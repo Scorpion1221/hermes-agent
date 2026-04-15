@@ -3097,6 +3097,11 @@ class FeishuAdapter(BasePlatformAdapter):
         """Require an explicit @mention before group messages enter the agent."""
         if not self._allow_group_message(sender_id, chat_id):
             return False
+        # Groups with "open" policy skip the mention requirement entirely.
+        rule = self._group_rules.get(chat_id) if chat_id else None
+        effective_policy = rule.policy if rule else (self._default_group_policy or self._group_policy)
+        if effective_policy == "open":
+            return True
         # @_all is Feishu's @everyone placeholder — always route to the bot.
         raw_content = getattr(message, "content", "") or ""
         if "@_all" in raw_content:
