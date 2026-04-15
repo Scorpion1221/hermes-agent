@@ -98,6 +98,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
     SUPPORTED_DOCUMENT_TYPES,
     cache_document_from_bytes,
@@ -188,7 +189,8 @@ _APPROVAL_LABEL_MAP: Dict[str, str] = {
 }
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
-_FEISHU_ACK_EMOJI = "OK"
+_FEISHU_ACK_EMOJI = os.environ.get("FEISHU_ACK_EMOJI", "Typing")
+_FEISHU_ACK_REMOVE_AFTER_REPLY = os.environ.get("FEISHU_ACK_REMOVE_AFTER_REPLY", "1") == "1"
 
 # QR onboarding constants
 _ONBOARD_ACCOUNTS_URLS = {
@@ -1075,6 +1077,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._card_action_tokens: Dict[str, float] = {}  # token → first_seen_time
         self._chat_locks: Dict[str, asyncio.Lock] = {}  # chat_id → lock (per-chat serial processing)
         self._sent_message_ids_to_chat: Dict[str, str] = {}  # message_id → chat_id (for reaction routing)
+        self._pending_ack_reactions: Dict[str, str] = {}  # message_id → reaction_id (for ACK removal)
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
         self._message_text_cache: Dict[str, Optional[str]] = {}
@@ -2076,11 +2079,25 @@ class FeishuAdapter(BasePlatformAdapter):
         async with chat_lock:
             message_id = event.message_id
             if message_id:
-                await self._add_ack_reaction(message_id)
+                reaction_id = await self._add_ack_reaction(message_id)
+                if reaction_id:
+                    self._pending_ack_reactions[message_id] = reaction_id
             await self.handle_message(event)
 
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        """Remove ACK reaction after the response has been fully sent."""
+        if not _FEISHU_ACK_REMOVE_AFTER_REPLY:
+            return
+        if outcome == ProcessingOutcome.CANCELLED:
+            return
+        message_id = getattr(event, "message_id", None)
+        if message_id:
+            reaction_id = self._pending_ack_reactions.pop(message_id, None)
+            if reaction_id:
+                await self._remove_ack_reaction(message_id, reaction_id)
+
     async def _add_ack_reaction(self, message_id: str) -> Optional[str]:
-        """Add a persistent ACK emoji reaction to signal the message was received."""
+        """Add a transient ACK emoji reaction to signal the message is being processed."""
         if not self._client or not message_id:
             return None
         try:
@@ -2112,6 +2129,22 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception:
             logger.warning("[Feishu] Failed to add ack reaction to %s", message_id, exc_info=True)
         return None
+
+    async def _remove_ack_reaction(self, message_id: str, reaction_id: str) -> None:
+        """Remove the ACK emoji reaction after the response has been sent."""
+        if not self._client or not message_id or not reaction_id:
+            return
+        try:
+            from lark_oapi.api.im.v1 import DeleteMessageReactionRequest
+            request = (
+                DeleteMessageReactionRequest.builder()
+                .message_id(message_id)
+                .reaction_id(reaction_id)
+                .build()
+            )
+            await asyncio.to_thread(self._client.im.v1.message_reaction.delete, request)
+        except Exception:
+            logger.warning("[Feishu] Failed to remove ack reaction from %s", message_id, exc_info=True)
 
     # =========================================================================
     # Webhook server and security

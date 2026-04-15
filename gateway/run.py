@@ -3835,6 +3835,9 @@ class GatewayRunner:
             await self.hooks.emit("agent:start", hook_ctx)
 
             # Run the agent
+            # Pass reply_to_text so memory recall can use it as context
+            # even when the quote was stripped from message_text (already in history).
+            _reply_ctx = getattr(event, "reply_to_text", None) or None
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -3842,6 +3845,7 @@ class GatewayRunner:
                 source=source,
                 session_id=session_entry.session_id,
                 session_key=session_key,
+                reply_context=_reply_ctx,
                 event_message_id=event.message_id,
             )
 
@@ -7969,6 +7973,7 @@ class GatewayRunner:
         session_key: str = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        reply_context: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -8695,7 +8700,16 @@ class GatewayRunner:
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
             try:
-                result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
+                # When the user replied-to / quoted a message whose text was
+                # already in history, gateway strips the quote from `message` to
+                # avoid redundancy.  But memory recall still benefits from the
+                # full context, so we pass a `persist_user_message` that
+                # includes the quoted text.  run_agent uses this for the
+                # memory prefetch query.
+                _persist = None
+                if reply_context:
+                    _persist = f'[Replying to: "{reply_context[:500]}"]\n\n{message}'
+                result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id, persist_user_message=_persist)
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)

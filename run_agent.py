@@ -10742,6 +10742,13 @@ class AIAgent:
         # injected skill content that bloats / breaks provider queries.
         if self._memory_manager and final_response and original_user_message:
             try:
+                # Tick the turn counter so providers can differentiate turns
+                # (e.g. MemPalace uses turn_number in drawer IDs to avoid
+                # overwriting earlier turns with upsert).
+                self._memory_manager.on_turn_start(
+                    self._user_turn_count, original_user_message,
+                    session_id=self.session_id,
+                )
                 self._memory_manager.sync_all(original_user_message, final_response)
                 self._memory_manager.queue_prefetch_all(original_user_message)
             except Exception:
