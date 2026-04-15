@@ -167,6 +167,14 @@ class GatewayStreamConsumer:
         buf = self._think_buffer + text
         self._think_buffer = ""
 
+        # Strip leading whitespace/newlines at the start of a new segment.
+        # run_agent._fire_stream_delta() prepends "\n\n" after tool calls to
+        # separate paragraphs in the CLI, but for gateway platforms each
+        # post-tool segment is a separate message — leading blank lines look
+        # like a rendering bug (especially on Feishu).
+        if not self._accumulated:
+            buf = buf.lstrip("\n\r")
+
         while buf:
             if self._in_think_block:
                 # Look for the earliest closing tag
