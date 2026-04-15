@@ -1125,7 +1125,7 @@ class FeishuAdapter(BasePlatformAdapter):
             ).strip().lower(),
             encrypt_key=os.getenv("FEISHU_ENCRYPT_KEY", "").strip(),
             verification_token=os.getenv("FEISHU_VERIFICATION_TOKEN", "").strip(),
-            group_policy=os.getenv("FEISHU_GROUP_POLICY", "allowlist").strip().lower(),
+            group_policy=os.getenv("FEISHU_GROUP_POLICY", "open").strip().lower(),
             allowed_group_users=frozenset(
                 item.strip()
                 for item in os.getenv("FEISHU_ALLOWED_USERS", "").split(",")
