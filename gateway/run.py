@@ -3332,13 +3332,12 @@ class GatewayRunner:
 
         if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
             reply_snippet = event.reply_to_text[:500]
-            found_in_history = any(
-                reply_snippet[:200] in (msg.get("content") or "")
-                for msg in history
-                if msg.get("role") in ("assistant", "user", "tool")
-            )
-            if not found_in_history:
-                message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
+            # Always inject the quoted text so the agent knows exactly what the
+            # user is replying to — even when the content already exists
+            # somewhere in session history.  Without this, short messages like
+            # "改一下" lose all context because the agent cannot see which
+            # earlier message the user is referencing.
+            message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
 
         if "@" in message_text:
             try:
