@@ -362,14 +362,17 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.message_id, "om_progress")
         self.assertEqual(captured["request"].message_id, "om_progress")
-        self.assertEqual(captured["request"].request_body.msg_type, "text")
+        # All outbound messages are now Feishu Card 2.0 (interactive).
+        self.assertEqual(captured["request"].request_body.msg_type, "interactive")
+        card = json.loads(captured["request"].request_body.content)
+        self.assertEqual(card["schema"], "2.0")
         self.assertEqual(
-            captured["request"].request_body.content,
-            json.dumps({"text": "📖 read_file: \"/tmp/image.png\""}, ensure_ascii=False),
+            card["body"]["elements"],
+            [{"tag": "markdown", "content": "📖 read_file: \"/tmp/image.png\""}],
         )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_edit_message_falls_back_to_text_when_post_update_is_rejected(self):
+    def test_edit_message_falls_back_to_text_when_card_update_is_rejected(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -380,7 +383,11 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             def update(self, request):
                 captured["calls"].append(request)
                 if len(captured["calls"]) == 1:
-                    return SimpleNamespace(success=lambda: False, code=230001, msg="content format of the post type is incorrect")
+                    return SimpleNamespace(
+                        success=lambda: False,
+                        code=230002,
+                        msg="invalid card content",
+                    )
                 return SimpleNamespace(success=lambda: True)
 
         adapter._client = SimpleNamespace(
@@ -404,7 +411,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["calls"][0].request_body.msg_type, "post")
+        self.assertEqual(captured["calls"][0].request_body.msg_type, "interactive")
         self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
         self.assertEqual(
             captured["calls"][1].request_body.content,
@@ -2289,43 +2296,69 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(elements, [{"tag": "md", "text": "# 标题\n访问 [文档](https://example.com)"}])
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_build_post_payload_wraps_markdown_in_md_tag(self):
+    def test_build_outbound_payload_emits_card_v2_for_markdown(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        payload = json.loads(
-            adapter._build_post_payload("支持 **粗体**、*斜体* 和 `代码`")
-        )
+        msg_type, payload = adapter._build_outbound_payload("支持 **粗体**、*斜体* 和 `代码`")
 
-        elements = payload["zh_cn"]["content"][0]
+        self.assertEqual(msg_type, "interactive")
+        card = json.loads(payload)
+        self.assertEqual(card["schema"], "2.0")
         self.assertEqual(
-            elements,
-            [
-                {"tag": "md", "text": "支持 **粗体**、*斜体* 和 `代码`"},
-            ],
+            card["body"]["elements"],
+            [{"tag": "markdown", "content": "支持 **粗体**、*斜体* 和 `代码`"}],
         )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_build_post_payload_keeps_full_markdown_text(self):
+    def test_build_outbound_payload_emits_card_v2_for_plain_text(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        payload = json.loads(
-            adapter._build_post_payload(
-                "---\n1. 第一项\n  2. 子项\n- 外层\n  - 内层\n<u>下划线</u> 和 ~~删除线~~"
-            )
-        )
+        msg_type, payload = adapter._build_outbound_payload("hello world")
 
-        rows = payload["zh_cn"]["content"]
-        self.assertEqual(
-            rows,
-            [[{"tag": "md", "text": "---\n1. 第一项\n  2. 子项\n- 外层\n  - 内层\n<u>下划线</u> 和 ~~删除线~~"}]],
-        )
+        self.assertEqual(msg_type, "interactive")
+        card = json.loads(payload)
+        self.assertEqual(card["body"]["elements"][0]["content"], "hello world")
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_send_uses_post_for_inline_markdown(self):
+    def test_build_outbound_payload_preserves_pipe_table_in_card(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        content = (
+            "**三个 Fork 仓库**\n\n"
+            "| 仓库 | 路径 |\n"
+            "| --- | --- |\n"
+            "| hermes-agent | ~/git/hermes-agent |\n"
+            "| mempalace | ~/git/mempalace |\n"
+        )
+        msg_type, payload = adapter._build_outbound_payload(content)
+
+        self.assertEqual(msg_type, "interactive")
+        card = json.loads(payload)
+        # Whole content (including the pipe table) is handed to a single
+        # markdown element — Card 2.0 renders GFM tables natively.
+        self.assertEqual(card["body"]["elements"][0]["content"], content)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_build_outbound_payload_keeps_full_markdown_text(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        content = "---\n1. 第一项\n  2. 子项\n- 外层\n  - 内层\n<u>下划线</u> 和 ~~删除线~~"
+        msg_type, payload = adapter._build_outbound_payload(content)
+
+        self.assertEqual(msg_type, "interactive")
+        card = json.loads(payload)
+        self.assertEqual(card["body"]["elements"][0]["content"], content)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_uses_interactive_card_for_inline_markdown(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -2337,7 +2370,7 @@ class TestAdapterBehavior(unittest.TestCase):
                 captured["request"] = request
                 return SimpleNamespace(
                     success=lambda: True,
-                    data=SimpleNamespace(message_id="om_markdown"),
+                    data=SimpleNamespace(message_id="om_card"),
                 )
 
         adapter._client = SimpleNamespace(
@@ -2360,13 +2393,16 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["request"].request_body.msg_type, "post")
-        payload = json.loads(captured["request"].request_body.content)
-        elements = payload["zh_cn"]["content"][0]
-        self.assertEqual(elements, [{"tag": "md", "text": "可以用 **粗体** 和 *斜体*。"}])
+        self.assertEqual(captured["request"].request_body.msg_type, "interactive")
+        card = json.loads(captured["request"].request_body.content)
+        self.assertEqual(card["schema"], "2.0")
+        self.assertEqual(
+            card["body"]["elements"],
+            [{"tag": "markdown", "content": "可以用 **粗体** 和 *斜体*。"}],
+        )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_send_falls_back_to_text_when_post_payload_is_rejected(self):
+    def test_send_falls_back_to_text_when_card_is_rejected(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -2377,7 +2413,7 @@ class TestAdapterBehavior(unittest.TestCase):
             def create(self, request):
                 captured["calls"].append(request)
                 if len(captured["calls"]) == 1:
-                    raise RuntimeError("content format of the post type is incorrect")
+                    raise RuntimeError("invalid card content")
                 return SimpleNamespace(
                     success=lambda: True,
                     data=SimpleNamespace(message_id="om_plain"),
@@ -2403,7 +2439,7 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["calls"][0].request_body.msg_type, "post")
+        self.assertEqual(captured["calls"][0].request_body.msg_type, "interactive")
         self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
         self.assertEqual(
             captured["calls"][1].request_body.content,
@@ -2411,7 +2447,7 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_send_falls_back_to_text_when_post_response_is_unsuccessful(self):
+    def test_send_falls_back_to_text_when_card_response_is_unsuccessful(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -2422,7 +2458,11 @@ class TestAdapterBehavior(unittest.TestCase):
             def create(self, request):
                 captured["calls"].append(request)
                 if len(captured["calls"]) == 1:
-                    return SimpleNamespace(success=lambda: False, code=230001, msg="content format of the post type is incorrect")
+                    return SimpleNamespace(
+                        success=lambda: False,
+                        code=230002,
+                        msg="invalid card schema",
+                    )
                 return SimpleNamespace(
                     success=lambda: True,
                     data=SimpleNamespace(message_id="om_plain_response"),
@@ -2448,7 +2488,7 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["calls"][0].request_body.msg_type, "post")
+        self.assertEqual(captured["calls"][0].request_body.msg_type, "interactive")
         self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
         self.assertEqual(
             captured["calls"][1].request_body.content,
@@ -2456,7 +2496,7 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_send_uses_post_for_advanced_markdown_lines(self):
+    def test_send_uses_card_for_advanced_markdown_lines(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -2468,7 +2508,7 @@ class TestAdapterBehavior(unittest.TestCase):
                 captured["request"] = request
                 return SimpleNamespace(
                     success=lambda: True,
-                    data=SimpleNamespace(message_id="om_markdown_advanced"),
+                    data=SimpleNamespace(message_id="om_card_advanced"),
                 )
 
         adapter._client = SimpleNamespace(
@@ -2491,12 +2531,12 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["request"].request_body.msg_type, "post")
-        payload = json.loads(captured["request"].request_body.content)
-        rows = payload["zh_cn"]["content"]
+        self.assertEqual(captured["request"].request_body.msg_type, "interactive")
+        card = json.loads(captured["request"].request_body.content)
+        self.assertEqual(card["schema"], "2.0")
         self.assertEqual(
-            rows,
-            [[{"tag": "md", "text": "---\n1. 第一项\n<u>下划线</u>\n~~删除线~~"}]],
+            card["body"]["elements"],
+            [{"tag": "markdown", "content": "---\n1. 第一项\n<u>下划线</u>\n~~删除线~~"}],
         )
 
 
