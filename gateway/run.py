@@ -8952,7 +8952,7 @@ class GatewayRunner:
                 # memory prefetch query.
                 _persist = None
                 if reply_context:
-                    _persist = f'[Replying to: "{reply_context[:500]}"]\n\n{message}'
+                    _persist = message
                 result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id, persist_user_message=_persist)
             finally:
                 unregister_gateway_notify(_approval_session_key)
