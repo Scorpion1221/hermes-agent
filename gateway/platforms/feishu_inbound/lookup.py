@@ -216,6 +216,7 @@ async def build_feishu_quoted_context(
     normalize_message: Callable[..., Any],
     download_resources: Callable[[str, Iterable[FeishuResourceDescriptor]], Awaitable[tuple[list[str], list[str]]]],
     resolve_sender_name: Optional[Callable[[str], Awaitable[Optional[str]]]] = None,
+    resolve_sender_name_sync: Optional[Callable[[str], Optional[str]]] = None,
 ) -> FeishuQuotedContext:
     primary_item = _select_primary_item(response_items, message_id)
     if primary_item is None:
@@ -234,7 +235,7 @@ async def build_feishu_quoted_context(
         response_items=response_items,
         sender_id=sender_id,
         sender_name=sender_name,
-        resolve_sender_name_sync=None,
+        resolve_sender_name_sync=resolve_sender_name_sync,
     )
 
     media_urls, media_types = await download_resources(message_id, ctx.resource_descriptors)

@@ -1434,6 +1434,64 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(media_types, ["image/png"])
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_fetch_reply_context_expands_merge_forward_with_sender_names(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._download_feishu_resource_descriptors = AsyncMock(return_value=([], []))
+        adapter._resolve_sender_name_from_api = AsyncMock(
+            side_effect=lambda open_id: {"ou_alice": "Alice", "ou_bob": "Bob"}.get(open_id)
+        )
+
+        response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(
+                items=[
+                    SimpleNamespace(
+                        message_id="om_parent_merge",
+                        msg_type="merge_forward",
+                        body=SimpleNamespace(content='{"title":"Forwarded"}'),
+                    ),
+                    SimpleNamespace(
+                        message_id="om_child_1",
+                        upper_message_id="om_parent_merge",
+                        msg_type="text",
+                        body=SimpleNamespace(content='{"text":"Investigating"}'),
+                        sender=SimpleNamespace(id="ou_alice"),
+                        create_time="1",
+                    ),
+                    SimpleNamespace(
+                        message_id="om_child_2",
+                        upper_message_id="om_parent_merge",
+                        msg_type="text",
+                        body=SimpleNamespace(content='{"text":"ETA 10 min"}'),
+                        sender=SimpleNamespace(id="ou_bob"),
+                        create_time="2",
+                    ),
+                ]
+            ),
+        )
+
+        class _MessageAPI:
+            def get(self, _request):
+                return response
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            text, media_urls, media_types = asyncio.run(adapter._fetch_reply_context("om_parent_merge"))
+
+        self.assertEqual(text, "- Alice: Investigating\n- Bob: ETA 10 min")
+        self.assertEqual(media_urls, [])
+        self.assertEqual(media_types, [])
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_extract_interactive_message_prefers_hydrated_card_payload(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter

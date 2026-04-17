@@ -3386,6 +3386,10 @@ class FeishuAdapter(BasePlatformAdapter):
         if not items:
             return None
         try:
+            primary_item = items[0]
+            primary_type = str(getattr(primary_item, "msg_type", "") or "").strip().lower()
+            if primary_type == "merge_forward":
+                await self._prefetch_item_sender_names(items)
             quoted_context = await build_feishu_quoted_context(
                 message_id=message_id,
                 response_items=items,
@@ -3395,6 +3399,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     descriptors=descriptors,
                 ),
                 resolve_sender_name=self._resolve_sender_name_from_api,
+                resolve_sender_name_sync=self._cached_sender_name,
             )
             self._quoted_context_cache[message_id] = quoted_context
             self._message_text_cache[message_id] = quoted_context.display_text or None
