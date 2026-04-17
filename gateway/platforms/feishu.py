@@ -106,6 +106,14 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_image_from_bytes,
 )
+from gateway.platforms.feishu_inbound import (
+    FeishuMessageContext,
+    FeishuQuotedContext,
+    FeishuResourceDescriptor,
+    build_feishu_message_context,
+    build_feishu_quoted_context,
+    extract_message_items,
+)
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
 
@@ -787,18 +795,19 @@ def _normalize_interactive_message(message_type: str, payload: Dict[str, Any]) -
         _find_first_text(card_payload, keys=("title", "summary", "subtitle")),
     )
     body_lines = _collect_card_lines(card_payload)
+    template_lines = _collect_template_variable_lines(card_payload)
     actions = _collect_action_labels(card_payload)
 
     lines: List[str] = []
     if title:
         lines.append(title)
-    for line in body_lines:
+    for line in body_lines + template_lines:
         if line != title:
             lines.append(line)
     if actions:
         lines.append(f"Actions: {', '.join(actions)}")
 
-    text_content = "\n".join(lines[:12]).strip() or FALLBACK_INTERACTIVE_TEXT
+    text_content = "\n".join(_unique_lines(lines)[:12]).strip() or FALLBACK_INTERACTIVE_TEXT
     return FeishuNormalizedMessage(
         raw_type=message_type,
         text_content=text_content,
@@ -873,6 +882,45 @@ def _collect_action_labels(payload: Any) -> List[str]:
         if label:
             labels.append(label)
     return _unique_lines(labels)
+
+
+def _collect_template_variable_lines(payload: Any) -> List[str]:
+    candidates: List[Any] = []
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, dict) and isinstance(data.get("template_variable"), (dict, list)):
+            candidates.append(data.get("template_variable"))
+        if isinstance(payload.get("template_variable"), (dict, list)):
+            candidates.append(payload.get("template_variable"))
+    if not candidates:
+        return []
+
+    lines: List[str] = []
+
+    def _walk_template_values(value: Any, key: str = "") -> None:
+        lowered = key.strip().lower()
+        if isinstance(value, str):
+            normalized = _normalize_feishu_text(value)
+            if (
+                normalized
+                and lowered not in _SKIP_TEXT_KEYS
+                and not lowered.endswith("_id")
+                and not lowered.endswith("_url")
+            ):
+                lines.append(normalized)
+            return
+        if isinstance(value, list):
+            for item in value:
+                _walk_template_values(item, key)
+            return
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                _walk_template_values(child_value, str(child_key))
+            return
+
+    for candidate in candidates:
+        _walk_template_values(candidate)
+    return _unique_lines(lines)
 
 
 def _collect_text_segments(value: Any, *, in_rich_block: bool) -> List[str]:
@@ -1120,6 +1168,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
         self._message_text_cache: Dict[str, Optional[str]] = {}
+        self._message_items_cache: Dict[str, List[Any]] = {}
+        self._quoted_context_cache: Dict[str, FeishuQuotedContext] = {}
         self._app_lock_identity: Optional[str] = None
         self._text_batch_state = FeishuBatchState()
         self._pending_text_batches = self._text_batch_state.events
@@ -2413,10 +2463,20 @@ class FeishuAdapter(BasePlatformAdapter):
 
         reply_to_message_id = (
             getattr(message, "parent_id", None)
+            or getattr(message, "root_id", None)
             or getattr(message, "upper_message_id", None)
             or None
         )
-        reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
+        reply_to_text = None
+        reply_to_media_urls: List[str] = []
+        reply_to_media_types: List[str] = []
+        quoted_context: Optional[FeishuQuotedContext] = None
+        if reply_to_message_id:
+            quoted_context = await self._fetch_quoted_context(reply_to_message_id)
+            if quoted_context:
+                reply_to_text = quoted_context.display_text or None
+                reply_to_media_urls = list(quoted_context.media_urls)
+                reply_to_media_types = list(quoted_context.media_types)
 
         logger.info(
             "[Feishu] Inbound %s message received: id=%s type=%s chat_id=%s text=%r media=%d",
@@ -2450,6 +2510,9 @@ class FeishuAdapter(BasePlatformAdapter):
             media_types=media_types,
             reply_to_message_id=reply_to_message_id,
             reply_to_text=reply_to_text,
+            reply_to_media_urls=reply_to_media_urls,
+            reply_to_media_types=reply_to_media_types,
+            quoted_context=quoted_context,
             timestamp=datetime.now(),
         )
         await self._dispatch_inbound_event(normalized)
@@ -2873,18 +2936,41 @@ class FeishuAdapter(BasePlatformAdapter):
         message_id = str(getattr(message, "message_id", "") or "")
         logger.info("[Feishu] Received raw message type=%s message_id=%s", raw_type, message_id)
 
-        normalized = normalize_feishu_message(message_type=raw_type, raw_content=raw_content)
+        hydrated_items: List[Any] = []
+        if raw_type in {"interactive", "card", "merge_forward"} and message_id:
+            hydrated_items = await self._fetch_message_items(message_id)
+            if raw_type == "merge_forward" and hydrated_items:
+                await self._prefetch_item_sender_names(hydrated_items)
+
+        message_context = build_feishu_message_context(
+            message_id=message_id,
+            message_type=raw_type,
+            raw_content=raw_content,
+            normalize_message=normalize_feishu_message,
+            response_items=hydrated_items,
+            chat_id=str(getattr(message, "chat_id", "") or ""),
+            chat_type=str(getattr(message, "chat_type", "") or ""),
+            root_id=getattr(message, "root_id", None) or None,
+            parent_id=getattr(message, "parent_id", None) or None,
+            thread_id=getattr(message, "thread_id", None) or None,
+            resolve_sender_name_sync=self._cached_sender_name,
+        )
+        normalized = normalize_feishu_message(
+            message_type=message_context.content_type,
+            raw_content=message_context.raw_content,
+        )
         media_urls, media_types = await self._download_feishu_message_resources(
             message_id=message_id,
             normalized=normalized,
+            resource_descriptors=message_context.resource_descriptors,
         )
-        inbound_type = self._resolve_normalized_message_type(normalized, media_types)
-        text = normalized.text_content
+        inbound_type = self._resolve_context_message_type(message_context, media_types)
+        text = message_context.content
 
         if (
             inbound_type in {MessageType.DOCUMENT, MessageType.AUDIO, MessageType.VIDEO, MessageType.PHOTO}
             and len(media_urls) == 1
-            and normalized.preferred_message_type in {"document", "audio"}
+            and message_context.preferred_message_type in {"document", "audio"}
         ):
             injected = await self._maybe_extract_text_document(media_urls[0], media_types[0])
             if injected:
@@ -2897,31 +2983,36 @@ class FeishuAdapter(BasePlatformAdapter):
         *,
         message_id: str,
         normalized: FeishuNormalizedMessage,
+        resource_descriptors: List[FeishuResourceDescriptor] | tuple[FeishuResourceDescriptor, ...] = (),
     ) -> tuple[List[str], List[str]]:
-        media_urls: List[str] = []
-        media_types: List[str] = []
+        if resource_descriptors:
+            return await self._download_feishu_resource_descriptors(
+                message_id=message_id,
+                descriptors=resource_descriptors,
+            )
 
+        descriptors: List[FeishuResourceDescriptor] = []
         for image_key in normalized.image_keys:
-            cached_path, media_type = await self._download_feishu_image(
-                message_id=message_id,
-                image_key=image_key,
-            )
-            if cached_path:
-                media_urls.append(cached_path)
-                media_types.append(media_type)
-
+            if image_key:
+                descriptors.append(FeishuResourceDescriptor(type="image", file_key=image_key))
         for media_ref in normalized.media_refs:
-            cached_path, media_type = await self._download_feishu_message_resource(
-                message_id=message_id,
-                file_key=media_ref.file_key,
-                resource_type=media_ref.resource_type,
-                fallback_filename=media_ref.file_name,
+            file_key = str(getattr(media_ref, "file_key", "") or "").strip()
+            if not file_key:
+                continue
+            mapped_type = str(getattr(media_ref, "resource_type", "file") or "file").strip().lower()
+            if mapped_type not in {"audio", "video"}:
+                mapped_type = "file"
+            descriptors.append(
+                FeishuResourceDescriptor(
+                    type=mapped_type,  # type: ignore[arg-type]
+                    file_key=file_key,
+                    file_name=str(getattr(media_ref, "file_name", "") or "").strip(),
+                )
             )
-            if cached_path:
-                media_urls.append(cached_path)
-                media_types.append(media_type)
-
-        return media_urls, media_types
+        return await self._download_feishu_resource_descriptors(
+            message_id=message_id,
+            descriptors=descriptors,
+        )
 
     @staticmethod
     def _resolve_media_message_type(media_type: str, *, default: MessageType) -> MessageType:
@@ -2940,6 +3031,20 @@ class FeishuAdapter(BasePlatformAdapter):
         media_types: List[str],
     ) -> MessageType:
         preferred = normalized.preferred_message_type
+        if preferred == "photo":
+            return self._resolve_media_message_type(media_types[0] if media_types else "", default=MessageType.PHOTO)
+        if preferred == "audio":
+            return self._resolve_media_message_type(media_types[0] if media_types else "", default=MessageType.AUDIO)
+        if preferred == "document":
+            return self._resolve_media_message_type(media_types[0] if media_types else "", default=MessageType.DOCUMENT)
+        return MessageType.TEXT
+
+    def _resolve_context_message_type(
+        self,
+        context: FeishuMessageContext,
+        media_types: List[str],
+    ) -> MessageType:
+        preferred = context.preferred_message_type
         if preferred == "photo":
             return self._resolve_media_message_type(media_types[0] if media_types else "", default=MessageType.PHOTO)
         if preferred == "audio":
@@ -3221,37 +3326,142 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Failed to resolve sender name for %s", sender_id, exc_info=True)
         return None
 
-    async def _fetch_message_text(self, message_id: str) -> Optional[str]:
+    async def _fetch_message_items(self, message_id: str) -> List[Any]:
         if not self._client or not message_id:
-            return None
-        if message_id in self._message_text_cache:
-            return self._message_text_cache[message_id]
+            return []
+        cached = self._message_items_cache.get(message_id)
+        if cached is not None:
+            return cached
         try:
-            request = self._build_get_message_request(message_id)
+            request = self._build_get_message_request(message_id, raw_card_content=True)
             response = await asyncio.to_thread(self._client.im.v1.message.get, request)
             if not response or getattr(response, "success", lambda: False)() is False:
                 code = getattr(response, "code", "unknown")
                 msg = getattr(response, "msg", "message lookup failed")
-                logger.warning("[Feishu] Failed to fetch parent message %s: [%s] %s", message_id, code, msg)
-                return None
-            items = getattr(getattr(response, "data", None), "items", None) or []
-            parent = items[0] if items else None
-            body = getattr(parent, "body", None)
-            msg_type = getattr(parent, "msg_type", "") or ""
-            raw_content = getattr(body, "content", "") or ""
-            text = self._extract_text_from_raw_content(msg_type=msg_type, raw_content=raw_content)
-            self._message_text_cache[message_id] = text
-            return text
+                logger.warning("[Feishu] Failed to fetch message %s: [%s] %s", message_id, code, msg)
+                return []
+            items = extract_message_items(response)
+            self._message_items_cache[message_id] = items
+            return items
         except Exception:
-            logger.warning("[Feishu] Failed to fetch parent message %s", message_id, exc_info=True)
+            logger.warning("[Feishu] Failed to fetch message %s", message_id, exc_info=True)
+            return []
+
+    async def _download_feishu_resource_descriptors(
+        self,
+        *,
+        message_id: str,
+        descriptors: List[FeishuResourceDescriptor] | tuple[FeishuResourceDescriptor, ...],
+    ) -> tuple[List[str], List[str]]:
+        media_urls: List[str] = []
+        media_types: List[str] = []
+
+        for descriptor in descriptors:
+            if descriptor.type == "image":
+                cached_path, media_type = await self._download_feishu_image(
+                    message_id=message_id,
+                    image_key=descriptor.file_key,
+                )
+            else:
+                resource_type = descriptor.type if descriptor.type in {"audio", "video"} else "file"
+                cached_path, media_type = await self._download_feishu_message_resource(
+                    message_id=message_id,
+                    file_key=descriptor.file_key,
+                    resource_type=resource_type,
+                    fallback_filename=descriptor.file_name,
+                )
+            if cached_path:
+                media_urls.append(cached_path)
+                media_types.append(media_type)
+
+        return media_urls, media_types
+
+    async def _fetch_quoted_context(self, message_id: str) -> Optional[FeishuQuotedContext]:
+        if not self._client or not message_id:
             return None
+        cached = self._quoted_context_cache.get(message_id)
+        if cached is not None:
+            return cached
+        items = await self._fetch_message_items(message_id)
+        if not items:
+            return None
+        try:
+            quoted_context = await build_feishu_quoted_context(
+                message_id=message_id,
+                response_items=items,
+                normalize_message=normalize_feishu_message,
+                download_resources=lambda msg_id, descriptors: self._download_feishu_resource_descriptors(
+                    message_id=msg_id,
+                    descriptors=descriptors,
+                ),
+                resolve_sender_name=self._resolve_sender_name_from_api,
+            )
+            self._quoted_context_cache[message_id] = quoted_context
+            self._message_text_cache[message_id] = quoted_context.display_text or None
+            return quoted_context
+        except Exception:
+            logger.warning("[Feishu] Failed to build quoted context for %s", message_id, exc_info=True)
+            return None
+
+    async def _fetch_reply_context(self, message_id: str) -> tuple[Optional[str], List[str], List[str]]:
+        quoted_context = await self._fetch_quoted_context(message_id)
+        if not quoted_context:
+            return None, [], []
+        return (
+            quoted_context.display_text or None,
+            list(quoted_context.media_urls),
+            list(quoted_context.media_types),
+        )
+
+    async def _fetch_message_text(self, message_id: str) -> Optional[str]:
+        text, _media_urls, _media_types = await self._fetch_reply_context(message_id)
+        return text
+
+    async def _prefetch_item_sender_names(self, items: List[Any]) -> None:
+        sender_ids: List[str] = []
+        seen: set[str] = set()
+        for item in items:
+            sender_id = str(getattr(getattr(item, "sender", None), "id", "") or "").strip()
+            if sender_id and sender_id not in seen:
+                seen.add(sender_id)
+                sender_ids.append(sender_id)
+        for sender_id in sender_ids:
+            name = await self._resolve_sender_name_from_api(sender_id)
+            if name:
+                self._sender_name_cache[sender_id] = (name, time.time() + _FEISHU_SENDER_NAME_TTL_SECONDS)
+
+    def _cached_sender_name(self, sender_id: str) -> Optional[str]:
+        normalized = str(sender_id or "").strip()
+        if not normalized:
+            return None
+        cached = self._sender_name_cache.get(normalized)
+        if not cached:
+            return None
+        name, expire_at = cached
+        if expire_at <= time.time():
+            self._sender_name_cache.pop(normalized, None)
+            return None
+        return name
 
     def _extract_text_from_raw_content(self, *, msg_type: str, raw_content: str) -> Optional[str]:
         normalized = normalize_feishu_message(message_type=msg_type, raw_content=raw_content)
         if normalized.text_content:
             return normalized.text_content
         placeholder = normalized.metadata.get("placeholder_text") if isinstance(normalized.metadata, dict) else None
-        return str(placeholder).strip() or None
+        if isinstance(placeholder, str) and placeholder.strip():
+            return placeholder.strip()
+        fallback_map = {
+            "image": FALLBACK_IMAGE_TEXT,
+            "post": FALLBACK_POST_TEXT,
+            "merge_forward": FALLBACK_FORWARD_TEXT,
+            "share_chat": FALLBACK_SHARE_CHAT_TEXT,
+            "interactive": FALLBACK_INTERACTIVE_TEXT,
+            "card": FALLBACK_INTERACTIVE_TEXT,
+            "file": FALLBACK_ATTACHMENT_TEXT,
+            "audio": FALLBACK_ATTACHMENT_TEXT,
+            "media": FALLBACK_ATTACHMENT_TEXT,
+        }
+        return fallback_map.get((normalized.raw_type or msg_type or "").strip().lower())
 
     @staticmethod
     def _default_image_media_type(ext: str) -> str:
@@ -3737,10 +3947,19 @@ class FeishuAdapter(BasePlatformAdapter):
         return SimpleNamespace(chat_id=chat_id)
 
     @staticmethod
-    def _build_get_message_request(message_id: str) -> Any:
+    def _build_get_message_request(message_id: str, raw_card_content: bool = False) -> Any:
         if "GetMessageRequest" in globals():
-            return GetMessageRequest.builder().message_id(message_id).build()
-        return SimpleNamespace(message_id=message_id)
+            builder = GetMessageRequest.builder().message_id(message_id)
+            if hasattr(builder, "user_id_type"):
+                builder = builder.user_id_type("open_id")
+            if raw_card_content and hasattr(builder, "card_msg_content_type"):
+                builder = builder.card_msg_content_type("raw_card_content")
+            return builder.build()
+        payload = {"message_id": message_id}
+        if raw_card_content:
+            payload["card_msg_content_type"] = "raw_card_content"
+            payload["user_id_type"] = "open_id"
+        return SimpleNamespace(**payload)
 
     @staticmethod
     def _build_message_resource_request(*, message_id: str, file_key: str, resource_type: str) -> Any:

@@ -114,3 +114,57 @@ async def test_prepare_inbound_message_text_transcribes_queued_voice_event():
     assert result is not None
     assert "queued voice transcript" in result
     assert "voice message" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_prepare_inbound_message_text_enriches_quoted_reply_image():
+    from gateway.run import GatewayRunner
+    from gateway.platforms.feishu_inbound import FeishuQuotedContext
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True)
+    runner.adapters = {}
+    runner._model = "test-model"
+    runner._base_url = ""
+    runner._has_setup_skill = lambda: False
+
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="123",
+        chat_type="dm",
+    )
+    event = MessageEvent(
+        text="请看这个",
+        message_type=MessageType.TEXT,
+        source=source,
+        reply_to_message_id="om_parent",
+        reply_to_text="[Image]",
+        reply_to_media_urls=["/tmp/quoted-image.png"],
+        reply_to_media_types=["image/png"],
+        quoted_context=FeishuQuotedContext(
+            message_id="om_parent",
+            kind="image",
+            text="[Image]",
+            summary="[Image]",
+            media_urls=("/tmp/quoted-image.png",),
+            media_types=("image/png",),
+        ),
+    )
+
+    with patch.object(
+        runner,
+        "_enrich_message_with_vision",
+        AsyncMock(return_value="[quoted image analysis]"),
+    ) as enrich:
+        result = await runner._prepare_inbound_message_text(
+            event=event,
+            source=source,
+            history=[],
+        )
+
+    assert result is not None
+    assert "[quoted image analysis]" in result
+    assert "[Quoted message context]" in result
+    assert "type: image" in result
+    assert "message_id: om_parent" in result
+    enrich.assert_awaited()

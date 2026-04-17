@@ -678,6 +678,9 @@ class MessageEvent:
     # Reply context
     reply_to_message_id: Optional[str] = None
     reply_to_text: Optional[str] = None  # Text of the replied-to message (for context injection)
+    reply_to_media_urls: List[str] = field(default_factory=list)
+    reply_to_media_types: List[str] = field(default_factory=list)
+    quoted_context: Any = None
     
     # Auto-loaded skill(s) for topic/channel bindings (e.g., Telegram DM Topics,
     # Discord channel_skill_bindings).  A single name or ordered list.

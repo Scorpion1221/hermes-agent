@@ -3403,25 +3403,46 @@ class GatewayRunner:
                     )
                 message_text = f"{context_note}\n\n{message_text}"
 
-        if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
-            reply_full = event.reply_to_text
-            # Check whether the quoted content already exists in the current
-            # session history.  If it does, the agent has already "seen" it and
-            # a short truncated snippet (200 chars) is enough to anchor context.
-            # If it does NOT exist (cross-session quote), inject the full text
-            # so the agent doesn't lose information it has never seen.
+        quoted_context = getattr(event, "quoted_context", None)
+        reply_image_paths = []
+        reply_media_urls = getattr(event, "reply_to_media_urls", None) or []
+        reply_media_types = getattr(event, "reply_to_media_types", None) or []
+        if quoted_context is not None:
+            reply_media_urls = list(getattr(quoted_context, "media_urls", ()) or ())
+            reply_media_types = list(getattr(quoted_context, "media_types", ()) or ())
+        for i, path in enumerate(reply_media_urls):
+            mtype = reply_media_types[i] if i < len(reply_media_types) else ""
+            if mtype.startswith("image/"):
+                reply_image_paths.append(path)
+
+        quoted_text = getattr(quoted_context, "display_text", None) or getattr(event, "reply_to_text", None) or ""
+        quoted_image_analysis = ""
+        if reply_image_paths and event.reply_to_message_id:
+            quoted_image_analysis = await self._enrich_message_with_vision(
+                "",
+                reply_image_paths,
+                preface="The user is replying to an earlier image. Here's what I can see in that quoted image:",
+                failure_preface="The user is replying to an earlier image, but I couldn't inspect it automatically this time.",
+                return_analysis_only=True,
+            )
+
+        if quoted_text and event.reply_to_message_id:
+            from gateway.platforms.feishu_inbound import render_quoted_context_block
+
             found_in_history = any(
-                reply_full[:200] in (msg.get("content") or "")
+                quoted_text[:200] in (msg.get("content") or "")
                 for msg in history
                 if msg.get("role") in ("assistant", "user", "tool")
             )
-            if found_in_history:
-                # Same session — short anchor is sufficient
-                reply_snippet = reply_full[:200]
-            else:
-                # Cross-session — full content, agent has never seen it
-                reply_snippet = reply_full
-            message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
+            quoted_block = render_quoted_context_block(
+                quoted_context,
+                found_in_history=found_in_history,
+                image_analysis=quoted_image_analysis,
+            )
+            if not quoted_block:
+                reply_snippet = quoted_text[:200] if found_in_history else quoted_text
+                quoted_block = f'[Replying to: "{reply_snippet}"]'
+            message_text = f"{quoted_block}\n\n{message_text}" if message_text else quoted_block
 
         if "@" in message_text:
             try:
@@ -3924,7 +3945,12 @@ class GatewayRunner:
             # Run the agent
             # Pass reply_to_text so memory recall can use it as context
             # even when the quote was stripped from message_text (already in history).
-            _reply_ctx = getattr(event, "reply_to_text", None) or None
+            _quoted = getattr(event, "quoted_context", None)
+            _reply_ctx = (
+                getattr(_quoted, "display_text", None)
+                or getattr(event, "reply_to_text", None)
+                or None
+            )
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -7390,6 +7416,10 @@ class GatewayRunner:
         self,
         user_text: str,
         image_paths: List[str],
+        *,
+        preface: str = "The user sent an image~ Here's what I can see:",
+        failure_preface: str = "The user sent an image but I couldn't quite see it this time (>_<)",
+        return_analysis_only: bool = False,
     ) -> str:
         """
         Auto-analyze user-attached images with the vision tool and prepend
@@ -7427,27 +7457,37 @@ class GatewayRunner:
                 result = _json.loads(result_json)
                 if result.get("success"):
                     description = result.get("analysis", "")
+                    if return_analysis_only:
+                        enriched_parts.append(description.strip())
+                        continue
                     enriched_parts.append(
-                        f"[The user sent an image~ Here's what I can see:\n{description}]\n"
+                        f"[{preface}\n{description}]\n"
                         f"[If you need a closer look, use vision_analyze with "
                         f"image_url: {path} ~]"
                     )
                 else:
+                    if return_analysis_only:
+                        enriched_parts.append(failure_preface)
+                        continue
                     enriched_parts.append(
-                        "[The user sent an image but I couldn't quite see it "
-                        "this time (>_<) You can try looking at it yourself "
+                        f"[{failure_preface} You can try looking at it yourself "
                         f"with vision_analyze using image_url: {path}]"
                     )
             except Exception as e:
                 logger.error("Vision auto-analysis error: %s", e)
+                if return_analysis_only:
+                    enriched_parts.append(f"{failure_preface} Something went wrong when I tried to inspect it.")
+                    continue
                 enriched_parts.append(
-                    f"[The user sent an image but something went wrong when I "
+                    f"[{failure_preface} Something went wrong when I "
                     f"tried to look at it~ You can try examining it yourself "
                     f"with vision_analyze using image_url: {path}]"
                 )
 
         # Combine: vision descriptions first, then the user's original text
         if enriched_parts:
+            if return_analysis_only:
+                return "\n\n".join(part for part in enriched_parts if part).strip()
             prefix = "\n\n".join(enriched_parts)
             if user_text:
                 return f"{prefix}\n\n{user_text}"
