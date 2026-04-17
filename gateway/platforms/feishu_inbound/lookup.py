@@ -24,6 +24,8 @@ def _obj_path(value: Any, *keys: str) -> Any:
 
 def _normalize_sender_name(sender_name: str | None, content: str) -> str:
     sender = str(sender_name or "").strip()
+    if sender.startswith(("ou_", "on_")):
+        sender = ""
     if not sender:
         return content.strip()
     body = content.strip()
