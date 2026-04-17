@@ -1492,6 +1492,56 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(media_types, [])
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_fetch_reply_context_downloads_quoted_merge_forward_image_resources(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._download_feishu_resource_descriptors = AsyncMock(
+            return_value=(["/tmp/quoted-merge-image.png"], ["image/png"])
+        )
+        adapter._resolve_sender_name_from_api = AsyncMock(return_value="Alice")
+
+        response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(
+                items=[
+                    SimpleNamespace(
+                        message_id="om_parent_merge_img",
+                        msg_type="merge_forward",
+                        body=SimpleNamespace(content='{"title":"Forwarded"}'),
+                    ),
+                    SimpleNamespace(
+                        message_id="om_child_img",
+                        upper_message_id="om_parent_merge_img",
+                        msg_type="image",
+                        body=SimpleNamespace(content='{"image_key":"img_nested"}'),
+                        sender=SimpleNamespace(id="ou_alice"),
+                        create_time="1",
+                    ),
+                ]
+            ),
+        )
+
+        class _MessageAPI:
+            def get(self, _request):
+                return response
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            text, media_urls, media_types = asyncio.run(adapter._fetch_reply_context("om_parent_merge_img"))
+
+        self.assertEqual(text, "- Alice: [Image]")
+        self.assertEqual(media_urls, ["/tmp/quoted-merge-image.png"])
+        self.assertEqual(media_types, ["image/png"])
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_extract_interactive_message_prefers_hydrated_card_payload(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -1578,6 +1628,46 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(msg_type.value, "text")
         self.assertEqual(media_urls, [])
         self.assertEqual(media_types, [])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_extract_merge_forward_message_downloads_embedded_image_resources(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._fetch_message_items = AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    message_id="om_merge_media",
+                    msg_type="merge_forward",
+                    body=SimpleNamespace(content='{"title":"Forward placeholder"}'),
+                ),
+                SimpleNamespace(
+                    message_id="om_child_img",
+                    upper_message_id="om_merge_media",
+                    msg_type="image",
+                    body=SimpleNamespace(content='{"image_key":"img_nested"}'),
+                    sender=SimpleNamespace(id="ou_alice"),
+                    create_time="1",
+                ),
+            ]
+        )
+        adapter._resolve_sender_name_from_api = AsyncMock(return_value="Alice")
+        adapter._download_feishu_resource_descriptors = AsyncMock(
+            return_value=(["/tmp/merge-forward-image.png"], ["image/png"])
+        )
+        message = SimpleNamespace(
+            message_type="merge_forward",
+            content='{"title":"Forward placeholder"}',
+            message_id="om_merge_media",
+        )
+
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
+
+        self.assertEqual(text, "- Alice: [Image]")
+        self.assertEqual(msg_type.value, "text")
+        self.assertEqual(media_urls, ["/tmp/merge-forward-image.png"])
+        self.assertEqual(media_types, ["image/png"])
 
     @patch.dict(os.environ, {}, clear=True)
     def test_extract_text_message_starting_with_slash_becomes_command(self):
