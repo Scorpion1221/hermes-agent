@@ -122,7 +122,11 @@ def _format_merge_forward_items(
             normalized = normalize_feishu_message(message_type=raw_type, raw_content=raw_content)
             sender_id = str(_obj_path(item, "sender", "id") or "").strip()
             sender_name = resolve_sender_name_sync(sender_id) if resolve_sender_name_sync and sender_id else None
-            sender_name = sender_name or sender_id or str(_obj_get(item, "sender_name", "") or "").strip()
+            sender_name = (
+                sender_name
+                or str(_obj_get(item, "sender_name", "") or "").strip()
+                or sender_id
+            )
             content = display_text_from_normalized(normalized, raw_type).strip()
             resources.extend(build_resource_descriptors(normalized))
             if raw_type == "merge_forward" and item_id:
@@ -166,6 +170,7 @@ def build_feishu_message_context(
         if primary_content:
             effective_content = primary_content
         sender_id = sender_id or str(_obj_path(primary_item, "sender", "id") or "")
+        sender_name = sender_name or str(_obj_get(primary_item, "sender_name", "") or "").strip()
 
     if effective_type == "merge_forward" and response_items and len(response_items) > 1:
         expanded, expanded_resources = _format_merge_forward_items(
@@ -243,13 +248,14 @@ async def build_feishu_quoted_context(
     )
 
     media_urls, media_types = await download_resources(message_id, ctx.resource_descriptors)
-    display_text = _normalize_sender_name(sender_name, ctx.content or "").strip()
+    display_sender = sender_name or ctx.sender_name
+    display_text = _normalize_sender_name(display_sender, ctx.content or "").strip()
     return FeishuQuotedContext(
         message_id=message_id,
         kind=ctx.relation_kind or ctx.content_type or "plain",
         text=ctx.content,
         summary=display_text or ctx.content,
-        sender_name=sender_name,
+        sender_name=display_sender,
         media_urls=tuple(media_urls),
         media_types=tuple(media_types),
         stable_ref=f"feishu:{message_id}",
