@@ -7,6 +7,13 @@ context hydration into dedicated modules.
 """
 
 from .types import FeishuMessageContext, FeishuQuotedContext, FeishuResourceDescriptor
+from .parse import (
+    FeishuNormalizedMessage,
+    FeishuPostMediaRef,
+    FeishuPostParseResult,
+    normalize_feishu_message,
+    parse_feishu_post_payload,
+)
 from .lookup import (
     build_feishu_message_context,
     build_feishu_quoted_context,
@@ -19,6 +26,11 @@ __all__ = [
     "FeishuMessageContext",
     "FeishuQuotedContext",
     "FeishuResourceDescriptor",
+    "FeishuNormalizedMessage",
+    "FeishuPostMediaRef",
+    "FeishuPostParseResult",
+    "normalize_feishu_message",
+    "parse_feishu_post_payload",
     "build_feishu_message_context",
     "build_feishu_quoted_context",
     "build_resource_descriptors",

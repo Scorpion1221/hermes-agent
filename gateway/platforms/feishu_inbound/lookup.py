@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
+from .parse import normalize_feishu_message
 from .types import FeishuMessageContext, FeishuQuotedContext, FeishuResourceDescriptor
 
 
@@ -94,7 +95,6 @@ def _format_merge_forward_items(
     *,
     items: list[Any],
     root_message_id: str,
-    normalize_message: Callable[..., Any],
     resolve_sender_name_sync: Optional[Callable[[str], Optional[str]]] = None,
 ) -> tuple[str, tuple[FeishuResourceDescriptor, ...]]:
     if not items:
@@ -119,7 +119,7 @@ def _format_merge_forward_items(
             item_id = str(_obj_get(item, "message_id", "") or "")
             raw_type = str(_obj_get(item, "msg_type", "") or "text")
             raw_content = str(_obj_path(item, "body", "content") or "")
-            normalized = normalize_message(message_type=raw_type, raw_content=raw_content)
+            normalized = normalize_feishu_message(message_type=raw_type, raw_content=raw_content)
             sender_id = str(_obj_path(item, "sender", "id") or "").strip()
             sender_name = resolve_sender_name_sync(sender_id) if resolve_sender_name_sync and sender_id else None
             sender_name = sender_name or sender_id or str(_obj_get(item, "sender_name", "") or "").strip()
@@ -145,7 +145,6 @@ def build_feishu_message_context(
     message_id: str,
     message_type: str,
     raw_content: str,
-    normalize_message: Callable[..., Any],
     response_items: Optional[list[Any]] = None,
     chat_id: str = "",
     chat_type: str = "",
@@ -172,7 +171,6 @@ def build_feishu_message_context(
         expanded, expanded_resources = _format_merge_forward_items(
             items=response_items,
             root_message_id=message_id,
-            normalize_message=normalize_message,
             resolve_sender_name_sync=resolve_sender_name_sync,
         )
         if expanded:
@@ -195,7 +193,7 @@ def build_feishu_message_context(
                 metadata={"expanded_from_items": True},
             )
 
-    normalized = normalize_message(message_type=effective_type, raw_content=effective_content)
+    normalized = normalize_feishu_message(message_type=effective_type, raw_content=effective_content)
     normalized_text = display_text_from_normalized(normalized, effective_type)
     return FeishuMessageContext(
         message_id=message_id,
@@ -221,7 +219,6 @@ async def build_feishu_quoted_context(
     *,
     message_id: str,
     response_items: list[Any],
-    normalize_message: Callable[..., Any],
     download_resources: Callable[[str, Iterable[FeishuResourceDescriptor]], Awaitable[tuple[list[str], list[str]]]],
     resolve_sender_name: Optional[Callable[[str], Awaitable[Optional[str]]]] = None,
     resolve_sender_name_sync: Optional[Callable[[str], Optional[str]]] = None,
@@ -239,7 +236,6 @@ async def build_feishu_quoted_context(
         message_id=message_id,
         message_type=str(_obj_get(primary_item, "msg_type", "") or "text"),
         raw_content=str(_obj_path(primary_item, "body", "content") or ""),
-        normalize_message=normalize_message,
         response_items=response_items,
         sender_id=sender_id,
         sender_name=sender_name,

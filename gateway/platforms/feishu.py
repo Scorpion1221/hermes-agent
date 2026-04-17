@@ -114,10 +114,24 @@ from gateway.platforms.feishu_inbound import (
     build_feishu_quoted_context,
     extract_message_items,
 )
+from gateway.platforms.feishu_inbound import parse as feishu_parse
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
+
+
+def _web_text_response(*, status: int, text: str) -> Any:
+    if web is not None:
+        return web.Response(status=status, text=text)
+    return SimpleNamespace(status=status, text=text, body=str(text).encode("utf-8"))
+
+
+def _web_json_response(payload: Dict[str, Any], *, status: int = 200) -> Any:
+    if web is not None:
+        return web.json_response(payload, status=status)
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    return SimpleNamespace(status=status, body=body, text=body.decode("utf-8"))
 
 # ---------------------------------------------------------------------------
 # Regex patterns
@@ -490,34 +504,7 @@ def _build_card_v2_payload(content: str) -> str:
 
 
 def parse_feishu_post_payload(payload: Any) -> FeishuPostParseResult:
-    resolved = _resolve_post_payload(payload)
-    if not resolved:
-        return FeishuPostParseResult(text_content=FALLBACK_POST_TEXT)
-
-    image_keys: List[str] = []
-    media_refs: List[FeishuPostMediaRef] = []
-    mentioned_ids: List[str] = []
-    parts: List[str] = []
-
-    title = _normalize_feishu_text(str(resolved.get("title", "")).strip())
-    if title:
-        parts.append(title)
-
-    for row in resolved.get("content", []) or []:
-        if not isinstance(row, list):
-            continue
-        row_text = _normalize_feishu_text(
-            "".join(_render_post_element(item, image_keys, media_refs, mentioned_ids) for item in row)
-        )
-        if row_text:
-            parts.append(row_text)
-
-    return FeishuPostParseResult(
-        text_content="\n".join(parts).strip() or FALLBACK_POST_TEXT,
-        image_keys=image_keys,
-        media_refs=media_refs,
-        mentioned_ids=mentioned_ids,
-    )
+    return feishu_parse.parse_feishu_post_payload(payload)
 
 
 def _resolve_post_payload(payload: Any) -> Dict[str, Any]:
@@ -677,57 +664,7 @@ def _render_nested_post(
 
 
 def normalize_feishu_message(*, message_type: str, raw_content: str) -> FeishuNormalizedMessage:
-    normalized_type = str(message_type or "").strip().lower()
-    payload = _load_feishu_payload(raw_content)
-
-    if normalized_type == "text":
-        return FeishuNormalizedMessage(
-            raw_type=normalized_type,
-            text_content=_normalize_feishu_text(str(payload.get("text", "") or "")),
-        )
-    if normalized_type == "post":
-        parsed_post = parse_feishu_post_payload(payload)
-        return FeishuNormalizedMessage(
-            raw_type=normalized_type,
-            text_content=parsed_post.text_content,
-            image_keys=list(parsed_post.image_keys),
-            media_refs=list(parsed_post.media_refs),
-            mentioned_ids=list(parsed_post.mentioned_ids),
-            relation_kind="post",
-        )
-    if normalized_type == "image":
-        image_key = str(payload.get("image_key", "") or "").strip()
-        alt_text = _normalize_feishu_text(
-            str(payload.get("text", "") or "")
-            or str(payload.get("alt", "") or "")
-            or FALLBACK_IMAGE_TEXT
-        )
-        return FeishuNormalizedMessage(
-            raw_type=normalized_type,
-            text_content=alt_text if alt_text != FALLBACK_IMAGE_TEXT else "",
-            preferred_message_type="photo",
-            image_keys=[image_key] if image_key else [],
-            relation_kind="image",
-        )
-    if normalized_type in {"file", "audio", "media"}:
-        media_ref = _build_media_ref_from_payload(payload, resource_type=normalized_type)
-        placeholder = _attachment_placeholder(media_ref.file_name)
-        return FeishuNormalizedMessage(
-            raw_type=normalized_type,
-            text_content="",
-            preferred_message_type="audio" if normalized_type == "audio" else "document",
-            media_refs=[media_ref] if media_ref.file_key else [],
-            relation_kind=normalized_type,
-            metadata={"placeholder_text": placeholder},
-        )
-    if normalized_type == "merge_forward":
-        return _normalize_merge_forward_message(payload)
-    if normalized_type == "share_chat":
-        return _normalize_share_chat_message(payload)
-    if normalized_type in {"interactive", "card"}:
-        return _normalize_interactive_message(normalized_type, payload)
-
-    return FeishuNormalizedMessage(raw_type=normalized_type, text_content="")
+    return feishu_parse.normalize_feishu_message(message_type=message_type, raw_content=raw_content)
 
 
 def _load_feishu_payload(raw_content: str) -> Dict[str, Any]:
@@ -2099,11 +2036,11 @@ class FeishuAdapter(BasePlatformAdapter):
             emoji_type,
         )
         # Only process reactions from real users. Ignore app/bot-generated reactions
-        # and Hermes' own ACK emoji to avoid feedback loops.
+        # and Hermes' own ACK emoji (including legacy "OK") to avoid feedback loops.
         loop = self._loop
         if (
             operator_type in {"bot", "app"}
-            or emoji_type == _FEISHU_ACK_EMOJI
+            or emoji_type in {_FEISHU_ACK_EMOJI, "OK"}
             or not message_id
             or loop is None
             or bool(getattr(loop, "is_closed", lambda: False)())
@@ -2669,7 +2606,7 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._check_webhook_rate_limit(rate_key):
             logger.warning("[Feishu] Webhook rate limit exceeded for %s", remote_ip)
             self._record_webhook_anomaly(remote_ip, "429")
-            return web.Response(status=429, text="Too Many Requests")
+            return _web_text_response(status=429, text="Too Many Requests")
 
         # Content-Type guard — Feishu always sends application/json.
         headers = getattr(request, "headers", {}) or {}
@@ -2677,14 +2614,14 @@ class FeishuAdapter(BasePlatformAdapter):
         if content_type and content_type != "application/json":
             logger.warning("[Feishu] Webhook rejected: unexpected Content-Type %r from %s", content_type, remote_ip)
             self._record_webhook_anomaly(remote_ip, "415")
-            return web.Response(status=415, text="Unsupported Media Type")
+            return _web_text_response(status=415, text="Unsupported Media Type")
 
         # Body size guard — reject early via Content-Length when present.
         content_length = getattr(request, "content_length", None)
         if content_length is not None and content_length > _FEISHU_WEBHOOK_MAX_BODY_BYTES:
             logger.warning("[Feishu] Webhook body too large (%d bytes) from %s", content_length, remote_ip)
             self._record_webhook_anomaly(remote_ip, "413")
-            return web.Response(status=413, text="Request body too large")
+            return _web_text_response(status=413, text="Request body too large")
 
         try:
             body_bytes: bytes = await asyncio.wait_for(
@@ -2694,26 +2631,26 @@ class FeishuAdapter(BasePlatformAdapter):
         except asyncio.TimeoutError:
             logger.warning("[Feishu] Webhook body read timed out after %ds from %s", _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS, remote_ip)
             self._record_webhook_anomaly(remote_ip, "408")
-            return web.Response(status=408, text="Request Timeout")
+            return _web_text_response(status=408, text="Request Timeout")
         except Exception:
             self._record_webhook_anomaly(remote_ip, "400")
-            return web.json_response({"code": 400, "msg": "failed to read body"}, status=400)
+            return _web_json_response({"code": 400, "msg": "failed to read body"}, status=400)
 
         if len(body_bytes) > _FEISHU_WEBHOOK_MAX_BODY_BYTES:
             logger.warning("[Feishu] Webhook body exceeds limit (%d bytes) from %s", len(body_bytes), remote_ip)
             self._record_webhook_anomaly(remote_ip, "413")
-            return web.Response(status=413, text="Request body too large")
+            return _web_text_response(status=413, text="Request body too large")
 
         try:
             payload = json.loads(body_bytes.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             self._record_webhook_anomaly(remote_ip, "400")
-            return web.json_response({"code": 400, "msg": "invalid json"}, status=400)
+            return _web_json_response({"code": 400, "msg": "invalid json"}, status=400)
 
         # URL verification challenge — respond before other checks so that Feishu's
         # subscription setup works even before encrypt_key is wired.
         if payload.get("type") == "url_verification":
-            return web.json_response({"challenge": payload.get("challenge", "")})
+            return _web_json_response({"challenge": payload.get("challenge", "")})
 
         # Verification token check — second layer of defence beyond signature (matches openclaw).
         if self._verification_token:
@@ -2722,18 +2659,18 @@ class FeishuAdapter(BasePlatformAdapter):
             if not incoming_token or not hmac.compare_digest(incoming_token, self._verification_token):
                 logger.warning("[Feishu] Webhook rejected: invalid verification token from %s", remote_ip)
                 self._record_webhook_anomaly(remote_ip, "401-token")
-                return web.Response(status=401, text="Invalid verification token")
+                return _web_text_response(status=401, text="Invalid verification token")
 
         # Timing-safe signature verification (only enforced when encrypt_key is set).
         if self._encrypt_key and not self._is_webhook_signature_valid(request.headers, body_bytes):
             logger.warning("[Feishu] Webhook rejected: invalid signature from %s", remote_ip)
             self._record_webhook_anomaly(remote_ip, "401-sig")
-            return web.Response(status=401, text="Invalid signature")
+            return _web_text_response(status=401, text="Invalid signature")
 
         if payload.get("encrypt"):
             logger.error("[Feishu] Encrypted webhook payloads are not supported by Hermes webhook mode")
             self._record_webhook_anomaly(remote_ip, "400-encrypted")
-            return web.json_response({"code": 400, "msg": "encrypted webhook payloads are not supported"}, status=400)
+            return _web_json_response({"code": 400, "msg": "encrypted webhook payloads are not supported"}, status=400)
 
         self._clear_webhook_anomaly(remote_ip)
 
@@ -2753,7 +2690,7 @@ class FeishuAdapter(BasePlatformAdapter):
             self._on_card_action_trigger(data)
         else:
             logger.debug("[Feishu] Ignoring webhook event type: %s", event_type or "unknown")
-        return web.json_response({"code": 0, "msg": "ok"})
+        return _web_json_response({"code": 0, "msg": "ok"})
 
     def _is_webhook_signature_valid(self, headers: Any, body_bytes: bytes) -> bool:
         """Verify Feishu webhook signature using timing-safe comparison.
@@ -2946,7 +2883,6 @@ class FeishuAdapter(BasePlatformAdapter):
             message_id=message_id,
             message_type=raw_type,
             raw_content=raw_content,
-            normalize_message=normalize_feishu_message,
             response_items=hydrated_items,
             chat_id=str(getattr(message, "chat_id", "") or ""),
             chat_type=str(getattr(message, "chat_type", "") or ""),
@@ -2966,6 +2902,8 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         inbound_type = self._resolve_context_message_type(message_context, media_types)
         text = message_context.content
+        if raw_type in {"image", "file", "audio", "media"}:
+            text = ""
 
         if (
             inbound_type in {MessageType.DOCUMENT, MessageType.AUDIO, MessageType.VIDEO, MessageType.PHOTO}
@@ -3393,7 +3331,6 @@ class FeishuAdapter(BasePlatformAdapter):
             quoted_context = await build_feishu_quoted_context(
                 message_id=message_id,
                 response_items=items,
-                normalize_message=normalize_feishu_message,
                 download_resources=lambda msg_id, descriptors: self._download_feishu_resource_descriptors(
                     message_id=msg_id,
                     descriptors=descriptors,
@@ -3519,14 +3456,9 @@ class FeishuAdapter(BasePlatformAdapter):
         return bool(sender_ids and (sender_ids & self._allowed_group_users))
 
     def _should_accept_group_message(self, message: Any, sender_id: Any, chat_id: str = "") -> bool:
-        """Require an explicit @mention before group messages enter the agent."""
+        """Require sender policy pass plus an explicit bot/@all mention for group messages."""
         if not self._allow_group_message(sender_id, chat_id):
             return False
-        # Groups with "open" policy skip the mention requirement entirely.
-        rule = self._group_rules.get(chat_id) if chat_id else None
-        effective_policy = rule.policy if rule else (self._default_group_policy or self._group_policy)
-        if effective_policy == "open":
-            return True
         # @_all is Feishu's @everyone placeholder — always route to the bot.
         raw_content = getattr(message, "content", "") or ""
         if "@_all" in raw_content:
