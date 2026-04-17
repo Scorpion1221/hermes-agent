@@ -108,11 +108,21 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.feishu_inbound import (
     FeishuMessageContext,
+    FeishuMediaIndexEntry,
     FeishuQuotedContext,
     FeishuResourceDescriptor,
+    FeishuInboundContentBridge,
+    FeishuReplyContextBridge,
+    build_feishu_inbound_content_bridge,
+    build_feishu_message_event,
+    build_feishu_reply_context_bridge,
     build_feishu_message_context,
     build_feishu_quoted_context,
     extract_message_items,
+    extract_text_from_raw_content as feishu_extract_text_from_raw_content,
+    get_feishu_media_index_entry,
+    put_feishu_media_index_entry,
+    resolve_context_message_type as feishu_resolve_context_message_type,
 )
 from gateway.platforms.feishu_inbound import parse as feishu_parse
 from gateway.status import acquire_scoped_lock, release_scoped_lock
@@ -2437,19 +2447,27 @@ class FeishuAdapter(BasePlatformAdapter):
             thread_id=getattr(message, "thread_id", None) or None,
             user_id_alt=sender_profile["user_id_alt"],
         )
-        normalized = MessageEvent(
+        inbound_content = FeishuInboundContentBridge(
             text=text,
             message_type=inbound_type,
-            source=source,
-            raw_message=data,
-            message_id=message_id,
-            media_urls=media_urls,
-            media_types=media_types,
-            reply_to_message_id=reply_to_message_id,
-            reply_to_text=reply_to_text,
-            reply_to_media_urls=reply_to_media_urls,
-            reply_to_media_types=reply_to_media_types,
+            media_urls=tuple(media_urls),
+            media_types=tuple(media_types),
+            raw_message_type=str(getattr(message, "message_type", "") or ""),
+        )
+        reply_context = build_feishu_reply_context_bridge(
+            message=SimpleNamespace(
+                parent_id=getattr(message, "parent_id", None),
+                root_id=getattr(message, "root_id", None),
+                upper_message_id=getattr(message, "upper_message_id", None),
+            ),
             quoted_context=quoted_context,
+        )
+        normalized = build_feishu_message_event(
+            data=data,
+            message=message,
+            source=source,
+            inbound_content=inbound_content,
+            reply_context=reply_context,
             timestamp=datetime.now(),
         )
         await self._dispatch_inbound_event(normalized)
@@ -2868,29 +2886,24 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def _extract_message_content(self, message: Any) -> tuple[str, MessageType, List[str], List[str]]:
         """Extract text and cached media from a normalized Feishu message."""
-        raw_content = getattr(message, "content", "") or ""
         raw_type = getattr(message, "message_type", "") or ""
         message_id = str(getattr(message, "message_id", "") or "")
         logger.info("[Feishu] Received raw message type=%s message_id=%s", raw_type, message_id)
-
         hydrated_items: List[Any] = []
         if raw_type in {"interactive", "card", "merge_forward"} and message_id:
             hydrated_items = await self._fetch_message_items(message_id)
             if raw_type == "merge_forward" and hydrated_items:
                 await self._prefetch_item_sender_names(hydrated_items)
 
-        message_context = build_feishu_message_context(
-            message_id=message_id,
-            message_type=raw_type,
-            raw_content=raw_content,
-            response_items=hydrated_items,
-            chat_id=str(getattr(message, "chat_id", "") or ""),
-            chat_type=str(getattr(message, "chat_type", "") or ""),
-            root_id=getattr(message, "root_id", None) or None,
-            parent_id=getattr(message, "parent_id", None) or None,
-            thread_id=getattr(message, "thread_id", None) or None,
+        inbound_content = build_feishu_inbound_content_bridge(
+            message=message,
+            hydrated_items=hydrated_items,
             resolve_sender_name_sync=self._cached_sender_name,
         )
+        message_context = inbound_content.message_context
+        if message_context is None:
+            return inbound_content.text, inbound_content.message_type, list(inbound_content.media_urls), list(inbound_content.media_types)
+
         normalized = normalize_feishu_message(
             message_type=message_context.content_type,
             raw_content=message_context.raw_content,
@@ -2900,21 +2913,28 @@ class FeishuAdapter(BasePlatformAdapter):
             normalized=normalized,
             resource_descriptors=message_context.resource_descriptors,
         )
-        inbound_type = self._resolve_context_message_type(message_context, media_types)
-        text = message_context.content
-        if raw_type in {"image", "file", "audio", "media"}:
-            text = ""
-
+        injected = ""
         if (
-            inbound_type in {MessageType.DOCUMENT, MessageType.AUDIO, MessageType.VIDEO, MessageType.PHOTO}
+            inbound_content.message_type in {MessageType.DOCUMENT, MessageType.AUDIO, MessageType.VIDEO, MessageType.PHOTO}
             and len(media_urls) == 1
             and message_context.preferred_message_type in {"document", "audio"}
         ):
             injected = await self._maybe_extract_text_document(media_urls[0], media_types[0])
-            if injected:
-                text = injected
 
-        return text, inbound_type, media_urls, media_types
+        inbound_content = build_feishu_inbound_content_bridge(
+            message=message,
+            hydrated_items=hydrated_items,
+            resolve_sender_name_sync=self._cached_sender_name,
+            media_urls=media_urls,
+            media_types=media_types,
+            injected_text=injected,
+        )
+        return (
+            inbound_content.text,
+            inbound_content.message_type,
+            list(inbound_content.media_urls),
+            list(inbound_content.media_types),
+        )
 
     async def _download_feishu_message_resources(
         self,
@@ -2982,14 +3002,7 @@ class FeishuAdapter(BasePlatformAdapter):
         context: FeishuMessageContext,
         media_types: List[str],
     ) -> MessageType:
-        preferred = context.preferred_message_type
-        if preferred == "photo":
-            return self._resolve_media_message_type(media_types[0] if media_types else "", default=MessageType.PHOTO)
-        if preferred == "audio":
-            return self._resolve_media_message_type(media_types[0] if media_types else "", default=MessageType.AUDIO)
-        if preferred == "document":
-            return self._resolve_media_message_type(media_types[0] if media_types else "", default=MessageType.DOCUMENT)
-        return MessageType.TEXT
+        return feishu_resolve_context_message_type(context, media_types)
 
     async def _maybe_extract_text_document(self, cached_path: str, media_type: str) -> str:
         if not cached_path or not media_type.startswith("text/"):
@@ -3010,6 +3023,9 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _download_feishu_image(self, *, message_id: str, image_key: str) -> tuple[str, str]:
         if not self._client or not message_id:
             return "", ""
+        cached_entry = get_feishu_media_index_entry(message_id, image_key)
+        if cached_entry is not None:
+            return cached_entry.cached_path, cached_entry.content_type or ""
         try:
             request = self._build_message_resource_request(
                 message_id=message_id,
@@ -3033,6 +3049,13 @@ class FeishuAdapter(BasePlatformAdapter):
             ext = self._guess_extension(filename, content_type, ".jpg", allowed=_IMAGE_EXTENSIONS)
             cached_path = cache_image_from_bytes(raw_bytes, ext=ext)
             media_type = self._normalize_media_type(content_type, default=self._default_image_media_type(ext))
+            put_feishu_media_index_entry(
+                message_id=message_id,
+                file_key=image_key,
+                cached_path=cached_path,
+                content_type=media_type,
+                resource_type="image",
+            )
             return cached_path, media_type
         except Exception:
             logger.warning("[Feishu] Failed to cache image resource %s", image_key, exc_info=True)
@@ -3054,6 +3077,9 @@ class FeishuAdapter(BasePlatformAdapter):
             request_types.append("file")
 
         for request_type in request_types:
+            cached_entry = get_feishu_media_index_entry(message_id, file_key)
+            if cached_entry is not None:
+                return cached_entry.cached_path, cached_entry.content_type or self._guess_media_type_from_filename(cached_entry.cached_path)
             try:
                 request = self._build_message_resource_request(
                     message_id=message_id,
@@ -3087,12 +3113,26 @@ class FeishuAdapter(BasePlatformAdapter):
                     ext = self._guess_extension(filename, content_type, ".jpg", allowed=_IMAGE_EXTENSIONS)
                     cached_path = cache_image_from_bytes(raw_bytes, ext=ext)
                     logger.info("[Feishu] Cached message image resource at %s", cached_path)
+                    put_feishu_media_index_entry(
+                        message_id=message_id,
+                        file_key=file_key,
+                        cached_path=cached_path,
+                        content_type=media_type or self._default_image_media_type(ext),
+                        resource_type="image",
+                    )
                     return cached_path, media_type or self._default_image_media_type(ext)
 
                 if request_type == "audio" or media_type.startswith("audio/"):
                     ext = self._guess_extension(filename, content_type, ".ogg", allowed=_AUDIO_EXTENSIONS)
                     cached_path = cache_audio_from_bytes(raw_bytes, ext=ext)
                     logger.info("[Feishu] Cached message audio resource at %s", cached_path)
+                    put_feishu_media_index_entry(
+                        message_id=message_id,
+                        file_key=file_key,
+                        cached_path=cached_path,
+                        content_type=(media_type or f"audio/{ext.lstrip('.') or 'ogg'}"),
+                        resource_type="audio",
+                    )
                     return cached_path, (media_type or f"audio/{ext.lstrip('.') or 'ogg'}")
 
                 if media_type.startswith("video/"):
@@ -3100,12 +3140,26 @@ class FeishuAdapter(BasePlatformAdapter):
                         filename = f"{filename}.mp4"
                     cached_path = cache_document_from_bytes(raw_bytes, filename)
                     logger.info("[Feishu] Cached message video resource at %s", cached_path)
+                    put_feishu_media_index_entry(
+                        message_id=message_id,
+                        file_key=file_key,
+                        cached_path=cached_path,
+                        content_type=media_type,
+                        resource_type="video",
+                    )
                     return cached_path, media_type
 
                 if not Path(filename).suffix and media_type in _DOCUMENT_MIME_TO_EXT:
                     filename = f"{filename}{_DOCUMENT_MIME_TO_EXT[media_type]}"
                 cached_path = cache_document_from_bytes(raw_bytes, filename)
                 logger.info("[Feishu] Cached message document resource at %s", cached_path)
+                put_feishu_media_index_entry(
+                    message_id=message_id,
+                    file_key=file_key,
+                    cached_path=cached_path,
+                    content_type=(media_type or self._guess_document_media_type(filename)),
+                    resource_type="file",
+                )
                 return cached_path, (media_type or self._guess_document_media_type(filename))
             except Exception:
                 logger.warning(
@@ -3386,24 +3440,7 @@ class FeishuAdapter(BasePlatformAdapter):
         return name
 
     def _extract_text_from_raw_content(self, *, msg_type: str, raw_content: str) -> Optional[str]:
-        normalized = normalize_feishu_message(message_type=msg_type, raw_content=raw_content)
-        if normalized.text_content:
-            return normalized.text_content
-        placeholder = normalized.metadata.get("placeholder_text") if isinstance(normalized.metadata, dict) else None
-        if isinstance(placeholder, str) and placeholder.strip():
-            return placeholder.strip()
-        fallback_map = {
-            "image": FALLBACK_IMAGE_TEXT,
-            "post": FALLBACK_POST_TEXT,
-            "merge_forward": FALLBACK_FORWARD_TEXT,
-            "share_chat": FALLBACK_SHARE_CHAT_TEXT,
-            "interactive": FALLBACK_INTERACTIVE_TEXT,
-            "card": FALLBACK_INTERACTIVE_TEXT,
-            "file": FALLBACK_ATTACHMENT_TEXT,
-            "audio": FALLBACK_ATTACHMENT_TEXT,
-            "media": FALLBACK_ATTACHMENT_TEXT,
-        }
-        return fallback_map.get((normalized.raw_type or msg_type or "").strip().lower())
+        return feishu_extract_text_from_raw_content(msg_type=msg_type, raw_content=raw_content)
 
     @staticmethod
     def _default_image_media_type(ext: str) -> str:

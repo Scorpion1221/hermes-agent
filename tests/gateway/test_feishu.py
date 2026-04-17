@@ -1670,6 +1670,75 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(media_types, ["image/png"])
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_download_feishu_image_uses_persistent_media_index_hit(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter, FeishuMediaIndexEntry
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = SimpleNamespace()
+        cached = FeishuMediaIndexEntry(
+            platform="feishu",
+            message_id="om_cached",
+            file_key="img_cached",
+            cached_path="/tmp/from-index.png",
+            content_type="image/png",
+            resource_type="image",
+            updated_at=0.0,
+        )
+
+        with patch("gateway.platforms.feishu.get_feishu_media_index_entry", return_value=cached) as lookup:
+            path, media_type = asyncio.run(adapter._download_feishu_image(message_id="om_cached", image_key="img_cached"))
+
+        lookup.assert_called_once_with("om_cached", "img_cached")
+        self.assertEqual(path, "/tmp/from-index.png")
+        self.assertEqual(media_type, "image/png")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_download_feishu_message_resource_writes_persistent_media_index(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        class _ResourceAPI:
+            def get(self, _request):
+                return SimpleNamespace(
+                    success=lambda: True,
+                    raw=SimpleNamespace(headers={"Content-Type": "image/png"}),
+                    file=SimpleNamespace(getvalue=lambda: b"\x89PNG\r\n\x1a\nrest"),
+                    file_name="quoted.png",
+                )
+
+        adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message_resource=_ResourceAPI())))
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with (
+            patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct),
+            patch("gateway.platforms.feishu.cache_image_from_bytes", return_value="/tmp/cached-quoted.png"),
+            patch("gateway.platforms.feishu.put_feishu_media_index_entry") as store,
+        ):
+            path, media_type = asyncio.run(
+                adapter._download_feishu_message_resource(
+                    message_id="om_res",
+                    file_key="img_nested",
+                    resource_type="file",
+                    fallback_filename="quoted.png",
+                )
+            )
+
+        self.assertEqual(path, "/tmp/cached-quoted.png")
+        self.assertEqual(media_type, "image/png")
+        store.assert_called_once_with(
+            message_id="om_res",
+            file_key="img_nested",
+            cached_path="/tmp/cached-quoted.png",
+            content_type="image/png",
+            resource_type="image",
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_extract_text_message_starting_with_slash_becomes_command(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
