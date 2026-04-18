@@ -1492,6 +1492,41 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(media_types, [])
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_fetch_message_items_prefers_raw_request_items_for_merge_forward(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        raw_items = [
+            {"message_id": "om_merge", "msg_type": "merge_forward", "body": {"content": '{"title":"Forwarded"}'}},
+            {
+                "message_id": "om_child_1",
+                "upper_message_id": "om_merge",
+                "msg_type": "text",
+                "body": {"content": '{"text":"Investigating"}'},
+                "sender": {"id": "ou_alice"},
+                "create_time": "1",
+            },
+        ]
+
+        class _Client:
+            def request(self, req):
+                return SimpleNamespace(data=SimpleNamespace(items=raw_items))
+
+        adapter._client = _Client()
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            items = asyncio.run(adapter._fetch_message_items("om_merge"))
+
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["message_id"], "om_merge")
+        self.assertEqual(items[1]["upper_message_id"], "om_merge")
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_fetch_reply_context_downloads_quoted_merge_forward_image_resources(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter

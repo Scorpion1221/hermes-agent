@@ -3488,6 +3488,27 @@ class FeishuAdapter(BasePlatformAdapter):
         if cached is not None:
             return cached
         try:
+            raw_response = None
+            if hasattr(self._client, "request"):
+                try:
+                    raw_response = await asyncio.to_thread(
+                        self._client.request,
+                        {
+                            "method": "GET",
+                            "url": f"/open-apis/im/v1/messages/{message_id}",
+                            "params": {
+                                "user_id_type": "open_id",
+                                "card_msg_content_type": "raw_card_content",
+                            },
+                        },
+                    )
+                except Exception:
+                    logger.debug("[Feishu] Raw message request fallback failed for %s", message_id, exc_info=True)
+            raw_items = extract_message_items(raw_response) if raw_response is not None else []
+            if raw_items:
+                self._message_items_cache[message_id] = raw_items
+                return raw_items
+
             request = self._build_get_message_request(message_id, raw_card_content=True)
             response = await asyncio.to_thread(self._client.im.v1.message.get, request)
             if not response or getattr(response, "success", lambda: False)() is False:
