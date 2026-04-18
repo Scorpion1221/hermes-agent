@@ -113,6 +113,7 @@ from gateway.platforms.feishu_inbound import (
     FeishuResourceDescriptor,
     FeishuInboundContentBridge,
     FeishuReplyContextBridge,
+    FeishuSenderNameCache,
     build_feishu_inbound_content_bridge,
     build_feishu_message_event,
     build_feishu_reply_context_bridge,
@@ -122,6 +123,10 @@ from gateway.platforms.feishu_inbound import (
     extract_text_from_raw_content as feishu_extract_text_from_raw_content,
     get_feishu_media_index_entry,
     put_feishu_media_index_entry,
+    coerce_feishu_sender_display_name,
+    resolve_feishu_sender_display_name,
+    resolve_feishu_sender_display_names,
+    resolve_feishu_sender_name,
     resolve_context_message_type as feishu_resolve_context_message_type,
 )
 from gateway.platforms.feishu_inbound import parse as feishu_parse
@@ -1098,7 +1103,9 @@ class FeishuAdapter(BasePlatformAdapter):
         self._seen_message_order: List[str] = []
         self._dedup_state_path = get_hermes_home() / "feishu_seen_message_ids.json"
         self._dedup_lock = threading.Lock()
-        self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
+        self._sender_name_cache = FeishuSenderNameCache(
+            ttl_seconds=_FEISHU_SENDER_NAME_TTL_SECONDS,
+        )
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
         self._card_action_tokens: Dict[str, float] = {}  # token → first_seen_time
@@ -2109,7 +2116,11 @@ class FeishuAdapter(BasePlatformAdapter):
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
-        user_name = self._get_cached_sender_name(open_id) or open_id
+        user_name = (
+            self._get_cached_sender_name(open_id)
+            or coerce_feishu_sender_display_name(sender_id=open_id)
+            or "Unknown user"
+        )
 
         self._submit_on_loop(loop, self._resolve_approval(approval_id, choice, user_name))
 
@@ -3255,7 +3266,11 @@ class FeishuAdapter(BasePlatformAdapter):
         user_id = getattr(sender_id, "user_id", None) or None
         union_id = getattr(sender_id, "union_id", None) or None
         primary_id = open_id or user_id
-        display_name = await self._resolve_sender_name_from_api(primary_id or union_id)
+        resolved_name = await self._resolve_sender_name_from_api(primary_id or union_id)
+        display_name = coerce_feishu_sender_display_name(
+            sender_name=resolved_name,
+            sender_id=primary_id or union_id,
+        )
         return {
             "user_id": primary_id,
             "user_name": display_name,
@@ -3264,41 +3279,38 @@ class FeishuAdapter(BasePlatformAdapter):
 
     def _get_cached_sender_name(self, sender_id: Optional[str]) -> Optional[str]:
         """Return a cached sender name only while its TTL is still valid."""
-        if not sender_id:
-            return None
-        cached = self._sender_name_cache.get(sender_id)
-        if cached is None:
-            return None
-        name, expire_at = cached
-        if time.time() < expire_at:
-            return name
-        self._sender_name_cache.pop(sender_id, None)
-        return None
+        return self._sender_name_cache.get_cached_name(
+            sender_id,
+            account_scope=self._app_id or None,
+        )
 
     async def _resolve_sender_name_from_api(self, sender_id: Optional[str]) -> Optional[str]:
-        """Fetch the sender's display name from the Feishu contact API with a 10-minute cache.
+        return await resolve_feishu_sender_name(
+            self._sender_name_cache,
+            sender_id,
+            account_scope=self._app_id or None,
+            resolver=self._fetch_sender_name_from_api,
+        )
 
-        ID-type detection mirrors openclaw: ou_ → open_id, on_ → union_id, else user_id.
-        Failures are silently suppressed; the message pipeline must not block on name resolution.
-        """
+    async def _fetch_sender_name_from_api(self, sender_id: Optional[str]) -> Optional[str]:
+        """Low-level single-user Feishu contact lookup without cache wrapping."""
         if not sender_id or not self._client:
             return None
         trimmed = sender_id.strip()
         if not trimmed:
             return None
-        now = time.time()
-        cached_name = self._get_cached_sender_name(trimmed)
-        if cached_name is not None:
-            return cached_name
         try:
-            from lark_oapi.api.contact.v3 import GetUserRequest  # lazy import
             if trimmed.startswith("ou_"):
                 id_type = "open_id"
             elif trimmed.startswith("on_"):
                 id_type = "union_id"
             else:
                 id_type = "user_id"
-            request = GetUserRequest.builder().user_id(trimmed).user_id_type(id_type).build()
+            try:
+                from lark_oapi.api.contact.v3 import GetUserRequest  # lazy import
+                request = GetUserRequest.builder().user_id(trimmed).user_id_type(id_type).build()
+            except Exception:
+                request = SimpleNamespace(user_id=trimmed, user_id_type=id_type)
             response = await asyncio.to_thread(self._client.contact.v3.user.get, request)
             if not response or not response.success():
                 return None
@@ -3309,14 +3321,53 @@ class FeishuAdapter(BasePlatformAdapter):
                 or getattr(user, "nickname", None)
                 or getattr(user, "en_name", None)
             )
-            if name and isinstance(name, str):
-                name = name.strip()
-                if name:
-                    self._sender_name_cache[trimmed] = (name, now + _FEISHU_SENDER_NAME_TTL_SECONDS)
-                    return name
+            return str(name).strip() if isinstance(name, str) and name.strip() else None
         except Exception:
-            logger.debug("[Feishu] Failed to resolve sender name for %s", sender_id, exc_info=True)
-        return None
+            logger.debug("[Feishu] Failed to fetch sender name for %s", sender_id, exc_info=True)
+            return None
+
+    async def _batch_resolve_sender_names_from_api(self, sender_ids: List[str] | tuple[str, ...]) -> Dict[str, Optional[str]]:
+        """Batch contact lookup for open_id sender names, falling back silently on failure."""
+        if not self._client:
+            return {}
+        normalized_ids = [str(sender_id or "").strip() for sender_id in sender_ids if str(sender_id or "").strip()]
+        if not normalized_ids:
+            return {}
+
+        open_ids = [sender_id for sender_id in normalized_ids if sender_id.startswith("ou_")]
+        result: Dict[str, Optional[str]] = {}
+        if not open_ids:
+            return result
+        try:
+            try:
+                from lark_oapi.api.contact.v3 import BatchUserRequest
+                request = (
+                    BatchUserRequest.builder()
+                    .user_ids(open_ids)
+                    .user_id_type("open_id")
+                    .build()
+                )
+            except Exception:
+                request = SimpleNamespace(user_ids=open_ids, user_id_type="open_id")
+            response = await asyncio.to_thread(self._client.contact.v3.user.batch, request)
+            if not response or not response.success():
+                return {}
+            items = getattr(getattr(response, "data", None), "items", None) or []
+            for item in items:
+                sender_id = str(getattr(item, "open_id", "") or "").strip()
+                if not sender_id:
+                    continue
+                name = (
+                    getattr(item, "name", None)
+                    or getattr(item, "display_name", None)
+                    or getattr(item, "nickname", None)
+                    or getattr(item, "en_name", None)
+                )
+                result[sender_id] = str(name).strip() if isinstance(name, str) and name.strip() else None
+            return result
+        except Exception:
+            logger.debug("[Feishu] Batch sender-name lookup failed", exc_info=True)
+            return {}
 
     async def _fetch_message_items(self, message_id: str) -> List[Any]:
         if not self._client or not message_id:
@@ -3421,10 +3472,15 @@ class FeishuAdapter(BasePlatformAdapter):
             if sender_id and sender_id not in seen:
                 seen.add(sender_id)
                 sender_ids.append(sender_id)
-        for sender_id in sender_ids:
-            name = await self._resolve_sender_name_from_api(sender_id)
-            if name:
-                self._sender_name_cache[sender_id] = (name, time.time() + _FEISHU_SENDER_NAME_TTL_SECONDS)
+        if not sender_ids:
+            return
+        await resolve_feishu_sender_display_names(
+            self._sender_name_cache,
+            sender_ids,
+            account_scope=self._app_id or None,
+            batch_resolver=self._batch_resolve_sender_names_from_api,
+            single_resolver=self._resolve_sender_name_from_api,
+        )
 
     def _cached_sender_name(self, sender_id: str) -> Optional[str]:
         normalized = str(sender_id or "").strip()

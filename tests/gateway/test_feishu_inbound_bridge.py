@@ -4,12 +4,18 @@ import json
 from datetime import datetime
 from types import SimpleNamespace
 
+import pytest
+
 from gateway.platforms.base import MessageType
 from gateway.platforms.feishu_inbound.bridge import (
     FeishuExtractedContent,
     build_extracted_content,
+    build_feishu_inbound_content_bridge,
+    build_feishu_message_event,
+    build_feishu_reply_context_bridge,
     build_message_event,
     build_reply_context,
+    coerce_command_message_type,
     extract_text_from_raw_content,
     resolve_message_context_type,
     resolve_normalized_message_type,
@@ -193,3 +199,159 @@ def test_build_message_event_copies_reply_quote_and_command_fields():
     assert event.reply_to_media_types == ["image/png"]
     assert event.quoted_context is quoted_context
     assert event.timestamp == timestamp
+
+
+def test_build_feishu_reply_context_bridge_propagates_root_reply_and_quoted_media():
+    message = SimpleNamespace(
+        message_id="om_reply_bridge",
+        parent_id=None,
+        root_id="om_root",
+        upper_message_id="om_upper",
+    )
+    quoted_context = FeishuQuotedContext(
+        message_id="om_root",
+        kind="card",
+        text="Quoted body",
+        summary="",
+        sender_name="Alice",
+        media_urls=("/tmp/original.png",),
+        media_types=("image/png",),
+        stable_ref="feishu:om_root",
+        metadata={"expanded_from_items": True},
+    )
+
+    reply_context = build_feishu_reply_context_bridge(message=message, quoted_context=quoted_context)
+
+    assert reply_context.reply_to_message_id == "om_root"
+    assert reply_context.reply_to_text == "Quoted body"
+    assert reply_context.reply_to_media_urls == ("/tmp/original.png",)
+    assert reply_context.reply_to_media_types == ("image/png",)
+    assert reply_context.quoted_context is quoted_context
+
+
+@pytest.mark.parametrize(
+    ("text", "message_type", "expected"),
+    [
+        ("/reset session", MessageType.TEXT, MessageType.COMMAND),
+        ("/reset session", MessageType.DOCUMENT, MessageType.DOCUMENT),
+        (" /reset session", MessageType.TEXT, MessageType.TEXT),
+    ],
+)
+def test_coerce_command_message_type_only_promotes_leading_slash_text(text, message_type, expected):
+    assert coerce_command_message_type(text=text, message_type=message_type) == expected
+
+
+@pytest.mark.parametrize(
+    (
+        "message_type",
+        "raw_content",
+        "media_urls",
+        "media_types",
+        "injected_text",
+        "expected_text",
+        "expected_type",
+    ),
+    [
+        (
+            "file",
+            '{"file_key":"file_1","file_name":"notes.txt"}',
+            ["/tmp/notes.txt"],
+            ["text/plain"],
+            "[Content of notes.txt]:\nhello world",
+            "[Content of notes.txt]:\nhello world",
+            MessageType.DOCUMENT,
+        ),
+        (
+            "audio",
+            '{"file_key":"audio_1","file_name":"voice.m4a"}',
+            ["/tmp/voice.m4a"],
+            ["audio/m4a"],
+            "Transcript: hello world",
+            "Transcript: hello world",
+            MessageType.AUDIO,
+        ),
+        (
+            "image",
+            '{"image_key":"img_1"}',
+            ["/tmp/image.png"],
+            ["image/png"],
+            "OCR text that should stay detached",
+            "",
+            MessageType.PHOTO,
+        ),
+        (
+            "file",
+            '{"file_key":"file_2","file_name":"bundle.zip"}',
+            ["/tmp/part-1.zip", "/tmp/part-2.zip"],
+            ["application/zip", "application/zip"],
+            "Combined contents",
+            "",
+            MessageType.DOCUMENT,
+        ),
+    ],
+)
+def test_build_feishu_inbound_content_bridge_text_injection_respects_shape_and_type(
+    message_type,
+    raw_content,
+    media_urls,
+    media_types,
+    injected_text,
+    expected_text,
+    expected_type,
+):
+    message = SimpleNamespace(
+        message_id=f"om_{message_type}",
+        message_type=message_type,
+        content=raw_content,
+        chat_id="oc_chat",
+        chat_type="p2p",
+        root_id=None,
+        parent_id=None,
+        thread_id=None,
+    )
+
+    extracted = build_feishu_inbound_content_bridge(
+        message=message,
+        media_urls=media_urls,
+        media_types=media_types,
+        injected_text=injected_text,
+    )
+
+    assert extracted.text == expected_text
+    assert extracted.message_type == expected_type
+    assert extracted.media_urls == tuple(media_urls)
+    assert extracted.media_types == tuple(media_types)
+
+
+def test_build_feishu_message_event_propagates_quoted_context_via_bridge_helpers():
+    message = SimpleNamespace(
+        message_id="om_reply_bridge",
+        parent_id=None,
+        root_id=None,
+        upper_message_id="om_upper",
+    )
+    quoted_context = FeishuQuotedContext(
+        message_id="om_upper",
+        kind="plain",
+        text="Original text",
+        media_urls=("/tmp/original.png",),
+        media_types=("image/png",),
+    )
+    reply_context = build_feishu_reply_context_bridge(message=message, quoted_context=quoted_context)
+
+    event = build_feishu_message_event(
+        data={"event": "payload"},
+        message=message,
+        source=SimpleNamespace(thread_id="thread-2"),
+        inbound_content=FeishuExtractedContent(text="Thanks", message_type=MessageType.TEXT),
+        reply_context=reply_context,
+    )
+
+    assert reply_context.reply_to_message_id == "om_upper"
+    assert reply_context.reply_to_text == "Original text"
+    assert event.message_type == MessageType.TEXT
+    assert event.reply_to_message_id == "om_upper"
+    assert event.reply_to_text == "Original text"
+    assert event.reply_to_media_urls == ["/tmp/original.png"]
+    assert event.reply_to_media_types == ["image/png"]
+    assert event.quoted_context is quoted_context

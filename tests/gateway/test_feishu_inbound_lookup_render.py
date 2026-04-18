@@ -156,6 +156,35 @@ def test_build_feishu_message_context_prefers_embedded_sender_name_over_sender_i
     assert context.content == "- Alice Embedded: Investigating"
 
 
+def test_build_feishu_message_context_hides_opaque_sender_ids_when_merge_forward_lookup_missing():
+    response_items = [
+        SimpleNamespace(
+            message_id="om_merge",
+            msg_type="merge_forward",
+            body=SimpleNamespace(content='{"title":"Forwarded"}'),
+        ),
+        SimpleNamespace(
+            message_id="om_text",
+            upper_message_id="om_merge",
+            msg_type="text",
+            body=SimpleNamespace(content='{"text":"Investigating"}'),
+            sender=SimpleNamespace(id="ou_hidden_sender"),
+            create_time="1",
+        ),
+    ]
+
+    context = build_feishu_message_context(
+        message_id="om_merge",
+        message_type="merge_forward",
+        raw_content='{"title":"Forwarded"}',
+        response_items=response_items,
+        resolve_sender_name_sync=lambda _sender_id: None,
+    )
+
+    assert context.content == "- Investigating"
+    assert "ou_hidden_sender" not in context.content
+
+
 def test_build_feishu_quoted_context_downloads_expanded_merge_forward_resources():
     response_items = [
         SimpleNamespace(
@@ -234,6 +263,45 @@ def test_build_feishu_quoted_context_uses_embedded_sender_name_when_lookup_missi
 
     assert quoted.sender_name == "Alice Embedded"
     assert quoted.summary == "Alice Embedded: Hello"
+
+
+def test_build_feishu_quoted_context_hides_opaque_sender_ids_in_merge_forward_summary_and_render():
+    response_items = [
+        SimpleNamespace(
+            message_id="om_merge",
+            msg_type="merge_forward",
+            body=SimpleNamespace(content='{"title":"Forwarded"}'),
+            sender=SimpleNamespace(id="ou_forwarder"),
+        ),
+        SimpleNamespace(
+            message_id="om_text",
+            upper_message_id="om_merge",
+            msg_type="text",
+            body=SimpleNamespace(content='{"text":"Investigating"}'),
+            sender=SimpleNamespace(id="ou_hidden_sender"),
+            create_time="1",
+        ),
+    ]
+
+    quoted = asyncio.run(
+        build_feishu_quoted_context(
+            message_id="om_merge",
+            response_items=response_items,
+            download_resources=AsyncMock(return_value=([], [])),
+            resolve_sender_name=AsyncMock(return_value=None),
+            resolve_sender_name_sync=lambda _sender_id: None,
+        )
+    )
+    rendered = render_quoted_context_block(quoted)
+
+    assert quoted.sender_name == ""
+    assert quoted.summary == "- Investigating"
+    assert "ou_forwarder" not in quoted.summary
+    assert "ou_hidden_sender" not in quoted.summary
+    assert "sender:" not in rendered
+    assert "summary: - Investigating" in rendered
+    assert "ou_forwarder" not in rendered
+    assert "ou_hidden_sender" not in rendered
 
 
 def test_render_quoted_context_block_includes_history_truncation_image_analysis_and_media_count():

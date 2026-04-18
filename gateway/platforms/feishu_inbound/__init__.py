@@ -35,6 +35,16 @@ from .media_index import (
     remove_feishu_media_index_entry,
 )
 from .render import render_quoted_context_block
+from .user_name_cache import (
+    DEFAULT_FEISHU_SENDER_NAME_TTL_SECONDS,
+    FeishuSenderNameCache,
+    FeishuSenderNameCacheEntry,
+    coerce_feishu_sender_display_name,
+    resolve_feishu_sender_display_name,
+    resolve_feishu_sender_display_names,
+    resolve_feishu_sender_name,
+    resolve_feishu_sender_names,
+)
 
 __all__ = [
     "FeishuMessageContext",
@@ -60,4 +70,12 @@ __all__ = [
     "put_feishu_media_index_entry",
     "remove_feishu_media_index_entry",
     "render_quoted_context_block",
+    "DEFAULT_FEISHU_SENDER_NAME_TTL_SECONDS",
+    "FeishuSenderNameCache",
+    "FeishuSenderNameCacheEntry",
+    "coerce_feishu_sender_display_name",
+    "resolve_feishu_sender_display_name",
+    "resolve_feishu_sender_display_names",
+    "resolve_feishu_sender_name",
+    "resolve_feishu_sender_names",
 ]
