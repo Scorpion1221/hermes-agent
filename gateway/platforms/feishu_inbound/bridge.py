@@ -8,7 +8,7 @@ content into Hermes gateway ``MessageEvent`` objects.
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional, Sequence
+from typing import Any, Awaitable, Callable, Dict, Optional, Sequence
 
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
@@ -54,6 +54,13 @@ class FeishuReplyContextBridge:
 # Backward-compatible aliases for main-thread wiring while extraction is in flight.
 FeishuExtractedContent = FeishuInboundContentBridge
 FeishuReplyContextData = FeishuReplyContextBridge
+
+
+@dataclass(frozen=True)
+class FeishuSenderProfile:
+    user_id: Optional[str]
+    user_name: Optional[str]
+    user_id_alt: Optional[str]
 
 
 def resolve_feishu_media_message_type(media_type: str, *, default: MessageType) -> MessageType:
@@ -192,6 +199,32 @@ def build_reply_context(
         reply_to_media_urls=reply_to_media_urls,
         reply_to_media_types=reply_to_media_types,
         quoted_context=quoted_context,
+    )
+
+
+def resolve_feishu_source_chat_type(*, chat_info: Dict[str, Any], event_chat_type: str) -> str:
+    resolved = str(chat_info.get("type") or "").strip().lower()
+    if resolved in {"group", "forum"}:
+        return resolved
+    if event_chat_type == "p2p":
+        return "dm"
+    return "group"
+
+
+async def build_feishu_sender_profile(
+    *,
+    sender_id: Any,
+    resolve_display_name: Callable[[Optional[str]], Awaitable[Optional[str]]],
+) -> FeishuSenderProfile:
+    open_id = getattr(sender_id, "open_id", None) or None
+    user_id = getattr(sender_id, "user_id", None) or None
+    union_id = getattr(sender_id, "union_id", None) or None
+    primary_id = open_id or user_id
+    display_name = await resolve_display_name(primary_id or union_id)
+    return FeishuSenderProfile(
+        user_id=primary_id,
+        user_name=display_name,
+        user_id_alt=union_id,
     )
 
 

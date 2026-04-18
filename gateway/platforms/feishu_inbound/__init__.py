@@ -21,11 +21,14 @@ from .lookup import (
     extract_message_items,
 )
 from .bridge import (
+    FeishuSenderProfile,
     build_inbound_message_event,
+    build_feishu_sender_profile,
     extract_message_content,
     extract_text_from_raw_content,
     resolve_context_message_type,
     resolve_media_message_type,
+    resolve_feishu_source_chat_type,
 )
 from .media_index import (
     FeishuMediaIndexEntry,
@@ -35,6 +38,19 @@ from .media_index import (
     remove_feishu_media_index_entry,
 )
 from .render import render_quoted_context_block
+from .comment_target import (
+    FeishuCommentTarget,
+    build_feishu_comment_target,
+    parse_feishu_comment_target,
+    is_feishu_comment_target,
+)
+from .comment_context import (
+    FeishuDriveCommentEvent,
+    FeishuDriveCommentTurn,
+    build_drive_comment_prompt,
+    parse_feishu_drive_comment_notice_event_payload,
+    resolve_drive_comment_event_turn,
+)
 from .user_name_cache import (
     DEFAULT_FEISHU_SENDER_NAME_TTL_SECONDS,
     FeishuSenderNameCache,
@@ -60,10 +76,13 @@ __all__ = [
     "build_resource_descriptors",
     "extract_message_items",
     "build_inbound_message_event",
+    "FeishuSenderProfile",
+    "build_feishu_sender_profile",
     "extract_message_content",
     "extract_text_from_raw_content",
     "resolve_context_message_type",
     "resolve_media_message_type",
+    "resolve_feishu_source_chat_type",
     "FeishuMediaIndexEntry",
     "make_media_index_key",
     "get_feishu_media_index_entry",
@@ -78,4 +97,13 @@ __all__ = [
     "resolve_feishu_sender_display_names",
     "resolve_feishu_sender_name",
     "resolve_feishu_sender_names",
+    "FeishuCommentTarget",
+    "build_feishu_comment_target",
+    "parse_feishu_comment_target",
+    "is_feishu_comment_target",
+    "FeishuDriveCommentEvent",
+    "FeishuDriveCommentTurn",
+    "build_drive_comment_prompt",
+    "parse_feishu_drive_comment_notice_event_payload",
+    "resolve_drive_comment_event_turn",
 ]

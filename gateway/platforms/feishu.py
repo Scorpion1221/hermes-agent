@@ -114,6 +114,7 @@ from gateway.platforms.feishu_inbound import (
     FeishuInboundContentBridge,
     FeishuReplyContextBridge,
     FeishuSenderNameCache,
+    build_feishu_sender_profile,
     build_feishu_inbound_content_bridge,
     build_feishu_message_event,
     build_feishu_reply_context_bridge,
@@ -127,6 +128,12 @@ from gateway.platforms.feishu_inbound import (
     resolve_feishu_sender_display_name,
     resolve_feishu_sender_display_names,
     resolve_feishu_sender_name,
+    resolve_feishu_source_chat_type,
+    build_feishu_comment_target,
+    is_feishu_comment_target,
+    parse_feishu_comment_target,
+    parse_feishu_drive_comment_notice_event_payload,
+    resolve_drive_comment_event_turn,
     resolve_context_message_type as feishu_resolve_context_message_type,
 )
 from gateway.platforms.feishu_inbound import parse as feishu_parse
@@ -1406,6 +1413,8 @@ class FeishuAdapter(BasePlatformAdapter):
         """Send a Feishu message."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
+        if is_feishu_comment_target(chat_id):
+            return await self._send_drive_comment_message(chat_id=chat_id, content=content)
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
@@ -1474,6 +1483,77 @@ class FeishuAdapter(BasePlatformAdapter):
             return self._finalize_send_result(last_response, "send failed")
         except Exception as exc:
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def _send_drive_comment_message(self, *, chat_id: str, content: str) -> SendResult:
+        target = parse_feishu_comment_target(chat_id)
+        if not target or not self._client:
+            return SendResult(success=False, error=f"Invalid comment target: {chat_id}")
+        text = _strip_markdown_to_plain_text(content).strip()
+        if not text:
+            return SendResult(success=False, error="Empty comment content")
+        elements = [{"type": "text_run", "text_run": {"text": text}}]
+        try:
+            if target.delivery_mode == "create_whole":
+                from lark_oapi.api.drive.v1.model.create_file_comment_request import (
+                    CreateFileCommentRequest,
+                    FileComment,
+                )
+                from lark_oapi.api.drive.v1.model.reply_content import ReplyContent, ReplyElement
+                from lark_oapi.api.drive.v1.model.reply_element import TextRun
+                from lark_oapi.api.drive.v1.model.reply_list import ReplyList, FileCommentReply
+
+                reply = (
+                    FileCommentReply.builder()
+                    .content(
+                        ReplyContent.builder().elements(
+                            [ReplyElement.builder().type("text_run").text_run(TextRun.builder().text(text).build()).build()]
+                        ).build()
+                    )
+                    .build()
+                )
+                body = FileComment.builder().reply_list(ReplyList.builder().replies([reply]).build()).build()
+                request = (
+                    CreateFileCommentRequest.builder()
+                    .file_token(target.file_token)
+                    .file_type(target.file_type)
+                    .user_id_type("open_id")
+                    .request_body(body)
+                    .build()
+                )
+                response = await asyncio.to_thread(self._client.drive.v1.file_comment.create, request)
+                if response and response.success():
+                    return SendResult(success=True, message_id=f"comment-create:{target.comment_id}", raw_response=response)
+                return self._response_error_result(response, default_message="comment create failed")
+
+            response = await asyncio.to_thread(
+                self._client.request,
+                {
+                    "method": "POST",
+                    "url": f"/open-apis/drive/v1/files/{target.file_token}/comments/{target.comment_id}/replies",
+                    "params": {"file_type": target.file_type, "user_id_type": "open_id"},
+                    "data": {"content": {"elements": elements}},
+                },
+            )
+            if response and getattr(response, "code", 0) == 0:
+                return SendResult(success=True, message_id=f"comment-reply:{target.comment_id}", raw_response=response)
+            # Fallback payload shape
+            response = await asyncio.to_thread(
+                self._client.request,
+                {
+                    "method": "POST",
+                    "url": f"/open-apis/drive/v1/files/{target.file_token}/comments/{target.comment_id}/replies",
+                    "params": {"file_type": target.file_type, "user_id_type": "open_id"},
+                    "data": {"reply_elements": elements},
+                },
+            )
+            if response and getattr(response, "code", 0) == 0:
+                return SendResult(success=True, message_id=f"comment-reply:{target.comment_id}", raw_response=response)
+            code = getattr(response, "code", "unknown")
+            msg = getattr(response, "msg", "comment reply failed")
+            return SendResult(success=False, error=f"[{code}] {msg}", raw_response=response)
+        except Exception as exc:
+            logger.error("[Feishu] Failed to send drive comment message %s: %s", chat_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
     async def edit_message(
@@ -2036,6 +2116,43 @@ class FeishuAdapter(BasePlatformAdapter):
 
     def _on_message_recalled(self, data: Any) -> None:
         logger.debug("[Feishu] Message recalled by user")
+
+    async def _handle_drive_comment_event_data(self, data: Any) -> None:
+        parsed = parse_feishu_drive_comment_notice_event_payload(data)
+        if parsed is None:
+            logger.debug("[Feishu] Dropping malformed drive comment event")
+            return
+        sender = getattr(parsed, "user_id", None)
+        sender_open_id = getattr(sender, "open_id", None) if sender is not None else None
+        if not sender_open_id:
+            logger.debug("[Feishu] Dropping drive comment event without sender open_id")
+            return
+        if self._bot_open_id and sender_open_id == self._bot_open_id:
+            logger.debug("[Feishu] Ignoring self-authored drive comment event")
+            return
+        turn = await resolve_drive_comment_event_turn(adapter=self, event=parsed)
+        if turn is None:
+            logger.debug("[Feishu] Failed to resolve drive comment context for %s", parsed.comment_id)
+            return
+        sender_profile = await self._resolve_sender_profile(sender)
+        source = self.build_source(
+            chat_id=turn.comment_target,
+            chat_name=f"Feishu comment {parsed.comment_id}",
+            chat_type="dm",
+            user_id=sender_profile["user_id"],
+            user_name=sender_profile["user_name"],
+            thread_id=None,
+            user_id_alt=sender_profile["user_id_alt"],
+        )
+        event = MessageEvent(
+            text=turn.prompt,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=data,
+            message_id=f"comment:{parsed.comment_id}:{parsed.reply_id or 'root'}",
+            timestamp=datetime.now(),
+        )
+        await self._handle_message_with_guards(event)
 
     def _on_reaction_event(self, event_type: str, data: Any) -> None:
         """Route user reactions on bot messages as synthetic text events."""
@@ -2717,6 +2834,8 @@ class FeishuAdapter(BasePlatformAdapter):
             self._on_reaction_event(event_type, data)
         elif event_type == "card.action.trigger":
             self._on_card_action_trigger(data)
+        elif event_type == "drive.notice.comment_add_v1":
+            await self._handle_drive_comment_event_data(data)
         else:
             logger.debug("[Feishu] Ignoring webhook event type: %s", event_type or "unknown")
         return _web_json_response({"code": 0, "msg": "ok"})
@@ -3254,27 +3373,20 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _resolve_source_chat_type(*, chat_info: Dict[str, Any], event_chat_type: str) -> str:
-        resolved = str(chat_info.get("type") or "").strip().lower()
-        if resolved in {"group", "forum"}:
-            return resolved
-        if event_chat_type == "p2p":
-            return "dm"
-        return "group"
+        return resolve_feishu_source_chat_type(
+            chat_info=chat_info,
+            event_chat_type=event_chat_type,
+        )
 
     async def _resolve_sender_profile(self, sender_id: Any) -> Dict[str, Optional[str]]:
-        open_id = getattr(sender_id, "open_id", None) or None
-        user_id = getattr(sender_id, "user_id", None) or None
-        union_id = getattr(sender_id, "union_id", None) or None
-        primary_id = open_id or user_id
-        resolved_name = await self._resolve_sender_name_from_api(primary_id or union_id)
-        display_name = coerce_feishu_sender_display_name(
-            sender_name=resolved_name,
-            sender_id=primary_id or union_id,
+        profile = await build_feishu_sender_profile(
+            sender_id=sender_id,
+            resolve_display_name=lambda raw_id: self._resolve_sender_name_from_api(raw_id),
         )
         return {
-            "user_id": primary_id,
-            "user_name": display_name,
-            "user_id_alt": union_id,
+            "user_id": profile.user_id,
+            "user_name": profile.user_name,
+            "user_id_alt": profile.user_id_alt,
         }
 
     def _get_cached_sender_name(self, sender_id: Optional[str]) -> Optional[str]:

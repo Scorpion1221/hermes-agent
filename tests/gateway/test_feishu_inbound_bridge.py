@@ -3,20 +3,24 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from gateway.platforms.base import MessageType
 from gateway.platforms.feishu_inbound.bridge import (
     FeishuExtractedContent,
+    FeishuSenderProfile,
     build_extracted_content,
     build_feishu_inbound_content_bridge,
     build_feishu_message_event,
+    build_feishu_sender_profile,
     build_feishu_reply_context_bridge,
     build_message_event,
     build_reply_context,
     coerce_command_message_type,
     extract_text_from_raw_content,
+    resolve_feishu_source_chat_type,
     resolve_message_context_type,
     resolve_normalized_message_type,
     resolve_reply_to_message_id,
@@ -32,6 +36,28 @@ def test_resolve_reply_to_message_id_prefers_parent_then_root_then_upper():
     assert resolve_reply_to_message_id(parent_id="", root_id="om_root", upper_message_id="om_upper") == "om_root"
     assert resolve_reply_to_message_id(parent_id=None, root_id="", upper_message_id="om_upper") == "om_upper"
     assert resolve_reply_to_message_id(parent_id=None, root_id=None, upper_message_id=None) is None
+
+
+def test_resolve_feishu_source_chat_type_prefers_chat_info_type_then_event_type():
+    assert resolve_feishu_source_chat_type(chat_info={"type": "forum"}, event_chat_type="group") == "forum"
+    assert resolve_feishu_source_chat_type(chat_info={"type": "group"}, event_chat_type="p2p") == "group"
+    assert resolve_feishu_source_chat_type(chat_info={"type": "dm"}, event_chat_type="p2p") == "dm"
+    assert resolve_feishu_source_chat_type(chat_info={"type": ""}, event_chat_type="group") == "group"
+
+
+@pytest.mark.asyncio
+async def test_build_feishu_sender_profile_uses_resolved_display_name_and_preserves_ids():
+    sender_id = SimpleNamespace(open_id="ou_user", user_id="u_user", union_id="on_union")
+    profile = await build_feishu_sender_profile(
+        sender_id=sender_id,
+        resolve_display_name=AsyncMock(return_value="Alice"),
+    )
+
+    assert profile == FeishuSenderProfile(
+        user_id="ou_user",
+        user_name="Alice",
+        user_id_alt="on_union",
+    )
 
 
 def test_extract_text_from_raw_content_uses_placeholders_and_never_stringifies_null():
