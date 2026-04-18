@@ -8239,6 +8239,8 @@ class GatewayRunner:
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
         tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        _adapter_for_tp = self.adapters.get(source.platform)
+        _cardkit_tool_progress = tool_progress_enabled and getattr(_adapter_for_tp, "_use_cardkit_streaming", False)
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
@@ -8341,6 +8343,25 @@ class GatewayRunner:
 
             adapter = self.adapters.get(source.platform)
             if not adapter:
+                return
+
+            if _cardkit_tool_progress:
+                while True:
+                    try:
+                        raw = progress_queue.get_nowait()
+                        if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                            _, base_msg, count = raw
+                            msg = f"{base_msg} (×{count + 1})"
+                        else:
+                            msg = raw
+                        _sc = stream_consumer_holder[0]
+                        if _sc is not None:
+                            styled = f"\n> {msg}\n"
+                            _sc.on_delta(styled)
+                    except queue.Empty:
+                        await asyncio.sleep(0.3)
+                    except asyncio.CancelledError:
+                        return
                 return
 
             # Skip tool progress for platforms that don't support message
@@ -8511,6 +8532,8 @@ class GatewayRunner:
             except Exception as _e:
                 logger.debug("status_callback error (%s): %s", event_type, _e)
 
+        _inbound_message_id = event_message_id
+
         def run_sync():
             # The conditional re-assignment of `message` further below
             # (prepending model-switch notes) makes Python treat it as a
@@ -8615,23 +8638,35 @@ class GatewayRunner:
                         if source.platform == Platform.MATRIX:
                             _effective_cursor = ""
                             _buffer_only = True
+                        _feishu_cardkit = (
+                            source.platform == Platform.FEISHU
+                            and getattr(_adapter, "_use_cardkit_streaming", False)
+                        )
                         _consumer_cfg = StreamConsumerConfig(
-                            edit_interval=_scfg.edit_interval,
+                            edit_interval=0.1 if _feishu_cardkit else _scfg.edit_interval,
                             buffer_threshold=_scfg.buffer_threshold,
-                            cursor=_effective_cursor,
+                            cursor="" if _feishu_cardkit else _effective_cursor,
                             buffer_only=_buffer_only,
                         )
+                        _consumer_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else {}
+                        if _feishu_cardkit:
+                            _consumer_metadata["streaming"] = True
+                            _consumer_metadata["reply_to"] = _inbound_message_id
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,
                             chat_id=source.chat_id,
                             config=_consumer_cfg,
-                            metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
+                            metadata=_consumer_metadata or None,
                         )
                         if _want_stream_deltas:
                             _stream_delta_cb = _stream_consumer.on_delta
                         stream_consumer_holder[0] = _stream_consumer
+                        logger.info(
+                            "Stream consumer created: cardkit=%s streaming=%s deltas=%s",
+                            _feishu_cardkit, _consumer_metadata.get("streaming"), _want_stream_deltas,
+                        )
                 except Exception as _sc_err:
-                    logger.debug("Could not set up stream consumer: %s", _sc_err)
+                    logger.info("Could not set up stream consumer: %s", _sc_err)
 
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if _stream_consumer is not None:

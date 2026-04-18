@@ -100,6 +100,7 @@ class GatewayStreamConsumer:
         self._flood_strikes = 0         # Consecutive flood-control edit failures
         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
         self._final_response_sent = False
+        self._cardkit_mode = bool(metadata and metadata.get("streaming"))
 
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
@@ -386,13 +387,19 @@ class GatewayStreamConsumer:
                             self._final_response_sent = await self._send_or_edit(self._accumulated)
                         elif not self._already_sent:
                             self._final_response_sent = await self._send_or_edit(self._accumulated)
+                    if self._message_id and hasattr(self.adapter, "finalize_streaming_message"):
+                        try:
+                            await self.adapter.finalize_streaming_message(self._message_id, self._accumulated or "")
+                        except Exception as _fin_err:
+                            logger.warning("finalize_streaming_message failed: %s", _fin_err)
                     return
 
                 if commentary_text is not None:
-                    self._reset_segment_state()
-                    await self._send_commentary(commentary_text)
-                    self._last_edit_time = time.monotonic()
-                    self._reset_segment_state()
+                    if not self._cardkit_mode:
+                        self._reset_segment_state()
+                        await self._send_commentary(commentary_text)
+                        self._last_edit_time = time.monotonic()
+                        self._reset_segment_state()
 
                 # Tool boundary: reset message state so the next text chunk
                 # creates a fresh message below any tool-progress messages.
@@ -409,7 +416,8 @@ class GatewayStreamConsumer:
                 # a real string like "msg_1", not "__no_edit__", so that case
                 # still resets and creates a fresh segment as intended.)
                 if got_segment_break:
-                    self._reset_segment_state(preserve_no_edit=True)
+                    if not self._cardkit_mode:
+                        self._reset_segment_state(preserve_no_edit=True)
 
                 await asyncio.sleep(0.05)  # Small yield to not busy-loop
 

@@ -141,6 +141,15 @@ from gateway.platforms.feishu_inbound import (
     resolve_context_message_type as feishu_resolve_context_message_type,
 )
 from gateway.platforms.feishu_inbound import parse as feishu_parse
+from gateway.platforms.feishu_inbound.cardkit import (
+    CardKitState,
+    build_card_id_message_content,
+    build_final_card_body,
+    create_streaming_card,
+    set_card_streaming_mode,
+    stream_card_element,
+    update_card as cardkit_update_card,
+)
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
 
@@ -1120,6 +1129,12 @@ class FeishuAdapter(BasePlatformAdapter):
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
         self._card_action_tokens: Dict[str, float] = {}  # token → first_seen_time
+        self._streaming_cards: Dict[str, CardKitState] = {}
+        _st_raw = str(
+            getattr(self._settings, "streaming_transport", "") or (config.extra or {}).get("streaming_transport", "")
+        ).strip().lower()
+        self._use_cardkit_streaming: bool = _st_raw == "cardkit"
+        logger.info("[Feishu] CardKit streaming: %s (raw=%r, extra=%r)", self._use_cardkit_streaming, _st_raw, (config.extra or {}).get("streaming_transport"))
         # Inbound events that arrived before the adapter loop was ready
         # (e.g. during startup/restart or network-flap reconnect). A single
         # drainer thread replays them as soon as the loop becomes available.
@@ -1420,6 +1435,12 @@ class FeishuAdapter(BasePlatformAdapter):
         if is_feishu_comment_target(chat_id):
             return await self._send_drive_comment_message(chat_id=chat_id, content=content)
 
+        if self._use_cardkit_streaming and metadata and metadata.get("streaming"):
+            effective_reply_to = reply_to or (metadata.get("reply_to") if metadata else None)
+            result = await self._send_streaming_card(chat_id=chat_id, content=content, reply_to=effective_reply_to, metadata=metadata)
+            if result is not None:
+                return result
+
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         last_response = None
@@ -1570,6 +1591,10 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
+        state = self._streaming_cards.get(message_id)
+        if state and not state.failed:
+            return await self._edit_streaming_card(state, content)
+
         try:
             msg_type, payload = self._build_outbound_payload(content)
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
@@ -1601,6 +1626,62 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    async def _send_streaming_card(
+        self, *, chat_id: str, content: str, reply_to: Optional[str], metadata: Optional[Dict[str, Any]],
+    ) -> Optional[SendResult]:
+        card_id = await create_streaming_card(self._client)
+        if not card_id:
+            return None
+        payload = build_card_id_message_content(card_id)
+        try:
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id, msg_type="interactive", payload=payload,
+                reply_to=reply_to, metadata=metadata,
+            )
+            result = self._finalize_send_result(response, "streaming card send failed")
+            if result.success and result.message_id:
+                state = CardKitState(card_id=card_id, message_id=result.message_id, sequence=1, started_at=time.time())
+                self._streaming_cards[result.message_id] = state
+                await stream_card_element(
+                    self._client, card_id=card_id, element_id=state.element_id,
+                    content=content, sequence=state.sequence,
+                )
+                state.sequence += 1
+            return result
+        except Exception as exc:
+            logger.warning("[Feishu] Streaming card send failed, will fall back: %s", exc)
+            return None
+
+    async def _edit_streaming_card(self, state: CardKitState, content: str) -> SendResult:
+        state.sequence += 1
+        ok = await stream_card_element(
+            self._client, card_id=state.card_id, element_id=state.element_id,
+            content=content, sequence=state.sequence,
+        )
+        if not ok:
+            state.failed = True
+            return SendResult(success=False, error="CardKit stream failed")
+        return SendResult(success=True, message_id=state.message_id)
+
+    async def finalize_streaming_message(self, message_id: str, final_text: str = "") -> None:
+        state = self._streaming_cards.pop(message_id, None)
+        if not state:
+            logger.info("[Feishu] finalize_streaming_message: no state for %s", message_id)
+            return
+        elapsed = time.time() - state.started_at if state.started_at else 0.0
+        logger.info("[Feishu] Finalizing streaming card %s (seq=%d, elapsed=%.1fs)", state.card_id, state.sequence, elapsed)
+        state.sequence += 1
+        if final_text:
+            await cardkit_update_card(
+                self._client, card_id=state.card_id,
+                card_body=build_final_card_body(final_text, elapsed_seconds=elapsed), sequence=state.sequence,
+            )
+            state.sequence += 1
+        ok = await set_card_streaming_mode(
+            self._client, card_id=state.card_id, enabled=False, sequence=state.sequence,
+        )
+        logger.info("[Feishu] Streaming mode disabled for %s: %s", state.card_id, ok)
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
