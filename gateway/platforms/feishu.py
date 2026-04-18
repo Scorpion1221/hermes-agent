@@ -134,6 +134,10 @@ from gateway.platforms.feishu_inbound import (
     parse_feishu_comment_target,
     parse_feishu_drive_comment_notice_event_payload,
     resolve_drive_comment_event_turn,
+    allow_feishu_group_message,
+    feishu_message_mentions_bot,
+    feishu_post_mentions_bot,
+    should_accept_feishu_group_message,
     resolve_context_message_type as feishu_resolve_context_message_type,
 )
 from gateway.platforms.feishu_inbound import parse as feishu_parse
@@ -2130,7 +2134,12 @@ class FeishuAdapter(BasePlatformAdapter):
         if self._bot_open_id and sender_open_id == self._bot_open_id:
             logger.debug("[Feishu] Ignoring self-authored drive comment event")
             return
-        turn = await resolve_drive_comment_event_turn(adapter=self, event=parsed)
+        turn = await resolve_drive_comment_event_turn(
+            adapter=self,
+            event=parsed,
+            prefetch_sender_names=self._prefetch_sender_names_by_ids,
+            resolve_sender_name_sync=self._get_cached_sender_name,
+        )
         if turn is None:
             logger.debug("[Feishu] Failed to resolve drive comment context for %s", parsed.comment_id)
             return
@@ -3028,7 +3037,7 @@ class FeishuAdapter(BasePlatformAdapter):
         inbound_content = build_feishu_inbound_content_bridge(
             message=message,
             hydrated_items=hydrated_items,
-            resolve_sender_name_sync=self._cached_sender_name,
+            resolve_sender_name_sync=self._get_cached_sender_name,
         )
         message_context = inbound_content.message_context
         if message_context is None:
@@ -3054,7 +3063,7 @@ class FeishuAdapter(BasePlatformAdapter):
         inbound_content = build_feishu_inbound_content_bridge(
             message=message,
             hydrated_items=hydrated_items,
-            resolve_sender_name_sync=self._cached_sender_name,
+            resolve_sender_name_sync=self._get_cached_sender_name,
             media_urls=media_urls,
             media_types=media_types,
             injected_text=injected,
@@ -3425,6 +3434,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 request = SimpleNamespace(user_id=trimmed, user_id_type=id_type)
             response = await asyncio.to_thread(self._client.contact.v3.user.get, request)
             if not response or not response.success():
+                logger.info(
+                    "[Feishu] Single contact API failed for %s: code=%s msg=%s",
+                    sender_id, getattr(response, "code", "?"), getattr(response, "msg", "?"),
+                )
                 return None
             user = getattr(getattr(response, "data", None), "user", None)
             name = (
@@ -3463,6 +3476,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 request = SimpleNamespace(user_ids=open_ids, user_id_type="open_id")
             response = await asyncio.to_thread(self._client.contact.v3.user.batch, request)
             if not response or not response.success():
+                logger.info(
+                    "[Feishu] Batch contact API failed: code=%s msg=%s",
+                    getattr(response, "code", "?"), getattr(response, "msg", "?"),
+                )
                 return {}
             items = getattr(getattr(response, "data", None), "items", None) or []
             for item in items:
@@ -3478,7 +3495,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 result[sender_id] = str(name).strip() if isinstance(name, str) and name.strip() else None
             return result
         except Exception:
-            logger.debug("[Feishu] Batch sender-name lookup failed", exc_info=True)
+            logger.info("[Feishu] Batch sender-name lookup exception", exc_info=True)
             return {}
 
     async def _fetch_message_items(self, message_id: str) -> List[Any]:
@@ -3488,23 +3505,51 @@ class FeishuAdapter(BasePlatformAdapter):
         if cached is not None:
             return cached
         try:
-            raw_response = None
+            raw_items: List[Any] = []
             if hasattr(self._client, "request"):
                 try:
-                    raw_response = await asyncio.to_thread(
-                        self._client.request,
-                        {
+                    try:
+                        from lark_oapi.core.model import BaseRequest as LarkBaseRequest
+                        from lark_oapi.core import HttpMethod, AccessTokenType
+                        raw_request = (
+                            LarkBaseRequest.builder()
+                            .http_method(HttpMethod.GET)
+                            .uri("/open-apis/im/v1/messages/:message_id")
+                            .token_types({AccessTokenType.TENANT})
+                            .paths({"message_id": message_id})
+                            .queries([
+                                ("user_id_type", "open_id"),
+                                ("card_msg_content_type", "raw_card_content"),
+                            ])
+                            .build()
+                        )
+                    except Exception:
+                        raw_request = {
                             "method": "GET",
                             "url": f"/open-apis/im/v1/messages/{message_id}",
                             "params": {
                                 "user_id_type": "open_id",
                                 "card_msg_content_type": "raw_card_content",
                             },
-                        },
-                    )
+                        }
+                    raw_response = await asyncio.to_thread(self._client.request, raw_request)
+                    if raw_response is not None:
+                        raw_content = getattr(getattr(raw_response, "raw", None), "content", None)
+                        if raw_content:
+                            import json as _json
+                            parsed = _json.loads(raw_content)
+                            raw_items = parsed.get("data", {}).get("items", [])
+                            if raw_items:
+                                logger.info(
+                                    "[Feishu] Raw request fetched %d items for %s (sender IDs: %s)",
+                                    len(raw_items),
+                                    message_id,
+                                    [item.get("sender", {}).get("id", "?") if isinstance(item, dict) else "obj" for item in raw_items[:5]],
+                                )
+                        if not raw_items:
+                            raw_items = extract_message_items(raw_response)
                 except Exception:
-                    logger.debug("[Feishu] Raw message request fallback failed for %s", message_id, exc_info=True)
-            raw_items = extract_message_items(raw_response) if raw_response is not None else []
+                    logger.info("[Feishu] Raw message request failed for %s", message_id, exc_info=True)
             if raw_items:
                 self._message_items_cache[message_id] = raw_items
                 return raw_items
@@ -3517,6 +3562,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 logger.warning("[Feishu] Failed to fetch message %s: [%s] %s", message_id, code, msg)
                 return []
             items = extract_message_items(response)
+            logger.info(
+                "[Feishu] SDK path fetched %d items for %s",
+                len(items), message_id,
+            )
             self._message_items_cache[message_id] = items
             return items
         except Exception:
@@ -3563,7 +3612,12 @@ class FeishuAdapter(BasePlatformAdapter):
             return None
         try:
             primary_item = items[0]
-            primary_type = str(getattr(primary_item, "msg_type", "") or "").strip().lower()
+            primary_type = str((primary_item.get("msg_type", "") if isinstance(primary_item, dict) else getattr(primary_item, "msg_type", "")) or "").strip().lower()
+            logger.info(
+                "[Feishu] Quoted context for %s: type=%s items=%d item_format=%s",
+                message_id, primary_type, len(items),
+                "dict" if isinstance(primary_item, dict) else type(primary_item).__name__,
+            )
             if primary_type == "merge_forward":
                 await self._prefetch_item_sender_names(items)
             quoted_context = await build_feishu_quoted_context(
@@ -3574,7 +3628,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     descriptors=descriptors,
                 ),
                 resolve_sender_name=self._resolve_sender_name_from_api,
-                resolve_sender_name_sync=self._cached_sender_name,
+                resolve_sender_name_sync=self._get_cached_sender_name,
             )
             self._quoted_context_cache[message_id] = quoted_context
             self._message_text_cache[message_id] = quoted_context.display_text or None
@@ -3597,36 +3651,39 @@ class FeishuAdapter(BasePlatformAdapter):
         text, _media_urls, _media_types = await self._fetch_reply_context(message_id)
         return text
 
+    async def _prefetch_sender_names_by_ids(self, sender_ids: List[str] | tuple[str, ...]) -> None:
+        normalized = [str(s or "").strip() for s in sender_ids if str(s or "").strip()]
+        if not normalized:
+            return
+        await resolve_feishu_sender_display_names(
+            self._sender_name_cache,
+            normalized,
+            account_scope=self._app_id or None,
+            batch_resolver=self._batch_resolve_sender_names_from_api,
+            single_resolver=self._resolve_sender_name_from_api,
+        )
+
     async def _prefetch_item_sender_names(self, items: List[Any]) -> None:
         sender_ids: List[str] = []
         seen: set[str] = set()
         for item in items:
-            sender_id = str(getattr(getattr(item, "sender", None), "id", "") or "").strip()
+            sender = item.get("sender") if isinstance(item, dict) else getattr(item, "sender", None)
+            sender_id = str((sender.get("id", "") if isinstance(sender, dict) else getattr(sender, "id", "")) if sender else "").strip()
             if sender_id and sender_id not in seen:
                 seen.add(sender_id)
                 sender_ids.append(sender_id)
         if not sender_ids:
+            logger.info("[Feishu] Prefetch: no sender IDs extracted from %d items", len(items))
             return
-        await resolve_feishu_sender_display_names(
+        logger.info("[Feishu] Prefetch: resolving %d sender IDs: %s", len(sender_ids), sender_ids[:10])
+        resolved = await resolve_feishu_sender_display_names(
             self._sender_name_cache,
             sender_ids,
             account_scope=self._app_id or None,
             batch_resolver=self._batch_resolve_sender_names_from_api,
             single_resolver=self._resolve_sender_name_from_api,
         )
-
-    def _cached_sender_name(self, sender_id: str) -> Optional[str]:
-        normalized = str(sender_id or "").strip()
-        if not normalized:
-            return None
-        cached = self._sender_name_cache.get(normalized)
-        if not cached:
-            return None
-        name, expire_at = cached
-        if expire_at <= time.time():
-            self._sender_name_cache.pop(normalized, None)
-            return None
-        return name
+        logger.info("[Feishu] Prefetch resolved: %s", {k: v for k, v in resolved.items() if v})
 
     def _extract_text_from_raw_content(self, *, msg_type: str, raw_content: str) -> Optional[str]:
         return feishu_extract_text_from_raw_content(msg_type=msg_type, raw_content=raw_content)
@@ -3651,80 +3708,48 @@ class FeishuAdapter(BasePlatformAdapter):
 
     def _allow_group_message(self, sender_id: Any, chat_id: str = "") -> bool:
         """Per-group policy gate for non-DM traffic."""
-        sender_open_id = getattr(sender_id, "open_id", None)
-        sender_user_id = getattr(sender_id, "user_id", None)
-        sender_ids = {sender_open_id, sender_user_id} - {None}
-
-        if sender_ids and self._admins and (sender_ids & self._admins):
-            return True
-
-        rule = self._group_rules.get(chat_id) if chat_id else None
-        if rule:
-            policy = rule.policy
-            allowlist = rule.allowlist
-            blacklist = rule.blacklist
-        else:
-            policy = self._default_group_policy or self._group_policy
-            allowlist = self._allowed_group_users
-            blacklist = set()
-
-        if policy == "disabled":
-            return False
-        if policy == "open":
-            return True
-        if policy == "admin_only":
-            return False
-        if policy == "allowlist":
-            return bool(sender_ids and (sender_ids & allowlist))
-        if policy == "blacklist":
-            return bool(sender_ids and not (sender_ids & blacklist))
-
-        return bool(sender_ids and (sender_ids & self._allowed_group_users))
+        return allow_feishu_group_message(
+            sender_id=sender_id,
+            chat_id=chat_id,
+            admins=self._admins,
+            group_rules=self._group_rules,
+            default_group_policy=self._default_group_policy,
+            group_policy=self._group_policy,
+            allowed_group_users=self._allowed_group_users,
+        )
 
     def _should_accept_group_message(self, message: Any, sender_id: Any, chat_id: str = "") -> bool:
         """Require sender policy pass plus an explicit bot/@all mention for group messages."""
-        if not self._allow_group_message(sender_id, chat_id):
-            return False
-        # @_all is Feishu's @everyone placeholder — always route to the bot.
-        raw_content = getattr(message, "content", "") or ""
-        if "@_all" in raw_content:
-            return True
-        mentions = getattr(message, "mentions", None) or []
-        if mentions:
-            return self._message_mentions_bot(mentions)
-        normalized = normalize_feishu_message(
-            message_type=getattr(message, "message_type", "") or "",
-            raw_content=raw_content,
+        return should_accept_feishu_group_message(
+            message=message,
+            sender_id=sender_id,
+            chat_id=chat_id,
+            admins=self._admins,
+            group_rules=self._group_rules,
+            default_group_policy=self._default_group_policy,
+            group_policy=self._group_policy,
+            allowed_group_users=self._allowed_group_users,
+            bot_open_id=self._bot_open_id,
+            bot_user_id=self._bot_user_id,
+            bot_name=self._bot_name,
+            normalize_message=normalize_feishu_message,
         )
-        if normalized.mentioned_ids:
-            return self._post_mentions_bot(normalized.mentioned_ids)
-        return False
 
     def _message_mentions_bot(self, mentions: List[Any]) -> bool:
         """Check whether any mention targets the configured or inferred bot identity."""
-        for mention in mentions:
-            mention_id = getattr(mention, "id", None)
-            mention_open_id = getattr(mention_id, "open_id", None)
-            mention_user_id = getattr(mention_id, "user_id", None)
-            mention_name = (getattr(mention, "name", None) or "").strip()
-
-            if self._bot_open_id and mention_open_id == self._bot_open_id:
-                return True
-            if self._bot_user_id and mention_user_id == self._bot_user_id:
-                return True
-            if self._bot_name and mention_name == self._bot_name:
-                return True
-
-        return False
+        return feishu_message_mentions_bot(
+            mentions,
+            bot_open_id=self._bot_open_id,
+            bot_user_id=self._bot_user_id,
+            bot_name=self._bot_name,
+        )
 
     def _post_mentions_bot(self, mentioned_ids: List[str]) -> bool:
-        if not mentioned_ids:
-            return False
-        if self._bot_open_id and self._bot_open_id in mentioned_ids:
-            return True
-        if self._bot_user_id and self._bot_user_id in mentioned_ids:
-            return True
-        return False
+        return feishu_post_mentions_bot(
+            mentioned_ids,
+            bot_open_id=self._bot_open_id,
+            bot_user_id=self._bot_user_id,
+        )
 
     async def _hydrate_bot_identity(self) -> None:
         """Best-effort discovery of bot identity for precise group mention gating."""

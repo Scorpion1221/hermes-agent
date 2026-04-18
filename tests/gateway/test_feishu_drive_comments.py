@@ -12,6 +12,7 @@ from gateway.platforms.feishu_inbound.comment_context import (
     FeishuDriveCommentTurn,
     build_drive_comment_prompt,
     parse_feishu_drive_comment_notice_event_payload,
+    resolve_drive_comment_event_turn,
 )
 from gateway.platforms.feishu_inbound.comment_target import (
     build_feishu_comment_target,
@@ -138,3 +139,113 @@ async def test_drive_comment_webhook_dispatches_synthetic_message(monkeypatch):
     assert event.source.chat_id == 'comment:docx:file_tok:comment_1'
     assert event.source.user_name == 'Alice'
     assert 'please update this' in event.text
+
+
+def _make_reply_item(reply_id, open_id, text):
+    return SimpleNamespace(
+        reply_id=reply_id,
+        user_id=SimpleNamespace(open_id=open_id),
+        content=SimpleNamespace(elements=[SimpleNamespace(text_run=SimpleNamespace(text=text))]),
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_drive_comment_reply_chain_uses_resolved_names():
+    """Reply chain context should use resolved names, not raw open_ids."""
+    replies = [
+        _make_reply_item('r1', 'ou_alice', 'first comment'),
+        _make_reply_item('r2', 'ou_bob', 'second comment'),
+        _make_reply_item('r3', 'ou_alice', 'the trigger reply'),
+    ]
+    comment_obj = SimpleNamespace(
+        quote='some quoted text',
+        reply_list=SimpleNamespace(replies=[
+            SimpleNamespace(content=SimpleNamespace(elements=[
+                SimpleNamespace(text_run=SimpleNamespace(text='root comment'))
+            ]))
+        ]),
+    )
+    mock_comment_resp = SimpleNamespace(
+        success=lambda: True,
+        data=SimpleNamespace(comment=comment_obj),
+    )
+    mock_reply_resp = SimpleNamespace(
+        success=lambda: True,
+        data=SimpleNamespace(items=replies),
+    )
+
+    client = SimpleNamespace(
+        drive=SimpleNamespace(v1=SimpleNamespace(
+            file_comment=SimpleNamespace(get=lambda req: mock_comment_resp),
+            file_comment_reply=SimpleNamespace(list=lambda req: mock_reply_resp),
+        )),
+    )
+    adapter = SimpleNamespace(_client=client)
+
+    prefetched_ids = []
+    async def mock_prefetch(ids):
+        prefetched_ids.extend(ids)
+
+    name_map = {'ou_alice': 'Alice', 'ou_bob': 'Bob'}
+    def mock_sync_resolve(sender_id):
+        return name_map.get(sender_id)
+
+    event = FeishuDriveCommentEvent(
+        file_token='ft_123', file_type='docx', comment_id='c_1', reply_id='r3',
+        user_id=SimpleNamespace(open_id='ou_alice'),
+    )
+    turn = await resolve_drive_comment_event_turn(
+        adapter=adapter,
+        event=event,
+        prefetch_sender_names=mock_prefetch,
+        resolve_sender_name_sync=mock_sync_resolve,
+    )
+    assert turn is not None
+    assert 'ou_alice' not in turn.reply_chain_context
+    assert 'ou_bob' not in turn.reply_chain_context
+    assert '[Alice]: first comment' in turn.reply_chain_context
+    assert '[Bob]: second comment' in turn.reply_chain_context
+    assert set(prefetched_ids) == {'ou_alice', 'ou_bob'}
+
+
+@pytest.mark.asyncio
+async def test_resolve_drive_comment_reply_chain_fallback_labels_without_resolver():
+    """Without resolvers, opaque IDs should become Participant N labels."""
+    replies = [
+        _make_reply_item('r1', 'ou_xxx', 'hello'),
+        _make_reply_item('r2', 'ou_yyy', 'world'),
+        _make_reply_item('r3', 'ou_xxx', 'trigger'),
+    ]
+    comment_obj = SimpleNamespace(
+        quote='',
+        reply_list=SimpleNamespace(replies=[
+            SimpleNamespace(content=SimpleNamespace(elements=[
+                SimpleNamespace(text_run=SimpleNamespace(text='root'))
+            ]))
+        ]),
+    )
+    mock_comment_resp = SimpleNamespace(
+        success=lambda: True,
+        data=SimpleNamespace(comment=comment_obj),
+    )
+    mock_reply_resp = SimpleNamespace(
+        success=lambda: True,
+        data=SimpleNamespace(items=replies),
+    )
+    client = SimpleNamespace(
+        drive=SimpleNamespace(v1=SimpleNamespace(
+            file_comment=SimpleNamespace(get=lambda req: mock_comment_resp),
+            file_comment_reply=SimpleNamespace(list=lambda req: mock_reply_resp),
+        )),
+    )
+    adapter = SimpleNamespace(_client=client)
+
+    event = FeishuDriveCommentEvent(
+        file_token='ft_123', file_type='docx', comment_id='c_1', reply_id='r3',
+    )
+    turn = await resolve_drive_comment_event_turn(adapter=adapter, event=event)
+    assert turn is not None
+    assert 'ou_xxx' not in turn.reply_chain_context
+    assert 'ou_yyy' not in turn.reply_chain_context
+    assert '[Participant 1]: hello' in turn.reply_chain_context
+    assert '[Participant 2]: world' in turn.reply_chain_context

@@ -34,6 +34,19 @@ def _normalize_sender_name(sender_name: str | None, content: str) -> str:
     return f"{sender}: {body}"
 
 
+def _fallback_sender_label(
+    *,
+    sender_id: str,
+    opaque_sender_labels: dict[str, str],
+) -> str:
+    normalized_sender_id = str(sender_id or "").strip()
+    if not normalized_sender_id:
+        return ""
+    if normalized_sender_id not in opaque_sender_labels:
+        opaque_sender_labels[normalized_sender_id] = f"Participant {len(opaque_sender_labels) + 1}"
+    return opaque_sender_labels[normalized_sender_id]
+
+
 def extract_message_items(response: Any) -> list[Any]:
     data = _obj_get(response, "data")
     items = _obj_get(data, "items") if data is not None else None
@@ -114,6 +127,8 @@ def _format_merge_forward_items(
     for child_items in children_map.values():
         child_items.sort(key=lambda item: str(_obj_get(item, "create_time", "") or ""))
 
+    opaque_sender_labels: dict[str, str] = {}
+
     def _render(parent_id: str, depth: int = 0) -> tuple[list[str], list[FeishuResourceDescriptor]]:
         rendered: list[str] = []
         resources: list[FeishuResourceDescriptor] = []
@@ -127,8 +142,12 @@ def _format_merge_forward_items(
             sender_name = (
                 sender_name
                 or str(_obj_get(item, "sender_name", "") or "").strip()
-                or sender_id
             )
+            if not sender_name:
+                sender_name = _fallback_sender_label(
+                    sender_id=sender_id,
+                    opaque_sender_labels=opaque_sender_labels,
+                )
             content = display_text_from_normalized(normalized, raw_type).strip()
             resources.extend(build_resource_descriptors(normalized))
             if raw_type == "merge_forward" and item_id:

@@ -38,6 +38,12 @@ from .media_index import (
     remove_feishu_media_index_entry,
 )
 from .render import render_quoted_context_block
+from .policy import (
+    allow_feishu_group_message,
+    feishu_message_mentions_bot,
+    feishu_post_mentions_bot,
+    should_accept_feishu_group_message,
+)
 from .comment_target import (
     FeishuCommentTarget,
     build_feishu_comment_target,
@@ -97,6 +103,10 @@ __all__ = [
     "resolve_feishu_sender_display_names",
     "resolve_feishu_sender_name",
     "resolve_feishu_sender_names",
+    "allow_feishu_group_message",
+    "feishu_message_mentions_bot",
+    "feishu_post_mentions_bot",
+    "should_accept_feishu_group_message",
     "FeishuCommentTarget",
     "build_feishu_comment_target",
     "parse_feishu_comment_target",

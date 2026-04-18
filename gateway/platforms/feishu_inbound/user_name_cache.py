@@ -171,53 +171,6 @@ class FeishuSenderNameCache:
             return default
         return (entry.user_name, entry.expires_at)
 
-    # ------------------------------------------------------------------
-    # Dict-like compatibility helpers for existing adapter/tests
-    # ------------------------------------------------------------------
-
-    def __contains__(self, sender_id: object) -> bool:
-        return self._get_entry(account_scope=None, sender_id=str(sender_id or "")) is not None
-
-    def __getitem__(self, sender_id: str) -> tuple[str, float]:
-        entry = self._get_entry(account_scope=None, sender_id=sender_id)
-        if entry is None:
-            raise KeyError(sender_id)
-        return (entry.user_name, entry.expires_at)
-
-    def __setitem__(self, sender_id: str, value: tuple[str, float]) -> None:
-        if not isinstance(value, tuple) or len(value) != 2:
-            raise ValueError("Expected (user_name, expires_at) tuple")
-        normalized_sender_id = normalize_feishu_sender_id(sender_id)
-        visible_name = coerce_feishu_sender_display_name(sender_name=value[0])
-        expires_at = float(value[1])
-        if not normalized_sender_id or not visible_name:
-            return
-        cached_at = min(self._time_fn(), expires_at)
-        entry = FeishuSenderNameCacheEntry(
-            account_scope=normalize_feishu_account_scope(None),
-            sender_id=normalized_sender_id,
-            user_name=visible_name,
-            cached_at=cached_at,
-            expires_at=expires_at,
-        )
-        self._entries[(entry.account_scope, entry.sender_id)] = entry
-
-    def get(self, sender_id: Optional[str], default: Optional[tuple[str, float]] = None) -> Optional[tuple[str, float]]:
-        entry = self._get_entry(account_scope=None, sender_id=sender_id)
-        if entry is None:
-            return default
-        return (entry.user_name, entry.expires_at)
-
-    def pop(self, sender_id: Optional[str], default: Any = None) -> Any:
-        normalized_sender_id = normalize_feishu_sender_id(sender_id)
-        if not normalized_sender_id:
-            return default
-        key = self.make_cache_key(None, normalized_sender_id)
-        entry = self._entries.pop(key, None)
-        if entry is None:
-            return default
-        return (entry.user_name, entry.expires_at)
-
     def _get_entry(self, *, account_scope: Optional[str], sender_id: Optional[str]) -> Optional[FeishuSenderNameCacheEntry]:
         normalized_sender_id = normalize_feishu_sender_id(sender_id)
         if not normalized_sender_id:

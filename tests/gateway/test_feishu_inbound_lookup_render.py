@@ -127,6 +127,28 @@ def test_build_feishu_message_context_expands_merge_forward_items_and_preserves_
     assert context.metadata == {"expanded_from_items": True}
 
 
+def test_build_feishu_message_context_merge_forward_with_dict_items():
+    """Items from the raw API path are dicts, not objects. Verify expansion works."""
+    response_items = [
+        {"message_id": "om_merge", "msg_type": "merge_forward", "body": {"content": '{"title":"Fwd"}'}},
+        {"message_id": "om_t1", "upper_message_id": "om_merge", "msg_type": "text",
+         "body": {"content": '{"text":"hello"}'}, "sender": {"id": "ou_aaa"}, "create_time": "1"},
+        {"message_id": "om_t2", "upper_message_id": "om_merge", "msg_type": "text",
+         "body": {"content": '{"text":"world"}'}, "sender": {"id": "ou_bbb"}, "create_time": "2"},
+    ]
+    context = build_feishu_message_context(
+        message_id="om_merge",
+        message_type="merge_forward",
+        raw_content='{"title":"Fwd"}',
+        response_items=response_items,
+        resolve_sender_name_sync=lambda sid: {"ou_aaa": "Alice", "ou_bbb": "Bob"}.get(sid),
+    )
+    assert "Alice: hello" in context.content
+    assert "Bob: world" in context.content
+    assert "ou_aaa" not in context.content
+    assert "ou_bbb" not in context.content
+
+
 def test_build_feishu_message_context_prefers_embedded_sender_name_over_sender_id_when_lookup_missing():
     response_items = [
         SimpleNamespace(
@@ -156,6 +178,54 @@ def test_build_feishu_message_context_prefers_embedded_sender_name_over_sender_i
     assert context.content == "- Alice Embedded: Investigating"
 
 
+def test_build_feishu_message_context_assigns_stable_participant_labels_when_names_missing():
+    response_items = [
+        SimpleNamespace(
+            message_id="om_merge",
+            msg_type="merge_forward",
+            body=SimpleNamespace(content='{"title":"Forwarded"}'),
+        ),
+        SimpleNamespace(
+            message_id="om_text_1",
+            upper_message_id="om_merge",
+            msg_type="text",
+            body=SimpleNamespace(content='{"text":"First line"}'),
+            sender=SimpleNamespace(id="ou_hidden_a"),
+            create_time="1",
+        ),
+        SimpleNamespace(
+            message_id="om_text_2",
+            upper_message_id="om_merge",
+            msg_type="text",
+            body=SimpleNamespace(content='{"text":"Second line"}'),
+            sender=SimpleNamespace(id="ou_hidden_b"),
+            create_time="2",
+        ),
+        SimpleNamespace(
+            message_id="om_text_3",
+            upper_message_id="om_merge",
+            msg_type="text",
+            body=SimpleNamespace(content='{"text":"Third line"}'),
+            sender=SimpleNamespace(id="ou_hidden_a"),
+            create_time="3",
+        ),
+    ]
+
+    context = build_feishu_message_context(
+        message_id="om_merge",
+        message_type="merge_forward",
+        raw_content='{"title":"Forwarded"}',
+        response_items=response_items,
+        resolve_sender_name_sync=lambda _sender_id: None,
+    )
+
+    assert context.content == (
+        "- Participant 1: First line\n"
+        "- Participant 2: Second line\n"
+        "- Participant 1: Third line"
+    )
+
+
 def test_build_feishu_message_context_hides_opaque_sender_ids_when_merge_forward_lookup_missing():
     response_items = [
         SimpleNamespace(
@@ -181,7 +251,7 @@ def test_build_feishu_message_context_hides_opaque_sender_ids_when_merge_forward
         resolve_sender_name_sync=lambda _sender_id: None,
     )
 
-    assert context.content == "- Investigating"
+    assert context.content == "- Participant 1: Investigating"
     assert "ou_hidden_sender" not in context.content
 
 
@@ -295,11 +365,11 @@ def test_build_feishu_quoted_context_hides_opaque_sender_ids_in_merge_forward_su
     rendered = render_quoted_context_block(quoted)
 
     assert quoted.sender_name == ""
-    assert quoted.summary == "- Investigating"
+    assert quoted.summary == "- Participant 1: Investigating"
     assert "ou_forwarder" not in quoted.summary
     assert "ou_hidden_sender" not in quoted.summary
     assert "sender:" not in rendered
-    assert "summary: - Investigating" in rendered
+    assert "summary: - Participant 1: Investigating" in rendered
     assert "ou_forwarder" not in rendered
     assert "ou_hidden_sender" not in rendered
 

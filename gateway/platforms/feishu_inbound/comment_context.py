@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 from .comment_target import build_feishu_comment_target
+from .lookup import _fallback_sender_label
+from .user_name_cache import is_probably_feishu_opaque_user_id
 
 
 def _obj_get(value: Any, key: str, default: Any = None) -> Any:
@@ -96,7 +99,13 @@ def build_drive_comment_prompt(*, quoted_text: str = '', comment_text: str = '',
     return '\n'.join(lines)
 
 
-async def resolve_drive_comment_event_turn(*, adapter: Any, event: FeishuDriveCommentEvent) -> Optional[FeishuDriveCommentTurn]:
+async def resolve_drive_comment_event_turn(
+    *,
+    adapter: Any,
+    event: FeishuDriveCommentEvent,
+    prefetch_sender_names: Optional[Callable[[Sequence[str]], Awaitable[Any]]] = None,
+    resolve_sender_name_sync: Optional[Callable[[str], Optional[str]]] = None,
+) -> Optional[FeishuDriveCommentTurn]:
     client = getattr(adapter, '_client', None)
     if client is None:
         return None
@@ -127,29 +136,63 @@ async def resolve_drive_comment_event_turn(*, adapter: Any, event: FeishuDriveCo
     root_replies = _obj_get(root_reply_list, 'replies', None) or []
     comment_text = _extract_reply_text(root_replies[0]) if root_replies else ''
     reply_chain_context = ''
-    if event.reply_id and ListFileCommentReplyRequest is not None:
-        reply_request = (
-            ListFileCommentReplyRequest.builder()
-            .file_token(event.file_token)
-            .comment_id(event.comment_id)
-            .file_type(event.file_type)
-            .user_id_type('open_id')
-            .page_size(100)
-            .build()
-        )
+    if event.reply_id:
+        if ListFileCommentReplyRequest is not None:
+            reply_request = (
+                ListFileCommentReplyRequest.builder()
+                .file_token(event.file_token)
+                .comment_id(event.comment_id)
+                .file_type(event.file_type)
+                .user_id_type('open_id')
+                .page_size(100)
+                .build()
+            )
+        else:
+            reply_request = SimpleNamespace(file_token=event.file_token, comment_id=event.comment_id, file_type=event.file_type, user_id_type='open_id', page_size=100)
         reply_response = await asyncio.to_thread(client.drive.v1.file_comment_reply.list, reply_request)
         reply_items = _obj_get(_obj_get(reply_response, 'data', None), 'items', None) or []
+
+        all_sender_ids: list[str] = []
+        seen_ids: set[str] = set()
+        for reply in reply_items:
+            sid = str(_obj_get(_obj_get(reply, 'user_id', None), 'open_id', None) or '').strip()
+            if sid and sid not in seen_ids:
+                seen_ids.add(sid)
+                all_sender_ids.append(sid)
+        if all_sender_ids and prefetch_sender_names is not None:
+            try:
+                await prefetch_sender_names(all_sender_ids)
+            except Exception:
+                pass
+
+        opaque_sender_labels: dict[str, str] = {}
         prior_lines = []
         matched_text = comment_text
         for reply in reply_items:
             rid = str(_obj_get(reply, 'reply_id', '') or '')
             text = _extract_reply_text(reply)
-            sender = _obj_get(_obj_get(reply, 'user_id', None), 'open_id', None) or 'unknown'
+            sender_id = str(_obj_get(_obj_get(reply, 'user_id', None), 'open_id', None) or '').strip()
+            sender_label = ''
+            if sender_id and resolve_sender_name_sync is not None:
+                sender_label = resolve_sender_name_sync(sender_id) or ''
+            if not sender_label and sender_id:
+                if is_probably_feishu_opaque_user_id(sender_id):
+                    sender_label = _fallback_sender_label(
+                        sender_id=sender_id,
+                        opaque_sender_labels=opaque_sender_labels,
+                    )
+                else:
+                    sender_label = sender_id
+            if not sender_label:
+                sender_label = _fallback_sender_label(
+                    sender_id=sender_id or 'unknown',
+                    opaque_sender_labels=opaque_sender_labels,
+                )
             if rid == event.reply_id:
                 matched_text = text or matched_text
                 continue
             if text:
-                prior_lines.append(f'[{sender}]: {text}')
+                prior_lines.append(f'[{sender_label}]: {text}')
         reply_chain_context = '\n'.join(prior_lines)
         comment_text = matched_text
     is_whole_comment = not bool(quoted_text)
