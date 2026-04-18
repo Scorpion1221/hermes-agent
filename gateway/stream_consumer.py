@@ -429,6 +429,13 @@ class GatewayStreamConsumer:
                     _best_effort_ok = bool(await self._send_or_edit(self._accumulated))
                 except Exception:
                     pass
+            if self._message_id and hasattr(self.adapter, "finalize_streaming_message"):
+                try:
+                    await self.adapter.finalize_streaming_message(
+                        self._message_id, self._accumulated or "", stopped=True,
+                    )
+                except Exception:
+                    pass
             # Only confirm final delivery if the best-effort send above
             # actually succeeded OR if the final response was already
             # confirmed before we were cancelled.  Previously this

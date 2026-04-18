@@ -2861,11 +2861,16 @@ class GatewayRunner:
             if _cmd_def_inner and _cmd_def_inner.name == "stop":
                 running_agent = self._running_agents.get(_quick_key)
                 if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
-                    running_agent.interrupt("Stop requested")
+                    running_agent.interrupt()
                 # Force-clean: remove the session lock regardless of agent state
                 adapter = self.adapters.get(source.platform)
                 if adapter and hasattr(adapter, 'get_pending_message'):
                     adapter.get_pending_message(_quick_key)  # consume and discard
+                if adapter and hasattr(adapter, 'stop_all_streaming_cards'):
+                    try:
+                        await adapter.stop_all_streaming_cards()
+                    except Exception:
+                        pass
                 self._pending_messages.pop(_quick_key, None)
                 if _quick_key in self._running_agents:
                     del self._running_agents[_quick_key]

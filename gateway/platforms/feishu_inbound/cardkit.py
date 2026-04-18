@@ -25,6 +25,7 @@ class CardKitState:
     element_id: str = STREAMING_ELEMENT_ID
     failed: bool = False
     started_at: float = 0.0
+    last_content: str = ""
 
 
 def build_streaming_card_body() -> dict:
@@ -48,7 +49,7 @@ def build_streaming_card_body() -> dict:
     }
 
 
-def build_final_card_body(content: str, *, elapsed_seconds: float = 0.0) -> dict:
+def build_final_card_body(content: str, *, elapsed_seconds: float = 0.0, stopped: bool = False) -> dict:
     elements: list[dict] = [
         {
             "tag": "markdown",
@@ -64,9 +65,10 @@ def build_final_card_body(content: str, *, elapsed_seconds: float = 0.0) -> dict
             time_str = f"{mins}m {secs}s"
         else:
             time_str = f"{elapsed_seconds:.1f}s"
+        status = "已停止" if stopped else "已完成"
         elements.append({
             "tag": "markdown",
-            "content": f"已完成 · 耗时 {time_str}",
+            "content": f"{status} · 耗时 {time_str}",
             "text_size": "notation",
             "text_align": "left",
         })

@@ -1655,6 +1655,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def _edit_streaming_card(self, state: CardKitState, content: str) -> SendResult:
         state.sequence += 1
+        state.last_content = content
         ok = await stream_card_element(
             self._client, card_id=state.card_id, element_id=state.element_id,
             content=content, sequence=state.sequence,
@@ -1664,24 +1665,41 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="CardKit stream failed")
         return SendResult(success=True, message_id=state.message_id)
 
-    async def finalize_streaming_message(self, message_id: str, final_text: str = "") -> None:
+    async def finalize_streaming_message(self, message_id: str, final_text: str = "", *, stopped: bool = False) -> None:
         state = self._streaming_cards.pop(message_id, None)
         if not state:
             logger.info("[Feishu] finalize_streaming_message: no state for %s", message_id)
             return
         elapsed = time.time() - state.started_at if state.started_at else 0.0
-        logger.info("[Feishu] Finalizing streaming card %s (seq=%d, elapsed=%.1fs)", state.card_id, state.sequence, elapsed)
+        logger.info("[Feishu] Finalizing streaming card %s (seq=%d, elapsed=%.1fs, stopped=%s)", state.card_id, state.sequence, elapsed, stopped)
         state.sequence += 1
         if final_text:
             await cardkit_update_card(
                 self._client, card_id=state.card_id,
-                card_body=build_final_card_body(final_text, elapsed_seconds=elapsed), sequence=state.sequence,
+                card_body=build_final_card_body(final_text, elapsed_seconds=elapsed, stopped=stopped), sequence=state.sequence,
             )
             state.sequence += 1
         ok = await set_card_streaming_mode(
             self._client, card_id=state.card_id, enabled=False, sequence=state.sequence,
         )
         logger.info("[Feishu] Streaming mode disabled for %s: %s", state.card_id, ok)
+
+    async def stop_all_streaming_cards(self) -> None:
+        to_stop = list(self._streaming_cards.items())
+        for message_id, state in to_stop:
+            self._streaming_cards.pop(message_id, None)
+            elapsed = time.time() - state.started_at if state.started_at else 0.0
+            content = state.last_content or ""
+            state.sequence += 1
+            await cardkit_update_card(
+                self._client, card_id=state.card_id,
+                card_body=build_final_card_body(content, elapsed_seconds=elapsed, stopped=True), sequence=state.sequence,
+            )
+            state.sequence += 1
+            await set_card_streaming_mode(
+                self._client, card_id=state.card_id, enabled=False, sequence=state.sequence,
+            )
+            logger.info("[Feishu] Force-stopped streaming card %s (content=%d chars)", state.card_id, len(content))
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
@@ -2512,8 +2530,6 @@ class FeishuAdapter(BasePlatformAdapter):
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Remove ACK reaction after the response has been fully sent."""
         if not _FEISHU_ACK_REMOVE_AFTER_REPLY:
-            return
-        if outcome == ProcessingOutcome.CANCELLED:
             return
         message_id = getattr(event, "message_id", None)
         if message_id:
