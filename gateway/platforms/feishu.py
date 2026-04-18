@@ -1654,6 +1654,8 @@ class FeishuAdapter(BasePlatformAdapter):
             return None
 
     async def _edit_streaming_card(self, state: CardKitState, content: str) -> SendResult:
+        if state.stopped:
+            return SendResult(success=True, message_id=state.message_id)
         state.sequence += 1
         state.last_content = content
         ok = await stream_card_element(
@@ -1668,7 +1670,8 @@ class FeishuAdapter(BasePlatformAdapter):
     async def finalize_streaming_message(self, message_id: str, final_text: str = "", *, stopped: bool = False) -> None:
         state = self._streaming_cards.pop(message_id, None)
         if not state:
-            logger.info("[Feishu] finalize_streaming_message: no state for %s", message_id)
+            return
+        if state.stopped:
             return
         elapsed = time.time() - state.started_at if state.started_at else 0.0
         logger.info("[Feishu] Finalizing streaming card %s (seq=%d, elapsed=%.1fs, stopped=%s)", state.card_id, state.sequence, elapsed, stopped)
@@ -1687,7 +1690,7 @@ class FeishuAdapter(BasePlatformAdapter):
     async def stop_all_streaming_cards(self) -> None:
         to_stop = list(self._streaming_cards.items())
         for message_id, state in to_stop:
-            self._streaming_cards.pop(message_id, None)
+            state.stopped = True
             elapsed = time.time() - state.started_at if state.started_at else 0.0
             content = state.last_content or ""
             state.sequence += 1

@@ -26,6 +26,7 @@ class CardKitState:
     failed: bool = False
     started_at: float = 0.0
     last_content: str = ""
+    stopped: bool = False
 
 
 def build_streaming_card_body() -> dict:
@@ -43,6 +44,16 @@ def build_streaming_card_body() -> dict:
                     "text_align": "left",
                     "text_size": "normal_v2",
                     "element_id": STREAMING_ELEMENT_ID,
+                },
+                {
+                    "tag": "markdown",
+                    "content": " ",
+                    "icon": {
+                        "tag": "custom_icon",
+                        "img_key": "img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg",
+                        "size": "16px 16px",
+                    },
+                    "element_id": LOADING_ELEMENT_ID,
                 },
             ],
         },

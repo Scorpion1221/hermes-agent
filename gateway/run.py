@@ -2871,6 +2871,14 @@ class GatewayRunner:
                         await adapter.stop_all_streaming_cards()
                     except Exception:
                         pass
+                if adapter and hasattr(adapter, '_pending_ack_reactions'):
+                    _stop_msg_id = getattr(event, "message_id", None)
+                    _stop_reaction_id = adapter._pending_ack_reactions.pop(_stop_msg_id, None) if _stop_msg_id else None
+                    if _stop_reaction_id:
+                        try:
+                            await adapter._remove_ack_reaction(_stop_msg_id, _stop_reaction_id)
+                        except Exception:
+                            pass
                 self._pending_messages.pop(_quick_key, None)
                 if _quick_key in self._running_agents:
                     del self._running_agents[_quick_key]
