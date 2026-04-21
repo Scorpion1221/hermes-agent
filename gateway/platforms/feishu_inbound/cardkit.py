@@ -27,6 +27,7 @@ class CardKitState:
     started_at: float = 0.0
     last_content: str = ""
     stopped: bool = False
+    reply_to_message_id: str = ""
 
 
 def build_streaming_card_body() -> dict:

@@ -1641,7 +1641,10 @@ class FeishuAdapter(BasePlatformAdapter):
             )
             result = self._finalize_send_result(response, "streaming card send failed")
             if result.success and result.message_id:
-                state = CardKitState(card_id=card_id, message_id=result.message_id, sequence=1, started_at=time.time())
+                state = CardKitState(
+                    card_id=card_id, message_id=result.message_id, sequence=1,
+                    started_at=time.time(), reply_to_message_id=reply_to or "",
+                )
                 self._streaming_cards[result.message_id] = state
                 await stream_card_element(
                     self._client, card_id=card_id, element_id=state.element_id,
