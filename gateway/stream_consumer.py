@@ -372,6 +372,14 @@ class GatewayStreamConsumer:
 
                     current_update_visible = await self._send_or_edit(display_text)
                     self._last_edit_time = time.monotonic()
+                    # Backoff on failed edits to avoid hammering the API
+                    # (especially CardKit streaming which can hit SSL errors).
+                    if not current_update_visible:
+                        self._consecutive_failures = getattr(self, "_consecutive_failures", 0) + 1
+                        _backoff = min(0.5 * self._consecutive_failures, 5.0)
+                        await asyncio.sleep(_backoff)
+                    else:
+                        self._consecutive_failures = 0
 
                 if got_done:
                     # Final edit without cursor. If progressive editing failed

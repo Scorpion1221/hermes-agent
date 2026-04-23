@@ -8656,7 +8656,7 @@ class GatewayRunner:
                             and getattr(_adapter, "_use_cardkit_streaming", False)
                         )
                         _consumer_cfg = StreamConsumerConfig(
-                            edit_interval=0.1 if _feishu_cardkit else _scfg.edit_interval,
+                            edit_interval=0.8 if _feishu_cardkit else _scfg.edit_interval,
                             buffer_threshold=_scfg.buffer_threshold,
                             cursor="" if _feishu_cardkit else _effective_cursor,
                             buffer_only=_buffer_only,
