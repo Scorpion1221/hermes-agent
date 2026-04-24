@@ -127,7 +127,7 @@ class SessionDB:
     single writer via WAL mode). Each method opens its own cursor.
     """
 
-    # ������ Write-contention tuning ������
+    # ── Write-contention tuning ──
     # With multiple hermes processes (gateway + CLI sessions + worktree agents)
     # all sharing one state.db, WAL write-lock contention causes visible TUI
     # freezes.  SQLite's built-in busy handler uses a deterministic sleep
@@ -151,7 +151,7 @@ class SessionDB:
         self._conn = sqlite3.connect(
             str(self.db_path),
             check_same_thread=False,
-            # Short timeout ��� application-level retry with random jitter
+            # Short timeout — application-level retry with random jitter
             # handles contention instead of sitting in SQLite's internal
             # busy handler for up to 30s.
             timeout=1.0,
@@ -166,19 +166,19 @@ class SessionDB:
 
         self._init_schema()
 
-    # ������ Core write helper ������
+    # ── Core write helper ──
 
     def _execute_write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
         *fn* receives the connection and should perform INSERT/UPDATE/DELETE
-        statements.  The caller must NOT call ``commit()`` ��� that's handled
+        statements.  The caller must NOT call ``commit()`` — that's handled
         here after *fn* returns.
 
         BEGIN IMMEDIATE acquires the WAL write lock at transaction start
         (not at commit time), so lock contention surfaces immediately.
         On ``database is locked``, we release the Python lock, sleep a
-        random 20-150ms, and retry ��� breaking the convoy pattern that
+        random 20-150ms, and retry — breaking the convoy pattern that
         SQLite's built-in deterministic backoff creates.
 
         Returns whatever *fn* returns.
@@ -197,7 +197,7 @@ class SessionDB:
                         except Exception:
                             pass
                         raise
-                # Success ��� periodic best-effort checkpoint.
+                # Success — periodic best-effort checkpoint.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
@@ -213,7 +213,7 @@ class SessionDB:
                         )
                         time.sleep(jitter)
                         continue
-                # Non-lock error or retries exhausted ��� propagate.
+                # Non-lock error or retries exhausted — propagate.
                 raise
         # Retries exhausted (shouldn't normally reach here).
         raise last_err or sqlite3.OperationalError(
@@ -239,7 +239,7 @@ class SessionDB:
                         result[2], result[1],
                     )
         except Exception:
-            pass  # Best effort ��� never fatal.
+            pass  # Best effort — never fatal.
 
     def close(self):
         """Close the database connection.
@@ -318,7 +318,7 @@ class SessionDB:
                         pass
                 cursor.execute("UPDATE schema_version SET version = 5")
             if current_version < 6:
-                # v6: add reasoning columns to messages table ��� preserves assistant
+                # v6: add reasoning columns to messages table — preserves assistant
                 # reasoning text and structured reasoning_details across gateway
                 # session turns.  Without these, reasoning chains are lost on
                 # session reload, breaking multi-turn reasoning continuity for
@@ -346,7 +346,7 @@ class SessionDB:
                     pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 7")
             if current_version < 8:
-                # v8: add api_call_count column to sessions ��� tracks the number
+                # v8: add api_call_count column to sessions — tracks the number
                 # of individual LLM API calls made within a session (as opposed
                 # to the session count itself).
                 try:
@@ -357,7 +357,7 @@ class SessionDB:
                     pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 8")
 
-        # Unique title index ��� always ensure it exists (safe to run after migrations
+        # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
         try:
             cursor.execute(
@@ -467,10 +467,10 @@ class SessionDB:
     ) -> None:
         """Update token counters and backfill model if not already set.
 
-        When *absolute* is False (default), values are **incremented** ��� use
+        When *absolute* is False (default), values are **incremented** — use
         this for per-API-call deltas (CLI path).
 
-        When *absolute* is True, values are **set directly** ��� use this when
+        When *absolute* is True, values are **set directly** — use this when
         the caller already holds cumulative totals (gateway path, where the
         cached agent accumulates across messages).
         """
@@ -720,7 +720,7 @@ class SessionDB:
         return None
 
     def get_next_title_in_lineage(self, base_title: str) -> str:
-        """Generate the next title in a lineage (e.g., "my session" ��� "my session #2").
+        """Generate the next title in a lineage (e.g., "my session" → "my session #2").
 
         Strips any existing " #N" suffix to find the base name, then finds
         the highest existing number and increments.
@@ -770,7 +770,7 @@ class SessionDB:
         input itself doesn't exist).
         """
         current = session_id
-        # Bound the walk defensively ��� compression chains this deep are
+        # Bound the walk defensively — compression chains this deep are
         # pathological and shouldn't happen in practice. 100 = plenty.
         for _ in range(100):
             with self._lock:
@@ -812,7 +812,7 @@ class SessionDB:
 
         With ``project_compression_tips=True`` (default), sessions that are
         roots of compression chains are projected forward to their latest
-        continuation ��� one logical conversation = one list entry, showing the
+        continuation — one logical conversation = one list entry, showing the
         live continuation's id/message_count/title/last_active. This prevents
         compressed continuations from being invisible to users while keeping
         delegate subagents and branches hidden. Pass ``False`` to return the
@@ -1235,7 +1235,7 @@ class SessionDB:
             try:
                 cursor = self._conn.execute(sql, params)
             except sqlite3.OperationalError:
-                # FTS5 query syntax error despite sanitization ��� return empty
+                # FTS5 query syntax error despite sanitization — return empty
                 # unless query contains CJK (fall back to LIKE below)
                 if not self._contains_cjk(query):
                     return []
@@ -1477,7 +1477,7 @@ class SessionDB:
 
         return self._execute_write(_do)
 
-    # ������ Meta key/value (for scheduler bookkeeping) ������
+    # ── Meta key/value (for scheduler bookkeeping) ──
 
     def get_meta(self, key: str) -> Optional[str]:
         """Read a value from the state_meta key/value store."""
@@ -1499,12 +1499,12 @@ class SessionDB:
             )
         self._execute_write(_do)
 
-    # ������ Space reclamation ������
+    # ── Space reclamation ──
 
     def vacuum(self) -> None:
         """Run VACUUM to reclaim disk space after large deletes.
 
-        SQLite does not shrink the database file when rows are deleted ���
+        SQLite does not shrink the database file when rows are deleted —
         freed pages just get reused on the next insert. After a prune that
         removed hundreds of sessions, the file stays bloated unless we
         explicitly VACUUM.
@@ -1540,10 +1540,10 @@ class SessionDB:
         with ``"error"`` set.
 
         Returns a dict with keys:
-          - ``"skipped"`` (bool) ��� true if within min_interval_hours of last run
-          - ``"pruned"`` (int)   ��� number of sessions deleted
-          - ``"vacuumed"`` (bool) ��� true if VACUUM ran
-          - ``"error"`` (str, optional) ��� present only on failure
+          - ``"skipped"`` (bool) — true if within min_interval_hours of last run
+          - ``"pruned"`` (int)   — number of sessions deleted
+          - ``"vacuumed"`` (bool) — true if VACUUM ran
+          - ``"error"`` (str, optional) — present only on failure
         """
         result: Dict[str, Any] = {"skipped": False, "pruned": 0, "vacuumed": False}
         try:
@@ -1562,7 +1562,7 @@ class SessionDB:
             pruned = self.prune_sessions(older_than_days=retention_days)
             result["pruned"] = pruned
 
-            # Only VACUUM if we actually freed rows ��� VACUUM on a tight DB
+            # Only VACUUM if we actually freed rows — VACUUM on a tight DB
             # is wasted I/O. Threshold keeps small DBs from paying the cost.
             if vacuum and pruned > 0:
                 try:
@@ -1588,3 +1588,4 @@ class SessionDB:
             result["error"] = str(exc)
 
         return result
+

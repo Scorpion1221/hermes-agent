@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 import pytest
 
 
-# ������ Helpers ������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������
+# ── Helpers ──────────────────────────────────────────────────────────────
 
 
 def _make_stream_chunk(
@@ -55,7 +55,7 @@ def _make_empty_chunk(model=None, usage=None):
     return SimpleNamespace(choices=[], model=model, usage=usage)
 
 
-# ������ Test: Streaming Accumulator ������������������������������������������������������������������������������������������������������������������������������
+# ── Test: Streaming Accumulator ──────────────────────────────────────────
 
 
 class TestStreamingAccumulator:
@@ -273,7 +273,7 @@ class TestStreamingAccumulator:
         assert len(response.choices[0].message.tool_calls) == 1
 
 
-# ������ Test: Streaming Callbacks ������������������������������������������������������������������������������������������������������������������������������������
+# ── Test: Streaming Callbacks ────────────────────────────────────────────
 
 
 class TestStreamingCallbacks:
@@ -466,7 +466,7 @@ class TestStreamingCallbacks:
         assert response.choices[0].message.content == "thinking... more text"
 
 
-# ������ Test: Streaming Fallback ������������������������������������������������������������������������������������������������������������������������������������
+# ── Test: Streaming Fallback ────────────────────────────────────────────
 
 
 class TestStreamingFallback:
@@ -583,7 +583,7 @@ class TestStreamingFallback:
         with pytest.raises(httpx.ConnectError, match="socket closed"):
             agent._interruptible_streaming_api_call({})
 
-        # Should have retried 3 times (default HERMES_STREAM_RETRIES=2 ��� 3 attempts)
+        # Should have retried 3 times (default HERMES_STREAM_RETRIES=2 → 3 attempts)
         assert mock_client.chat.completions.create.call_count == 3
         assert mock_close.call_count >= 1
 
@@ -627,7 +627,7 @@ class TestStreamingFallback:
         with pytest.raises(OAIAPIError):
             agent._interruptible_streaming_api_call({})
 
-        # Should retry 3 times (default HERMES_STREAM_RETRIES=2 ��� 3 attempts)
+        # Should retry 3 times (default HERMES_STREAM_RETRIES=2 → 3 attempts)
         assert mock_client.chat.completions.create.call_count == 3
         # Connection cleanup should happen for each failed retry
         assert mock_close.call_count >= 2
@@ -664,11 +664,11 @@ class TestStreamingFallback:
         with pytest.raises(OAIAPIError):
             agent._interruptible_streaming_api_call({})
 
-        # Should NOT retry ��� propagates immediately
+        # Should NOT retry — propagates immediately
         assert mock_client.chat.completions.create.call_count == 1
 
 
-# ������ Test: Reasoning Streaming ������������������������������������������������������������������������������������������������������������������������������������
+# ── Test: Reasoning Streaming ────────────────────────────────────────────
 
 
 class TestReasoningStreaming:
@@ -715,7 +715,7 @@ class TestReasoningStreaming:
         assert response.choices[0].message.content == "The answer is 42"
 
 
-# ������ Test: _has_stream_consumers ������������������������������������������������������������������������������������������������������������������������������
+# ── Test: _has_stream_consumers ──────────────────────────────────────────
 
 
 class TestHasStreamConsumers:
@@ -760,7 +760,7 @@ class TestHasStreamConsumers:
         assert agent._has_stream_consumers() is True
 
 
-# ������ Test: Codex stream fires callbacks ������������������������������������������������������������������������������������������������
+# ── Test: Codex stream fires callbacks ────────────────────────────────
 
 
 class TestCodexStreamCallbacks:
@@ -1006,7 +1006,7 @@ class TestPartialToolCallWarning:
     line ~6107 used to silently set ``tool_calls=None`` and return
     ``finish_reason=stop``, losing the attempted action with zero user-facing
     signal.  Live-observed Apr 2026 with MiniMax M2.7 on a 6-minute audit
-    task ��� agent streamed commentary, emitted a write_file tool call,
+    task — agent streamed commentary, emitted a write_file tool call,
     MiniMax stalled for 240 s mid-arguments, stale-stream detector killed
     the connection, the stub returned, session ended with no file written
     and no error shown.
@@ -1301,7 +1301,7 @@ class TestSilentRetryMidToolCall:
         self, mock_close, mock_create, mock_replace,
     ):
         """Text-only stall (no tool call in flight) must NOT trigger silent
-        retry ��� that's the case where the user saw the model's text reply
+        retry — that's the case where the user saw the model's text reply
         and retrying would duplicate it with no benefit."""
         from run_agent import AIAgent
         import httpx as _httpx
@@ -1354,3 +1354,4 @@ class TestSilentRetryMidToolCall:
         assert "Stream stalled" not in content, (
             f"Text-only stall should not emit tool-call warning: {content!r}"
         )
+

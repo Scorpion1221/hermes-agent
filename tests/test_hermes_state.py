@@ -1,4 +1,4 @@
-"""Tests for hermes_state.py ��� SessionDB SQLite CRUD, FTS5 search, export."""
+"""Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
 import time
 import pytest
@@ -47,7 +47,7 @@ class TestSessionLifecycle:
         assert session["end_reason"] == "user_exit"
 
     def test_end_session_preserves_original_end_reason(self, db):
-        """The first end_reason wins ��� compression splits must not be
+        """The first end_reason wins — compression splits must not be
         overwritten when a later stale ``end_session()`` call lands on the
         same row (e.g. from a CLI session_id that desynced after compression
         and then tried to /resume another session).
@@ -454,7 +454,7 @@ class TestFTS5Search:
             'a AND OR b',       # adjacent operators
         ]
         for query in dangerous_queries:
-            # Must not raise ��� should return list (possibly empty)
+            # Must not raise — should return list (possibly empty)
             results = db.search_messages(query)
             assert isinstance(results, list), f"Query {query!r} did not return a list"
 
@@ -555,7 +555,7 @@ class TestFTS5Search:
         result = s('chat-send OR deploy-prod')
         assert '"chat-send"' in result
         assert '"deploy-prod"' in result
-        # Already-quoted hyphenated term ��� no double quoting
+        # Already-quoted hyphenated term — no double quoting
         assert s('"chat-send"') == '"chat-send"'
         # Hyphenated inside a quoted phrase stays as-is
         assert s('"my chat-send thing"') == '"my chat-send thing"'
@@ -569,7 +569,7 @@ class TestFTS5Search:
         assert s('simulate.p2') == '"simulate.p2"'
         assert s('simulate.p2.test.ts') == '"simulate.p2.test.ts"'
 
-        # Already quoted ��� no double quoting
+        # Already quoted — no double quoting
         assert s('"P2.2"') == '"P2.2"'
 
         # Works with boolean syntax
@@ -577,7 +577,7 @@ class TestFTS5Search:
         assert '"P2.2"' in result
         assert '"simulate.p2"' in result
 
-        # Mixed dots and hyphens ��� single pass avoids double-quoting
+        # Mixed dots and hyphens — single pass avoids double-quoting
         assert s('my-app.config') == '"my-app.config"'
         assert s('my-app.config.ts') == '"my-app.config.ts"'
 
@@ -590,8 +590,8 @@ class TestCJKSearchFallback:
     """Regression tests for CJK search (see #11511).
 
     SQLite FTS5's default tokenizer treats contiguous CJK runs as a single
-    token ("���������agent���������������" ��� one token), so substring queries like
-    "������������" return 0 rows despite the data being present. SessionDB falls
+    token ("和其他agent的聊天记录" → one token), so substring queries like
+    "记忆断裂" return 0 rows despite the data being present. SessionDB falls
     back to LIKE substring matching whenever FTS5 returns no results and
     the query contains CJK characters.
     """
@@ -600,17 +600,17 @@ class TestCJKSearchFallback:
         from hermes_state import SessionDB
         f = SessionDB._contains_cjk
         # Chinese (CJK Unified Ideographs)
-        assert f("������������") is True
+        assert f("记忆断裂") is True
         # Japanese Hiragana + Katakana
-        assert f("���������������") is True
-        assert f("������������") is True
-        # Korean Hangul syllables (both early and late ��� guards against
+        assert f("こんにちは") is True
+        assert f("カタカナ") is True
+        # Korean Hangul syllables (both early and late — guards against
         # the \ud7a0-\ud7af typo seen in one of the duplicate PRs)
-        assert f("���������������") is True
-        assert f("������") is True
+        assert f("안녕하세요") is True
+        assert f("기억") is True
         # Non-CJK
         assert f("hello world") is False
-        assert f("���������mixedwithenglish") is True
+        assert f("日本語mixedwithenglish") is True
         assert f("") is False
 
     def test_chinese_multichar_query_returns_results(self, db):
@@ -618,76 +618,76 @@ class TestCJKSearchFallback:
         db.create_session(session_id="s1", source="cli")
         db.append_message(
             "s1", role="user",
-            content="���������������Agent���������������������������������������������",
+            content="昨天和其他Agent的聊天记录，记忆断裂问题复现了",
         )
-        results = db.search_messages("������������")
+        results = db.search_messages("记忆断裂")
         assert len(results) == 1
         assert results[0]["session_id"] == "s1"
 
     def test_chinese_bigram_query(self, db):
         db.create_session(session_id="s1", source="telegram")
-        db.append_message("s1", role="user", content="������������A2A���������������������")
-        results = db.search_messages("������")
+        db.append_message("s1", role="user", content="今天讨论A2A通信协议的实现")
+        results = db.search_messages("通信")
         assert len(results) == 1
 
     def test_korean_query_returns_results(self, db):
         """Guards against Hangul range typos (\\uac00-\\ud7af, not \\ud7a0-)."""
         db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="user", content="��������������� ���������������")
-        results = db.search_messages("������")
+        db.append_message("s1", role="user", content="안녕하세요 반갑습니다")
+        results = db.search_messages("안녕")
         assert len(results) == 1
 
     def test_japanese_query_returns_results(self, db):
         db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="user", content="���������������������")
-        assert len(db.search_messages("���������������")) == 1
-        assert len(db.search_messages("������")) == 1
+        db.append_message("s1", role="user", content="こんにちは世界")
+        assert len(db.search_messages("こんにちは")) == 1
+        assert len(db.search_messages("世界")) == 1
 
     def test_cjk_fallback_preserves_source_filter(self, db):
         """Guards against the SQL-builder bug where filter clauses land
         after LIMIT/OFFSET (seen in one of the duplicate PRs)."""
         db.create_session(session_id="s1", source="cli")
         db.create_session(session_id="s2", source="telegram")
-        db.append_message("s1", role="user", content="���������������CLI")
-        db.append_message("s2", role="user", content="���������������Telegram")
+        db.append_message("s1", role="user", content="记忆断裂在CLI")
+        db.append_message("s2", role="user", content="记忆断裂在Telegram")
 
-        results = db.search_messages("������������", source_filter=["telegram"])
+        results = db.search_messages("记忆断裂", source_filter=["telegram"])
         assert len(results) == 1
         assert results[0]["source"] == "telegram"
 
     def test_cjk_fallback_preserves_exclude_sources(self, db):
         db.create_session(session_id="s1", source="cli")
         db.create_session(session_id="s2", source="tool")
-        db.append_message("s1", role="user", content="���������������CLI")
-        db.append_message("s2", role="assistant", content="���������������tool")
+        db.append_message("s1", role="user", content="记忆断裂在CLI")
+        db.append_message("s2", role="assistant", content="记忆断裂在tool")
 
-        results = db.search_messages("������������", exclude_sources=["tool"])
+        results = db.search_messages("记忆断裂", exclude_sources=["tool"])
         sources = {r["source"] for r in results}
         assert "tool" not in sources
         assert "cli" in sources
 
     def test_cjk_fallback_preserves_role_filter(self, db):
         db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="user", content="������������������������")
-        db.append_message("s1", role="assistant", content="������������������������")
+        db.append_message("s1", role="user", content="用户说的记忆断裂")
+        db.append_message("s1", role="assistant", content="助手说的记忆断裂")
 
-        results = db.search_messages("������������", role_filter=["assistant"])
+        results = db.search_messages("记忆断裂", role_filter=["assistant"])
         assert len(results) == 1
         assert results[0]["role"] == "assistant"
 
     def test_cjk_snippet_is_centered_on_match(self, db):
         """Snippet should contain the search term, not just the first N chars."""
         db.create_session(session_id="s1", source="cli")
-        long_prefix = "������������������������������������������������������������������" * 3
-        long_suffix = "���������������������������������������������������" * 3
+        long_prefix = "这是一段很长的前缀用来把匹配位置推到文档中间" * 3
+        long_suffix = "这是一段很长的后缀内容填充剩余空间" * 3
         db.append_message(
             "s1", role="user",
-            content=f"{long_prefix}������������{long_suffix}",
+            content=f"{long_prefix}记忆断裂{long_suffix}",
         )
-        results = db.search_messages("������������")
+        results = db.search_messages("记忆断裂")
         assert len(results) == 1
         # The centered substr() snippet must include the matched term.
-        assert "������������" in results[0]["snippet"]
+        assert "记忆断裂" in results[0]["snippet"]
 
     def test_english_query_still_uses_fts5_fast_path(self, db):
         """English queries must not trigger the LIKE fallback (fast path regression)."""
@@ -695,7 +695,7 @@ class TestCJKSearchFallback:
         db.append_message("s1", role="user", content="Deploy docker containers")
         results = db.search_messages("docker")
         assert len(results) == 1
-        # No CJK in query ��� LIKE fallback must not run. We don't assert this
+        # No CJK in query → LIKE fallback must not run. We don't assert this
         # directly (no instrumentation), but the FTS5 path produces an
         # FTS5-style snippet with highlight markers when the term is short.
         # At minimum: english queries must still match.
@@ -703,17 +703,17 @@ class TestCJKSearchFallback:
     def test_cjk_query_with_no_matches_returns_empty(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="unrelated English content")
-        results = db.search_messages("������������")
+        results = db.search_messages("记忆断裂")
         assert results == []
 
     def test_mixed_cjk_english_query(self, db):
         """Mixed queries should still fall back to LIKE when FTS5 misses."""
         db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="user", content="������Agent������������")
-        # "Agent������" is CJK+English ��� FTS5 default tokenizer indexes the
+        db.append_message("s1", role="user", content="讨论Agent通信协议")
+        # "Agent通信" is CJK+English — FTS5 default tokenizer indexes the
         # whole CJK run with embedded "agent" as separate tokens; the LIKE
         # fallback handles the substring correctly.
-        results = db.search_messages("Agent������")
+        results = db.search_messages("Agent通信")
         assert len(results) == 1
 
 
@@ -937,7 +937,7 @@ class TestPruneSessions:
         assert d["parent_session_id"] == "C"
 
     def test_prune_entire_old_chain(self, db):
-        """All sessions in a chain are old ��� entire chain is pruned."""
+        """All sessions in a chain are old — entire chain is pruned."""
         old_ts = time.time() - 200 * 86400
 
         db.create_session(session_id="X", source="cli")
@@ -1032,7 +1032,7 @@ class TestSessionTitle:
 
     def test_title_with_special_characters(self, db):
         db.create_session(session_id="s1", source="cli")
-        title = "PR #438 ��� fixing the 'auth' middleware"
+        title = "PR #438 — fixing the 'auth' middleware"
         db.set_session_title("s1", title)
 
         session = db.get_session("s1")
@@ -1106,7 +1106,7 @@ class TestSanitizeTitle:
         assert SessionDB.sanitize_title("hello\u200dworld") == "helloworld"
 
     def test_rtl_override_stripped(self):
-        # Right-to-left override (U+202E) ��� used in filename spoofing attacks
+        # Right-to-left override (U+202E) — used in filename spoofing attacks
         assert SessionDB.sanitize_title("hello\u202eworld") == "helloworld"
 
     def test_bom_stripped(self):
@@ -1126,16 +1126,16 @@ class TestSanitizeTitle:
             SessionDB.sanitize_title(title)
 
     def test_unicode_emoji_allowed(self):
-        assert SessionDB.sanitize_title("���� My Project ����") == "���� My Project ����"
+        assert SessionDB.sanitize_title("🚀 My Project 🎉") == "🚀 My Project 🎉"
 
     def test_cjk_characters_allowed(self):
-        assert SessionDB.sanitize_title("������������") == "������������"
+        assert SessionDB.sanitize_title("我的项目") == "我的项目"
 
     def test_accented_characters_allowed(self):
-        assert SessionDB.sanitize_title("R��sum�� ��diting") == "R��sum�� ��diting"
+        assert SessionDB.sanitize_title("Résumé éditing") == "Résumé éditing"
 
     def test_special_punctuation_allowed(self):
-        title = "PR #438 ��� fixing the 'auth' middleware"
+        title = "PR #438 — fixing the 'auth' middleware"
         assert SessionDB.sanitize_title(title) == title
 
     def test_sanitize_applied_in_set_session_title(self, db):
@@ -1229,7 +1229,7 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB ��� should migrate to v8
+        # Open with SessionDB — should migrate to v8
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
@@ -1270,14 +1270,14 @@ class TestTitleUniqueness:
         """A session can re-set its own title without error."""
         db.create_session("s1", "cli")
         db.set_session_title("s1", "my project")
-        # Should not raise ��� it's the same session
+        # Should not raise — it's the same session
         assert db.set_session_title("s1", "my project") is True
 
     def test_null_titles_not_unique(self, db):
         """Multiple sessions can have NULL titles (no constraint violation)."""
         db.create_session("s1", "cli")
         db.create_session("s2", "cli")
-        # Both have NULL titles ��� no error
+        # Both have NULL titles — no error
         assert db.get_session("s1")["title"] is None
         assert db.get_session("s2")["title"] is None
 
@@ -1460,7 +1460,7 @@ class TestListSessionsRich:
 
 
 class TestCompressionChainProjection:
-    """Tests for lineage-aware list_sessions_rich ��� compressed conversations
+    """Tests for lineage-aware list_sessions_rich — compressed conversations
     surface as their live continuation tip, not the dead parent root.
     """
 
@@ -1505,7 +1505,7 @@ class TestCompressionChainProjection:
             (t_compress_mid, "compression", "mid1"),
         )
 
-        # Tip ��� latest continuation
+        # Tip — latest continuation
         db.create_session("tip1", "cli", parent_session_id="mid1")
         db._conn.execute(
             "UPDATE sessions SET started_at=? WHERE id=?",
@@ -1530,7 +1530,7 @@ class TestCompressionChainProjection:
     def test_get_compression_tip_skips_delegate_children(self, db):
         """Delegate subagents have parent_session_id set but were created
         BEFORE the parent ended. They must not be followed as compression
-        continuations ��� the started_at >= ended_at guard handles this.
+        continuations — the started_at >= ended_at guard handles this.
         """
         import time as _time
         self._build_compression_chain(db, _time.time() - 3600)
@@ -1569,7 +1569,7 @@ class TestCompressionChainProjection:
 
     def test_list_without_projection_returns_raw_root(self, db):
         """project_compression_tips=False returns the raw parent-NULL root
-        rows ��� useful for admin/debug UIs.
+        rows — useful for admin/debug UIs.
         """
         import time as _time
         self._build_compression_chain(db, _time.time() - 3600)
@@ -1610,7 +1610,7 @@ class TestCompressionChainProjection:
     def test_list_handles_broken_chain_gracefully(self, db):
         """A compression root with no child (e.g. DB corruption or a partial
         end_session call that didn't finish creating the child) must not
-        crash the list ��� it should fall back to surfacing the root as-is.
+        crash the list — it should fall back to surfacing the root as-is.
         """
         import time as _time
         t0 = _time.time() - 100
@@ -1626,7 +1626,7 @@ class TestCompressionChainProjection:
         ids = [s["id"] for s in sessions]
         assert "orphan" in ids
         row = next(s for s in sessions if s["id"] == "orphan")
-        # No tip means no projection ��� row stays raw.
+        # No tip means no projection — row stays raw.
         assert "_lineage_root_id" not in row
         assert row["end_reason"] == "compression"
 
@@ -1706,7 +1706,7 @@ class TestExcludeSources:
         db.append_message("s2", "user", "Golang test")
         db.create_session("s3", "tool")
         db.append_message("s3", "user", "Golang test")
-        # Include cli+tool, but exclude tool ��� should only return cli
+        # Include cli+tool, but exclude tool → should only return cli
         results = db.search_messages(
             "Golang", source_filter=["cli", "tool"], exclude_sources=["tool"]
         )
@@ -1738,7 +1738,7 @@ class TestConcurrentWriteSafety:
     def test_create_session_insert_or_ignore_is_idempotent(self, db):
         """create_session with the same ID twice must not raise (INSERT OR IGNORE)."""
         db.create_session(session_id="dup-1", source="cli", model="m")
-        # Second call should be silent ��� no IntegrityError
+        # Second call should be silent — no IntegrityError
         db.create_session(session_id="dup-1", source="gateway", model="m2")
         session = db.get_session("dup-1")
         # Row should exist (first write wins with OR IGNORE)
@@ -1759,7 +1759,7 @@ class TestConcurrentWriteSafety:
         db.create_session(session_id="existing", source="cli", model="original-model")
         db.ensure_session("existing", source="gateway", model="overwrite-model")
         row = db.get_session("existing")
-        # First write wins ��� ensure_session must not overwrite
+        # First write wins — ensure_session must not overwrite
         assert row["source"] == "cli"
         assert row["model"] == "original-model"
 
@@ -1769,7 +1769,7 @@ class TestConcurrentWriteSafety:
         Simulates the #3139 scenario: create_session raises (lock), then
         ensure_session is called during flush, then append_message succeeds.
         """
-        # Simulate failed create_session ��� row absent
+        # Simulate failed create_session — row absent
         db.ensure_session("late-session", source="gateway", model="gpt-4")
         db.append_message(
             session_id="late-session",
@@ -1911,3 +1911,4 @@ class TestAutoMaintenance:
         assert marker is not None
         # Should parse as a float timestamp close to now.
         assert abs(float(marker) - time.time()) < 60
+
