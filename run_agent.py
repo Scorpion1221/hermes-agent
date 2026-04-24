@@ -2051,7 +2051,7 @@ class AIAgent:
         new_norm = (new_provider or "").strip().lower()
         if old_norm and new_norm and old_norm != new_norm:
             self._fallback_chain = [
-                entry for entry in self._fallback_chain
+                entry for entry in getattr(self, "_fallback_chain", [])
                 if (entry.get("provider") or "").strip().lower() not in {old_norm, new_norm}
             ]
             self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None

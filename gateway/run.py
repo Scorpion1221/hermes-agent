@@ -4030,7 +4030,7 @@ class GatewayRunner:
                 image_analysis=quoted_image_analysis,
             )
             if not quoted_block:
-                reply_snippet = quoted_text[:200] if found_in_history else quoted_text
+                reply_snippet = quoted_text[:200] if found_in_history else quoted_text[:500]
                 quoted_block = f'[Replying to: "{reply_snippet}"]'
             message_text = f"{quoted_block}\n\n{message_text}" if message_text else quoted_block
 
@@ -10251,7 +10251,27 @@ class GatewayRunner:
                 _persist = None
                 if reply_context:
                     _persist = message
-                result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id, persist_user_message=_persist)
+                run_kwargs = {
+                    "conversation_history": agent_history,
+                    "task_id": session_id,
+                }
+                if _persist is not None:
+                    try:
+                        import inspect
+
+                        sig = inspect.signature(agent.run_conversation)
+                        accepts_persist = (
+                            "persist_user_message" in sig.parameters
+                            or any(
+                                param.kind == inspect.Parameter.VAR_KEYWORD
+                                for param in sig.parameters.values()
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        accepts_persist = True
+                    if accepts_persist:
+                        run_kwargs["persist_user_message"] = _persist
+                result = agent.run_conversation(message, **run_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)

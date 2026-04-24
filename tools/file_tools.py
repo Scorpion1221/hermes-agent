@@ -791,7 +791,10 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     "old_string not found. Use read_file to verify the current "
                     "content, or search_files to locate the text."
                 )
-        return json.dumps(result_dict, ensure_ascii=False)
+        result_json = json.dumps(result_dict, ensure_ascii=False)
+        if result_dict.get("_hint"):
+            result_json += f"\n\n[Hint: {result_dict['_hint']}]"
+        return result_json
     except Exception as e:
         return tool_error(str(e))
 

@@ -27,6 +27,13 @@ def get_transport(api_mode: str):
         _discover_transports()
     cls = _REGISTRY.get(api_mode)
     if cls is None:
+        # A test or import path may have registered one transport directly
+        # (making the registry non-empty) before the full transport discovery
+        # ran.  Do a best-effort discovery for missing modes too; imports are
+        # idempotent, and this prevents order-dependent None transports.
+        _discover_transports()
+        cls = _REGISTRY.get(api_mode)
+    if cls is None:
         return None
     return cls()
 

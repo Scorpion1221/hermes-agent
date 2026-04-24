@@ -9,6 +9,7 @@ context hydration into dedicated modules.
 from .types import FeishuMessageContext, FeishuQuotedContext, FeishuResourceDescriptor
 from .parse import (
     FeishuNormalizedMessage,
+    FeishuMentionRef,
     FeishuPostMediaRef,
     FeishuPostParseResult,
     normalize_feishu_message,
@@ -83,6 +84,7 @@ __all__ = [
     "FeishuQuotedContext",
     "FeishuResourceDescriptor",
     "FeishuNormalizedMessage",
+    "FeishuMentionRef",
     "FeishuPostMediaRef",
     "FeishuPostParseResult",
     "normalize_feishu_message",

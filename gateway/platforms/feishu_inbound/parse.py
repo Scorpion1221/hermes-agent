@@ -67,6 +67,14 @@ class FeishuPostMediaRef:
 
 
 @dataclass(frozen=True)
+class FeishuMentionRef:
+    name: str = ""
+    open_id: str = ""
+    is_all: bool = False
+    is_self: bool = False
+
+
+@dataclass(frozen=True)
 class FeishuPostParseResult:
     text_content: str
     image_keys: list[str] = field(default_factory=list)
@@ -81,9 +89,16 @@ class FeishuNormalizedMessage:
     preferred_message_type: str = "text"
     image_keys: list[str] = field(default_factory=list)
     media_refs: list[FeishuPostMediaRef] = field(default_factory=list)
-    mentioned_ids: list[str] = field(default_factory=list)
+    mentions: list[FeishuMentionRef] = field(default_factory=list)
     relation_kind: str = "plain"
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def mentioned_ids(self) -> list[str]:
+        explicit = getattr(self, "_mentioned_ids", None)
+        if explicit is not None:
+            return list(explicit)
+        return [ref.open_id for ref in self.mentions if ref.open_id]
 
 
 def parse_feishu_post_payload(payload: Any) -> FeishuPostParseResult:
@@ -128,14 +143,15 @@ def normalize_feishu_message(*, message_type: str, raw_content: str) -> FeishuNo
         )
     if normalized_type == "post":
         parsed_post = parse_feishu_post_payload(payload)
-        return FeishuNormalizedMessage(
+        normalized = FeishuNormalizedMessage(
             raw_type=normalized_type,
             text_content=parsed_post.text_content,
             image_keys=list(parsed_post.image_keys),
             media_refs=list(parsed_post.media_refs),
-            mentioned_ids=list(parsed_post.mentioned_ids),
             relation_kind="post",
         )
+        object.__setattr__(normalized, "_mentioned_ids", list(parsed_post.mentioned_ids))
+        return normalized
     if normalized_type == "image":
         image_key = str(payload.get("image_key", "") or "").strip()
         alt_text = _normalize_feishu_text(
