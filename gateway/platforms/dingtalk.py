@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE_LENGTH = 20000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 _SESSION_WEBHOOKS_MAX = 500
-_DINGTALK_WEBHOOK_RE = re.compile(r'^https://api\.dingtalk\.com/')
+_DINGTALK_WEBHOOK_RE = re.compile(r'^https://(?:api|oapi)\.dingtalk\.com/')
 
 
 def check_dingtalk_requirements() -> bool:
@@ -128,12 +128,12 @@ class DingTalkAdapter(BasePlatformAdapter):
             return False
 
     async def _run_stream(self) -> None:
-        """Run the blocking stream client with auto-reconnection."""
+        """Run the stream client with auto-reconnection."""
         backoff_idx = 0
         while self._running:
             try:
                 logger.debug("[%s] Starting stream client...", self.name)
-                await asyncio.to_thread(self._stream_client.start)
+                await self._stream_client.start()
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -238,18 +238,35 @@ class DingTalkAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _extract_text(message: "ChatbotMessage") -> str:
-        """Extract plain text from a DingTalk chatbot message."""
-        text = getattr(message, "text", None) or ""
-        if isinstance(text, dict):
-            content = text.get("content", "").strip()
-        else:
-            content = str(text).strip()
+        """Extract plain text from a DingTalk chatbot message.
 
-        # Fall back to rich text if present
+        Handles both legacy and current dingtalk-stream SDK payload shapes:
+          * legacy: ``message.text`` was a dict ``{"content": "..."}``
+          * >= 0.20: ``message.text`` is a ``TextContent`` dataclass whose
+            ``__str__`` returns ``"TextContent(content=...)"`` — never fall
+            back to ``str(text)`` without extracting ``.content`` first.
+          * rich text moved from ``message.rich_text`` (list) to
+            ``message.rich_text_content.rich_text_list`` (list of dicts).
+        """
+        text = getattr(message, "text", None)
+        content = ""
+        if text is not None:
+            if isinstance(text, dict):
+                content = (text.get("content") or "").strip()
+            elif hasattr(text, "content"):
+                content = str(text.content or "").strip()
+            else:
+                content = str(text).strip()
+
         if not content:
-            rich_text = getattr(message, "rich_text", None)
-            if rich_text and isinstance(rich_text, list):
-                parts = [item["text"] for item in rich_text
+            rich_list = None
+            rtc = getattr(message, "rich_text_content", None)
+            if rtc is not None and hasattr(rtc, "rich_text_list"):
+                rich_list = rtc.rich_text_list
+            if rich_list is None:
+                rich_list = getattr(message, "rich_text", None)
+            if rich_list and isinstance(rich_list, list):
+                parts = [item["text"] for item in rich_list
                          if isinstance(item, dict) and item.get("text")]
                 content = " ".join(parts).strip()
         return content
@@ -314,19 +331,16 @@ class _IncomingHandler(ChatbotHandler if DINGTALK_STREAM_AVAILABLE else object):
         self._adapter = adapter
         self._loop = loop
 
-    def process(self, message: "ChatbotMessage"):
-        """Called by dingtalk-stream in its thread when a message arrives.
+    async def process(self, callback_message):
+        """Called by dingtalk-stream when a message arrives.
 
-        Schedules the async handler on the main event loop.
+        dingtalk-stream >= 0.24 passes a CallbackMessage whose `.data` contains
+        the chatbot payload. Convert it to ChatbotMessage and await the adapter
+        handler directly on the main event loop.
         """
-        loop = self._loop
-        if loop is None or loop.is_closed():
-            logger.error("[DingTalk] Event loop unavailable, cannot dispatch message")
-            return dingtalk_stream.AckMessage.STATUS_OK, "OK"
-
-        future = asyncio.run_coroutine_threadsafe(self._adapter._on_message(message), loop)
         try:
-            future.result(timeout=60)
+            chatbot_msg = ChatbotMessage.from_dict(callback_message.data)
+            await self._adapter._on_message(chatbot_msg)
         except Exception:
             logger.exception("[DingTalk] Error processing incoming message")
 

@@ -43,6 +43,7 @@ class StreamConsumerConfig:
     edit_interval: float = 1.0
     buffer_threshold: int = 40
     cursor: str = " ▉"
+    buffer_only: bool = False
 
 
 class GatewayStreamConsumer:
@@ -99,6 +100,7 @@ class GatewayStreamConsumer:
         self._flood_strikes = 0         # Consecutive flood-control edit failures
         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
         self._final_response_sent = False
+        self._cardkit_mode = bool(metadata and metadata.get("streaming"))
 
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
@@ -303,10 +305,13 @@ class GatewayStreamConsumer:
                     got_done
                     or got_segment_break
                     or commentary_text is not None
-                    or (elapsed >= self._current_edit_interval
-                        and self._accumulated)
-                    or len(self._accumulated) >= self.cfg.buffer_threshold
                 )
+                if not self.cfg.buffer_only:
+                    should_edit = should_edit or (
+                        (elapsed >= self._current_edit_interval
+                            and self._accumulated)
+                        or len(self._accumulated) >= self.cfg.buffer_threshold
+                    )
 
                 current_update_visible = False
                 if should_edit and self._accumulated:
@@ -367,6 +372,14 @@ class GatewayStreamConsumer:
 
                     current_update_visible = await self._send_or_edit(display_text)
                     self._last_edit_time = time.monotonic()
+                    # Backoff on failed edits to avoid hammering the API
+                    # (especially CardKit streaming which can hit SSL errors).
+                    if not current_update_visible:
+                        self._consecutive_failures = getattr(self, "_consecutive_failures", 0) + 1
+                        _backoff = min(0.5 * self._consecutive_failures, 5.0)
+                        await asyncio.sleep(_backoff)
+                    else:
+                        self._consecutive_failures = 0
 
                 if got_done:
                     # Final edit without cursor. If progressive editing failed
@@ -382,13 +395,19 @@ class GatewayStreamConsumer:
                             self._final_response_sent = await self._send_or_edit(self._accumulated)
                         elif not self._already_sent:
                             self._final_response_sent = await self._send_or_edit(self._accumulated)
+                    if self._message_id and hasattr(self.adapter, "finalize_streaming_message"):
+                        try:
+                            await self.adapter.finalize_streaming_message(self._message_id, self._accumulated or "")
+                        except Exception as _fin_err:
+                            logger.warning("finalize_streaming_message failed: %s", _fin_err)
                     return
 
                 if commentary_text is not None:
-                    self._reset_segment_state()
-                    await self._send_commentary(commentary_text)
-                    self._last_edit_time = time.monotonic()
-                    self._reset_segment_state()
+                    if not self._cardkit_mode:
+                        self._reset_segment_state()
+                        await self._send_commentary(commentary_text)
+                        self._last_edit_time = time.monotonic()
+                        self._reset_segment_state()
 
                 # Tool boundary: reset message state so the next text chunk
                 # creates a fresh message below any tool-progress messages.
@@ -405,24 +424,34 @@ class GatewayStreamConsumer:
                 # a real string like "msg_1", not "__no_edit__", so that case
                 # still resets and creates a fresh segment as intended.)
                 if got_segment_break:
-                    self._reset_segment_state(preserve_no_edit=True)
+                    if not self._cardkit_mode:
+                        self._reset_segment_state(preserve_no_edit=True)
 
                 await asyncio.sleep(0.05)  # Small yield to not busy-loop
 
         except asyncio.CancelledError:
             # Best-effort final edit on cancellation
+            _best_effort_ok = False
             if self._accumulated and self._message_id:
                 try:
-                    await self._send_or_edit(self._accumulated)
+                    _best_effort_ok = bool(await self._send_or_edit(self._accumulated))
                 except Exception:
                     pass
-            # If we delivered any content before being cancelled, mark the
-            # final response as sent so the gateway's already_sent check
-            # doesn't trigger a duplicate message.  The 5-second
-            # stream_task timeout (gateway/run.py) can cancel us while
-            # waiting on a slow Telegram API call — without this flag the
-            # gateway falls through to the normal send path.
-            if self._already_sent:
+            if self._message_id and hasattr(self.adapter, "finalize_streaming_message"):
+                try:
+                    await self.adapter.finalize_streaming_message(
+                        self._message_id, self._accumulated or "", stopped=True,
+                    )
+                except Exception:
+                    pass
+            # Only confirm final delivery if the best-effort send above
+            # actually succeeded OR if the final response was already
+            # confirmed before we were cancelled.  Previously this
+            # promoted any partial send (already_sent=True) to
+            # final_response_sent — which suppressed the gateway's
+            # fallback send even when only intermediate text (e.g.
+            # "Let me search…") had been delivered, not the real answer.
+            if _best_effort_ok and not self._final_response_sent:
                 self._final_response_sent = True
         except Exception as e:
             logger.error("Stream consumer error: %s", e)
@@ -521,9 +550,17 @@ class GatewayStreamConsumer:
         self._fallback_final_send = False
         if not continuation.strip():
             # Nothing new to send — the visible partial already matches final text.
-            self._already_sent = True
-            self._final_response_sent = True
-            return
+            # BUT: if final_text itself has meaningful content (e.g. a timeout
+            # message after a long tool call), the prefix-based continuation
+            # calculation may wrongly conclude "already shown" because the
+            # streamed prefix was from a *previous* segment (before the tool
+            # boundary).  In that case, send the full final_text as-is (#10807).
+            if final_text.strip() and final_text != self._visible_prefix():
+                continuation = final_text
+            else:
+                self._already_sent = True
+                self._final_response_sent = True
+                return
 
         raw_limit = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
         safe_limit = max(500, raw_limit - 100)
@@ -617,12 +654,15 @@ class GatewayStreamConsumer:
                 content=text,
                 metadata=self.metadata,
             )
-            if result.success:
-                self._already_sent = True
-                return True
+            # Note: do NOT set _already_sent = True here.
+            # Commentary messages are interim status updates (e.g. "Using browser
+            # tool..."), not the final response. Setting already_sent would cause
+            # the final response to be incorrectly suppressed when there are
+            # multiple tool calls. See: https://github.com/NousResearch/hermes-agent/issues/10454
+            return result.success
         except Exception as e:
             logger.error("Commentary send error: %s", e)
-        return False
+            return False
 
     async def _send_or_edit(self, text: str) -> bool:
         """Send or edit the streaming message.

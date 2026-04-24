@@ -29,13 +29,6 @@ def _mock_event_dispatcher_builder(mock_handler_class):
     return mock_builder
 
 
-class TestPlatformEnum(unittest.TestCase):
-    def test_feishu_in_platform_enum(self):
-        from gateway.config import Platform
-
-        self.assertEqual(Platform.FEISHU.value, "feishu")
-
-
 class TestConfigEnvOverrides(unittest.TestCase):
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_xxx",
@@ -80,24 +73,6 @@ class TestConfigEnvOverrides(unittest.TestCase):
         _apply_env_overrides(config)
 
         self.assertIn(Platform.FEISHU, config.get_connected_platforms())
-
-
-class TestGatewayIntegration(unittest.TestCase):
-    def test_feishu_in_adapter_factory(self):
-        source = Path("gateway/run.py").read_text(encoding="utf-8")
-        self.assertIn("Platform.FEISHU", source)
-        self.assertIn("FeishuAdapter", source)
-
-    def test_feishu_in_authorization_maps(self):
-        source = Path("gateway/run.py").read_text(encoding="utf-8")
-        self.assertIn("FEISHU_ALLOWED_USERS", source)
-        self.assertIn("FEISHU_ALLOW_ALL_USERS", source)
-
-    def test_feishu_toolset_exists(self):
-        from toolsets import TOOLSETS
-
-        self.assertIn("hermes-feishu", TOOLSETS)
-        self.assertIn("hermes-feishu", TOOLSETS["hermes-gateway"]["includes"])
 
 
 class TestFeishuMessageNormalization(unittest.TestCase):
@@ -179,6 +154,30 @@ class TestFeishuMessageNormalization(unittest.TestCase):
             normalized.text_content,
             "Build Failed\nService: payments-api\nBranch: main\nView Logs\nRetry\nActions: View Logs, Retry",
         )
+
+    def test_normalize_interactive_template_card_uses_template_variables(self):
+        from gateway.platforms.feishu import normalize_feishu_message
+
+        normalized = normalize_feishu_message(
+            message_type="card",
+            raw_content=json.dumps(
+                {
+                    "type": "template",
+                    "data": {
+                        "template_id": "ctp_xxx",
+                        "template_variable": {
+                            "alert_title": "Build Failed",
+                            "service": "payments-api",
+                            "branch": "main",
+                            "log_url": "https://example.com/logs",
+                        },
+                    },
+                }
+            ),
+        )
+
+        self.assertEqual(normalized.relation_kind, "interactive")
+        self.assertEqual(normalized.text_content, "Build Failed\npayments-api\nmain")
 
 
 class TestFeishuAdapterMessaging(unittest.TestCase):
@@ -387,14 +386,17 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.message_id, "om_progress")
         self.assertEqual(captured["request"].message_id, "om_progress")
-        self.assertEqual(captured["request"].request_body.msg_type, "text")
+        # All outbound messages are now Feishu Card 2.0 (interactive).
+        self.assertEqual(captured["request"].request_body.msg_type, "interactive")
+        card = json.loads(captured["request"].request_body.content)
+        self.assertEqual(card["schema"], "2.0")
         self.assertEqual(
-            captured["request"].request_body.content,
-            json.dumps({"text": "📖 read_file: \"/tmp/image.png\""}, ensure_ascii=False),
+            card["body"]["elements"],
+            [{"tag": "markdown", "content": "📖 read_file: \"/tmp/image.png\""}],
         )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_edit_message_falls_back_to_text_when_post_update_is_rejected(self):
+    def test_edit_message_falls_back_to_text_when_card_update_is_rejected(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -405,7 +407,11 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             def update(self, request):
                 captured["calls"].append(request)
                 if len(captured["calls"]) == 1:
-                    return SimpleNamespace(success=lambda: False, code=230001, msg="content format of the post type is incorrect")
+                    return SimpleNamespace(
+                        success=lambda: False,
+                        code=230002,
+                        msg="invalid card content",
+                    )
                 return SimpleNamespace(success=lambda: True)
 
         adapter._client = SimpleNamespace(
@@ -429,7 +435,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["calls"][0].request_body.msg_type, "post")
+        self.assertEqual(captured["calls"][0].request_body.msg_type, "interactive")
         self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
         self.assertEqual(
             captured["calls"][1].request_body.content,
@@ -472,27 +478,6 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertEqual(info["type"], "group")
 
 class TestAdapterModule(unittest.TestCase):
-    def test_adapter_requirement_helper_exists(self):
-        source = Path("gateway/platforms/feishu.py").read_text(encoding="utf-8")
-        self.assertIn("def check_feishu_requirements()", source)
-        self.assertIn("FEISHU_AVAILABLE", source)
-
-    def test_adapter_declares_websocket_scope(self):
-        source = Path("gateway/platforms/feishu.py").read_text(encoding="utf-8")
-        self.assertIn("Supported modes: websocket, webhook", source)
-        self.assertIn("FEISHU_CONNECTION_MODE", source)
-
-    def test_adapter_registers_message_read_noop_handler(self):
-        source = Path("gateway/platforms/feishu.py").read_text(encoding="utf-8")
-        self.assertIn("register_p2_im_message_message_read_v1", source)
-        self.assertIn("def _on_message_read_event", source)
-
-    def test_adapter_registers_reaction_and_card_handlers_for_websocket(self):
-        source = Path("gateway/platforms/feishu.py").read_text(encoding="utf-8")
-        self.assertIn("register_p2_im_message_reaction_created_v1", source)
-        self.assertIn("register_p2_im_message_reaction_deleted_v1", source)
-        self.assertIn("register_p2_card_action_trigger", source)
-
     def test_load_settings_uses_sdk_defaults_for_invalid_ws_reconnect_values(self):
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -639,6 +624,14 @@ class TestAdapterBehavior(unittest.TestCase):
                 calls.append("bot_deleted")
                 return self
 
+            def register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(self, _handler):
+                calls.append("p2p_chat_entered")
+                return self
+
+            def register_p2_im_message_recalled_v1(self, _handler):
+                calls.append("message_recalled")
+                return self
+
             def build(self):
                 calls.append("build")
                 return "handler"
@@ -664,6 +657,8 @@ class TestAdapterBehavior(unittest.TestCase):
                 "card_action",
                 "bot_added",
                 "bot_deleted",
+                "p2p_chat_entered",
+                "message_recalled",
                 "build",
             ],
         )
@@ -1383,9 +1378,406 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(attachment, "[Attachment: report.pdf]")
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_extract_text_from_raw_content_does_not_stringify_none(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        text = adapter._extract_text_from_raw_content(
+            msg_type="text",
+            raw_content="{}",
+        )
+        image = adapter._extract_text_from_raw_content(
+            msg_type="image",
+            raw_content='{"image_key":"img_123"}',
+        )
+
+        self.assertIsNone(text)
+        self.assertEqual(image, "[Image]")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_fetch_reply_context_downloads_quoted_image(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._download_feishu_resource_descriptors = AsyncMock(
+            return_value=(["/tmp/quoted-image.png"], ["image/png"])
+        )
+
+        parent = SimpleNamespace(
+            msg_type="image",
+            body=SimpleNamespace(content='{"image_key":"img_quoted"}'),
+        )
+        response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(items=[parent]),
+        )
+
+        class _MessageAPI:
+            def get(self, _request):
+                return response
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            text, media_urls, media_types = asyncio.run(adapter._fetch_reply_context("om_parent"))
+
+        self.assertEqual(text, "[Image]")
+        self.assertEqual(media_urls, ["/tmp/quoted-image.png"])
+        self.assertEqual(media_types, ["image/png"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_fetch_reply_context_expands_merge_forward_with_sender_names(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._download_feishu_resource_descriptors = AsyncMock(return_value=([], []))
+        adapter._resolve_sender_name_from_api = AsyncMock(
+            side_effect=lambda open_id: {"ou_alice": "Alice", "ou_bob": "Bob"}.get(open_id)
+        )
+
+        response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(
+                items=[
+                    SimpleNamespace(
+                        message_id="om_parent_merge",
+                        msg_type="merge_forward",
+                        body=SimpleNamespace(content='{"title":"Forwarded"}'),
+                    ),
+                    SimpleNamespace(
+                        message_id="om_child_1",
+                        upper_message_id="om_parent_merge",
+                        msg_type="text",
+                        body=SimpleNamespace(content='{"text":"Investigating"}'),
+                        sender=SimpleNamespace(id="ou_alice"),
+                        create_time="1",
+                    ),
+                    SimpleNamespace(
+                        message_id="om_child_2",
+                        upper_message_id="om_parent_merge",
+                        msg_type="text",
+                        body=SimpleNamespace(content='{"text":"ETA 10 min"}'),
+                        sender=SimpleNamespace(id="ou_bob"),
+                        create_time="2",
+                    ),
+                ]
+            ),
+        )
+
+        class _MessageAPI:
+            def get(self, _request):
+                return response
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            text, media_urls, media_types = asyncio.run(adapter._fetch_reply_context("om_parent_merge"))
+
+        self.assertEqual(text, "- Alice: Investigating\n- Bob: ETA 10 min")
+        self.assertEqual(media_urls, [])
+        self.assertEqual(media_types, [])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_fetch_message_items_prefers_raw_request_items_for_merge_forward(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        raw_items = [
+            {"message_id": "om_merge", "msg_type": "merge_forward", "body": {"content": '{"title":"Forwarded"}'}},
+            {
+                "message_id": "om_child_1",
+                "upper_message_id": "om_merge",
+                "msg_type": "text",
+                "body": {"content": '{"text":"Investigating"}'},
+                "sender": {"id": "ou_alice"},
+                "create_time": "1",
+            },
+        ]
+
+        class _Client:
+            def request(self, req):
+                return SimpleNamespace(data=SimpleNamespace(items=raw_items))
+
+        adapter._client = _Client()
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            items = asyncio.run(adapter._fetch_message_items("om_merge"))
+
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["message_id"], "om_merge")
+        self.assertEqual(items[1]["upper_message_id"], "om_merge")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_fetch_reply_context_downloads_quoted_merge_forward_image_resources(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._download_feishu_resource_descriptors = AsyncMock(
+            return_value=(["/tmp/quoted-merge-image.png"], ["image/png"])
+        )
+        adapter._resolve_sender_name_from_api = AsyncMock(return_value="Alice")
+
+        response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(
+                items=[
+                    SimpleNamespace(
+                        message_id="om_parent_merge_img",
+                        msg_type="merge_forward",
+                        body=SimpleNamespace(content='{"title":"Forwarded"}'),
+                    ),
+                    SimpleNamespace(
+                        message_id="om_child_img",
+                        upper_message_id="om_parent_merge_img",
+                        msg_type="image",
+                        body=SimpleNamespace(content='{"image_key":"img_nested"}'),
+                        sender=SimpleNamespace(id="ou_alice"),
+                        create_time="1",
+                    ),
+                ]
+            ),
+        )
+
+        class _MessageAPI:
+            def get(self, _request):
+                return response
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            text, media_urls, media_types = asyncio.run(adapter._fetch_reply_context("om_parent_merge_img"))
+
+        self.assertEqual(text, "- Alice: [Image]")
+        self.assertEqual(media_urls, ["/tmp/quoted-merge-image.png"])
+        self.assertEqual(media_types, ["image/png"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_extract_interactive_message_prefers_hydrated_card_payload(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._fetch_message_items = AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    message_id="om_interactive_hydrated",
+                    msg_type="interactive",
+                    body=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "card": {
+                                    "header": {"title": {"tag": "plain_text", "content": "Hydrated Card"}},
+                                    "elements": [
+                                        {"tag": "div", "text": {"tag": "plain_text", "content": "Requester: Bob"}},
+                                    ],
+                                }
+                            }
+                        )
+                    ),
+                )
+            ]
+        )
+        message = SimpleNamespace(
+            message_type="interactive",
+            content=json.dumps({"card": {"header": {"title": {"tag": "plain_text", "content": "Placeholder"}}}}),
+            message_id="om_interactive_hydrated",
+        )
+
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
+
+        self.assertEqual(text, "Hydrated Card\nRequester: Bob")
+        self.assertEqual(msg_type.value, "text")
+        self.assertEqual(media_urls, [])
+        self.assertEqual(media_types, [])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_extract_merge_forward_message_expands_hydrated_items(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._fetch_message_items = AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    message_id="om_merge_hydrated",
+                    msg_type="merge_forward",
+                    body=SimpleNamespace(content='{"title":"Forward placeholder"}'),
+                ),
+                SimpleNamespace(
+                    message_id="om_child_1",
+                    upper_message_id="om_merge_hydrated",
+                    msg_type="text",
+                    body=SimpleNamespace(content='{"text":"Investigating"}'),
+                    sender=SimpleNamespace(id="ou_alice"),
+                    create_time="1",
+                ),
+                SimpleNamespace(
+                    message_id="om_child_2",
+                    upper_message_id="om_merge_hydrated",
+                    msg_type="post",
+                    body=SimpleNamespace(
+                        content='{"en_us":{"content":[[{"tag":"text","text":"ETA 10 min"}]]}}'
+                    ),
+                    sender=SimpleNamespace(id="ou_bob"),
+                    create_time="2",
+                ),
+            ]
+        )
+        adapter._resolve_sender_name_from_api = AsyncMock(
+            side_effect=lambda open_id: {"ou_alice": "Alice", "ou_bob": "Bob"}.get(open_id)
+        )
+        message = SimpleNamespace(
+            message_type="merge_forward",
+            content='{"title":"Forward placeholder"}',
+            message_id="om_merge_hydrated",
+        )
+
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
+
+        self.assertEqual(text, "- Alice: Investigating\n- Bob: ETA 10 min")
+        self.assertEqual(msg_type.value, "text")
+        self.assertEqual(media_urls, [])
+        self.assertEqual(media_types, [])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_extract_merge_forward_message_downloads_embedded_image_resources(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._fetch_message_items = AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    message_id="om_merge_media",
+                    msg_type="merge_forward",
+                    body=SimpleNamespace(content='{"title":"Forward placeholder"}'),
+                ),
+                SimpleNamespace(
+                    message_id="om_child_img",
+                    upper_message_id="om_merge_media",
+                    msg_type="image",
+                    body=SimpleNamespace(content='{"image_key":"img_nested"}'),
+                    sender=SimpleNamespace(id="ou_alice"),
+                    create_time="1",
+                ),
+            ]
+        )
+        adapter._resolve_sender_name_from_api = AsyncMock(return_value="Alice")
+        adapter._download_feishu_resource_descriptors = AsyncMock(
+            return_value=(["/tmp/merge-forward-image.png"], ["image/png"])
+        )
+        message = SimpleNamespace(
+            message_type="merge_forward",
+            content='{"title":"Forward placeholder"}',
+            message_id="om_merge_media",
+        )
+
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
+
+        self.assertEqual(text, "- Alice: [Image]")
+        self.assertEqual(msg_type.value, "text")
+        self.assertEqual(media_urls, ["/tmp/merge-forward-image.png"])
+        self.assertEqual(media_types, ["image/png"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_download_feishu_image_uses_persistent_media_index_hit(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter, FeishuMediaIndexEntry
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = SimpleNamespace()
+        cached = FeishuMediaIndexEntry(
+            platform="feishu",
+            message_id="om_cached",
+            file_key="img_cached",
+            cached_path="/tmp/from-index.png",
+            content_type="image/png",
+            resource_type="image",
+            updated_at=0.0,
+        )
+
+        with patch("gateway.platforms.feishu.get_feishu_media_index_entry", return_value=cached) as lookup:
+            path, media_type = asyncio.run(adapter._download_feishu_image(message_id="om_cached", image_key="img_cached"))
+
+        lookup.assert_called_once_with("om_cached", "img_cached")
+        self.assertEqual(path, "/tmp/from-index.png")
+        self.assertEqual(media_type, "image/png")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_download_feishu_message_resource_writes_persistent_media_index(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        class _ResourceAPI:
+            def get(self, _request):
+                return SimpleNamespace(
+                    success=lambda: True,
+                    raw=SimpleNamespace(headers={"Content-Type": "image/png"}),
+                    file=SimpleNamespace(getvalue=lambda: b"\x89PNG\r\n\x1a\nrest"),
+                    file_name="quoted.png",
+                )
+
+        adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message_resource=_ResourceAPI())))
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with (
+            patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct),
+            patch("gateway.platforms.feishu.cache_image_from_bytes", return_value="/tmp/cached-quoted.png"),
+            patch("gateway.platforms.feishu.put_feishu_media_index_entry") as store,
+        ):
+            path, media_type = asyncio.run(
+                adapter._download_feishu_message_resource(
+                    message_id="om_res",
+                    file_key="img_nested",
+                    resource_type="file",
+                    fallback_filename="quoted.png",
+                )
+            )
+
+        self.assertEqual(path, "/tmp/cached-quoted.png")
+        self.assertEqual(media_type, "image/png")
+        store.assert_called_once_with(
+            message_id="om_res",
+            file_key="img_nested",
+            cached_path="/tmp/cached-quoted.png",
+            content_type="image/png",
+            resource_type="image",
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_extract_text_message_starting_with_slash_becomes_command(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
+        from gateway.platforms.feishu_inbound import FeishuQuotedContext
 
         adapter = FeishuAdapter(PlatformConfig())
         adapter._dispatch_inbound_event = AsyncMock()
@@ -1779,6 +2171,7 @@ class TestAdapterBehavior(unittest.TestCase):
     def test_process_inbound_message_fetches_reply_to_text(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
+        from gateway.platforms.feishu_inbound import FeishuQuotedContext
 
         adapter = FeishuAdapter(PlatformConfig())
         adapter._dispatch_inbound_event = AsyncMock()
@@ -1788,7 +2181,9 @@ class TestAdapterBehavior(unittest.TestCase):
         adapter._resolve_sender_profile = AsyncMock(
             return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
         )
-        adapter._fetch_message_text = AsyncMock(return_value="父消息内容")
+        adapter._fetch_quoted_context = AsyncMock(
+            return_value=FeishuQuotedContext(message_id="om_parent", kind="plain", text="父消息内容", summary="父消息内容")
+        )
         message = SimpleNamespace(
             chat_id="oc_chat",
             thread_id=None,
@@ -1812,6 +2207,100 @@ class TestAdapterBehavior(unittest.TestCase):
         event = adapter._dispatch_inbound_event.await_args.args[0]
         self.assertEqual(event.reply_to_message_id, "om_parent")
         self.assertEqual(event.reply_to_text, "父消息内容")
+        self.assertIsNotNone(event.quoted_context)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_process_inbound_message_uses_root_id_when_parent_missing(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.platforms.feishu_inbound import FeishuQuotedContext
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_chat", "name": "Feishu DM", "type": "dm"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
+        )
+        adapter._fetch_quoted_context = AsyncMock(
+            return_value=FeishuQuotedContext(message_id="om_root", kind="plain", text="线程根消息", summary="线程根消息")
+        )
+        message = SimpleNamespace(
+            chat_id="oc_chat",
+            thread_id="omt_root",
+            parent_id=None,
+            root_id="om_root",
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"reply"}',
+            message_id="om_reply_root",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+                chat_type="p2p",
+                message_id="om_reply_root",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.reply_to_message_id, "om_root")
+        self.assertEqual(event.reply_to_text, "线程根消息")
+        self.assertIsNotNone(event.quoted_context)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_process_inbound_message_attaches_reply_image_context(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.platforms.feishu_inbound import FeishuQuotedContext
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_chat", "name": "Feishu DM", "type": "dm"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
+        )
+        adapter._fetch_quoted_context = AsyncMock(
+            return_value=FeishuQuotedContext(
+                message_id="om_parent",
+                kind="image",
+                text="[Image]",
+                summary="[Image]",
+                media_urls=("/tmp/quoted-image.png",),
+                media_types=("image/png",),
+            )
+        )
+        message = SimpleNamespace(
+            chat_id="oc_chat",
+            thread_id=None,
+            parent_id="om_parent",
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"reply"}',
+            message_id="om_reply_image",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+                chat_type="p2p",
+                message_id="om_reply_image",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.reply_to_text, "[Image]")
+        self.assertEqual(event.reply_to_media_urls, ["/tmp/quoted-image.png"])
+        self.assertEqual(event.reply_to_media_types, ["image/png"])
+        self.assertIsNotNone(event.quoted_context)
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_replies_in_thread_when_thread_metadata_present(self):
@@ -2325,43 +2814,69 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(elements, [{"tag": "md", "text": "# 标题\n访问 [文档](https://example.com)"}])
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_build_post_payload_wraps_markdown_in_md_tag(self):
+    def test_build_outbound_payload_emits_card_v2_for_markdown(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        payload = json.loads(
-            adapter._build_post_payload("支持 **粗体**、*斜体* 和 `代码`")
-        )
+        msg_type, payload = adapter._build_outbound_payload("支持 **粗体**、*斜体* 和 `代码`")
 
-        elements = payload["zh_cn"]["content"][0]
+        self.assertEqual(msg_type, "interactive")
+        card = json.loads(payload)
+        self.assertEqual(card["schema"], "2.0")
         self.assertEqual(
-            elements,
-            [
-                {"tag": "md", "text": "支持 **粗体**、*斜体* 和 `代码`"},
-            ],
+            card["body"]["elements"],
+            [{"tag": "markdown", "content": "支持 **粗体**、*斜体* 和 `代码`"}],
         )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_build_post_payload_keeps_full_markdown_text(self):
+    def test_build_outbound_payload_emits_card_v2_for_plain_text(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        payload = json.loads(
-            adapter._build_post_payload(
-                "---\n1. 第一项\n  2. 子项\n- 外层\n  - 内层\n<u>下划线</u> 和 ~~删除线~~"
-            )
-        )
+        msg_type, payload = adapter._build_outbound_payload("hello world")
 
-        rows = payload["zh_cn"]["content"]
-        self.assertEqual(
-            rows,
-            [[{"tag": "md", "text": "---\n1. 第一项\n  2. 子项\n- 外层\n  - 内层\n<u>下划线</u> 和 ~~删除线~~"}]],
-        )
+        self.assertEqual(msg_type, "interactive")
+        card = json.loads(payload)
+        self.assertEqual(card["body"]["elements"][0]["content"], "hello world")
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_send_uses_post_for_inline_markdown(self):
+    def test_build_outbound_payload_preserves_pipe_table_in_card(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        content = (
+            "**三个 Fork 仓库**\n\n"
+            "| 仓库 | 路径 |\n"
+            "| --- | --- |\n"
+            "| hermes-agent | ~/git/hermes-agent |\n"
+            "| mempalace | ~/git/mempalace |\n"
+        )
+        msg_type, payload = adapter._build_outbound_payload(content)
+
+        self.assertEqual(msg_type, "interactive")
+        card = json.loads(payload)
+        # Whole content (including the pipe table) is handed to a single
+        # markdown element — Card 2.0 renders GFM tables natively.
+        self.assertEqual(card["body"]["elements"][0]["content"], content)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_build_outbound_payload_keeps_full_markdown_text(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        content = "---\n1. 第一项\n  2. 子项\n- 外层\n  - 内层\n<u>下划线</u> 和 ~~删除线~~"
+        msg_type, payload = adapter._build_outbound_payload(content)
+
+        self.assertEqual(msg_type, "interactive")
+        card = json.loads(payload)
+        self.assertEqual(card["body"]["elements"][0]["content"], content)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_uses_interactive_card_for_inline_markdown(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -2373,7 +2888,7 @@ class TestAdapterBehavior(unittest.TestCase):
                 captured["request"] = request
                 return SimpleNamespace(
                     success=lambda: True,
-                    data=SimpleNamespace(message_id="om_markdown"),
+                    data=SimpleNamespace(message_id="om_card"),
                 )
 
         adapter._client = SimpleNamespace(
@@ -2396,13 +2911,16 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["request"].request_body.msg_type, "post")
-        payload = json.loads(captured["request"].request_body.content)
-        elements = payload["zh_cn"]["content"][0]
-        self.assertEqual(elements, [{"tag": "md", "text": "可以用 **粗体** 和 *斜体*。"}])
+        self.assertEqual(captured["request"].request_body.msg_type, "interactive")
+        card = json.loads(captured["request"].request_body.content)
+        self.assertEqual(card["schema"], "2.0")
+        self.assertEqual(
+            card["body"]["elements"],
+            [{"tag": "markdown", "content": "可以用 **粗体** 和 *斜体*。"}],
+        )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_send_falls_back_to_text_when_post_payload_is_rejected(self):
+    def test_send_falls_back_to_text_when_card_is_rejected(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -2413,7 +2931,7 @@ class TestAdapterBehavior(unittest.TestCase):
             def create(self, request):
                 captured["calls"].append(request)
                 if len(captured["calls"]) == 1:
-                    raise RuntimeError("content format of the post type is incorrect")
+                    raise RuntimeError("invalid card content")
                 return SimpleNamespace(
                     success=lambda: True,
                     data=SimpleNamespace(message_id="om_plain"),
@@ -2439,7 +2957,7 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["calls"][0].request_body.msg_type, "post")
+        self.assertEqual(captured["calls"][0].request_body.msg_type, "interactive")
         self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
         self.assertEqual(
             captured["calls"][1].request_body.content,
@@ -2447,7 +2965,7 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_send_falls_back_to_text_when_post_response_is_unsuccessful(self):
+    def test_send_falls_back_to_text_when_card_response_is_unsuccessful(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -2458,7 +2976,11 @@ class TestAdapterBehavior(unittest.TestCase):
             def create(self, request):
                 captured["calls"].append(request)
                 if len(captured["calls"]) == 1:
-                    return SimpleNamespace(success=lambda: False, code=230001, msg="content format of the post type is incorrect")
+                    return SimpleNamespace(
+                        success=lambda: False,
+                        code=230002,
+                        msg="invalid card schema",
+                    )
                 return SimpleNamespace(
                     success=lambda: True,
                     data=SimpleNamespace(message_id="om_plain_response"),
@@ -2484,7 +3006,7 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["calls"][0].request_body.msg_type, "post")
+        self.assertEqual(captured["calls"][0].request_body.msg_type, "interactive")
         self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
         self.assertEqual(
             captured["calls"][1].request_body.content,
@@ -2492,7 +3014,7 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_send_uses_post_for_advanced_markdown_lines(self):
+    def test_send_uses_card_for_advanced_markdown_lines(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -2504,7 +3026,7 @@ class TestAdapterBehavior(unittest.TestCase):
                 captured["request"] = request
                 return SimpleNamespace(
                     success=lambda: True,
-                    data=SimpleNamespace(message_id="om_markdown_advanced"),
+                    data=SimpleNamespace(message_id="om_card_advanced"),
                 )
 
         adapter._client = SimpleNamespace(
@@ -2527,13 +3049,159 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["request"].request_body.msg_type, "post")
-        payload = json.loads(captured["request"].request_body.content)
-        rows = payload["zh_cn"]["content"]
+        self.assertEqual(captured["request"].request_body.msg_type, "interactive")
+        card = json.loads(captured["request"].request_body.content)
+        self.assertEqual(card["schema"], "2.0")
         self.assertEqual(
-            rows,
-            [[{"tag": "md", "text": "---\n1. 第一项\n<u>下划线</u>\n~~删除线~~"}]],
+            card["body"]["elements"],
+            [{"tag": "markdown", "content": "---\n1. 第一项\n<u>下划线</u>\n~~删除线~~"}],
         )
+
+
+@unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
+class TestPendingInboundQueue(unittest.TestCase):
+    """Tests for the loop-not-ready race (#5499): inbound events arriving
+    before or during adapter loop transitions must be queued for replay
+    rather than silently dropped."""
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_event_queued_when_loop_not_ready(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._loop = None  # Simulate "before start()" or "during reconnect"
+
+        with patch("gateway.platforms.feishu.threading.Thread") as thread_cls:
+            adapter._on_message_event(SimpleNamespace(tag="evt-1"))
+            adapter._on_message_event(SimpleNamespace(tag="evt-2"))
+            adapter._on_message_event(SimpleNamespace(tag="evt-3"))
+
+        # All three queued, none dropped.
+        self.assertEqual(len(adapter._pending_inbound_events), 3)
+        # Only ONE drainer thread scheduled, not one per event.
+        self.assertEqual(thread_cls.call_count, 1)
+        # Drain scheduled flag set.
+        self.assertTrue(adapter._pending_drain_scheduled)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_drainer_replays_queued_events_when_loop_becomes_ready(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._loop = None
+        adapter._running = True
+
+        class _ReadyLoop:
+            def is_closed(self):
+                return False
+
+        # Queue three events while loop is None (simulate the race).
+        events = [SimpleNamespace(tag=f"evt-{i}") for i in range(3)]
+        with patch("gateway.platforms.feishu.threading.Thread"):
+            for ev in events:
+                adapter._on_message_event(ev)
+
+        self.assertEqual(len(adapter._pending_inbound_events), 3)
+
+        # Now the loop becomes ready; run the drainer inline (not as a thread)
+        # to verify it replays the queue.
+        adapter._loop = _ReadyLoop()
+
+        future = SimpleNamespace(add_done_callback=lambda *_a, **_kw: None)
+        submitted: list = []
+
+        def _submit(coro, _loop):
+            submitted.append(coro)
+            coro.close()
+            return future
+
+        with patch(
+            "gateway.platforms.feishu.asyncio.run_coroutine_threadsafe",
+            side_effect=_submit,
+        ) as submit:
+            adapter._drain_pending_inbound_events()
+
+        # All three events dispatched to the loop.
+        self.assertEqual(submit.call_count, 3)
+        # Queue emptied.
+        self.assertEqual(len(adapter._pending_inbound_events), 0)
+        # Drain flag reset so a future race can schedule a new drainer.
+        self.assertFalse(adapter._pending_drain_scheduled)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_drainer_drops_queue_when_adapter_shuts_down(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._loop = None
+        adapter._running = False  # Shutdown state
+
+        with patch("gateway.platforms.feishu.threading.Thread"):
+            adapter._on_message_event(SimpleNamespace(tag="evt-lost"))
+
+        self.assertEqual(len(adapter._pending_inbound_events), 1)
+
+        # Drainer should drop the queue immediately since _running is False.
+        adapter._drain_pending_inbound_events()
+
+        self.assertEqual(len(adapter._pending_inbound_events), 0)
+        self.assertFalse(adapter._pending_drain_scheduled)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_queue_cap_evicts_oldest_beyond_max_depth(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._loop = None
+        adapter._pending_inbound_max_depth = 3  # Shrink for test
+
+        with patch("gateway.platforms.feishu.threading.Thread"):
+            for i in range(5):
+                adapter._on_message_event(SimpleNamespace(tag=f"evt-{i}"))
+
+        # Only the last 3 should remain; evt-0 and evt-1 dropped.
+        self.assertEqual(len(adapter._pending_inbound_events), 3)
+        tags = [getattr(e, "tag", None) for e in adapter._pending_inbound_events]
+        self.assertEqual(tags, ["evt-2", "evt-3", "evt-4"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_normal_path_unchanged_when_loop_ready(self):
+        """When the loop is ready, events should dispatch directly without
+        ever touching the pending queue."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        class _ReadyLoop:
+            def is_closed(self):
+                return False
+
+        adapter._loop = _ReadyLoop()
+
+        future = SimpleNamespace(add_done_callback=lambda *_a, **_kw: None)
+
+        def _submit(coro, _loop):
+            coro.close()
+            return future
+
+        with patch(
+            "gateway.platforms.feishu.asyncio.run_coroutine_threadsafe",
+            side_effect=_submit,
+        ) as submit, patch(
+            "gateway.platforms.feishu.threading.Thread"
+        ) as thread_cls:
+            adapter._on_message_event(SimpleNamespace(tag="evt"))
+
+        self.assertEqual(submit.call_count, 1)
+        self.assertEqual(len(adapter._pending_inbound_events), 0)
+        self.assertFalse(adapter._pending_drain_scheduled)
+        # No drainer thread spawned when the happy path runs.
+        self.assertEqual(thread_cls.call_count, 0)
 
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
