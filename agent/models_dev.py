@@ -1,6 +1,6 @@
-"""Models.dev registry integration — primary database for providers and models.
+"""Models.dev registry integration ��� primary database for providers and models.
 
-Fetches from https://models.dev/api.json — a community-maintained database
+Fetches from https://models.dev/api.json ��� a community-maintained database
 of 4000+ models across 109+ providers.  Provides:
 
 - **Provider metadata**: name, base URL, env vars, documentation link
@@ -9,7 +9,7 @@ of 4000+ models across 109+ providers.  Provides:
   open-weights flag, family grouping, deprecation status
 
 Data resolution order (like TypeScript OpenCode):
-  1. Bundled snapshot (ships with the package — offline-first)
+  1. Bundled snapshot (ships with the package ��� offline-first)
   2. Disk cache (~/.hermes/models_dev_cache.json)
   3. Network fetch (https://models.dev/api.json)
   4. Background refresh every 60 minutes
@@ -40,7 +40,7 @@ _models_dev_cache_time: float = 0
 
 
 # ---------------------------------------------------------------------------
-# Dataclasses — rich metadata for providers and models
+# Dataclasses ��� rich metadata for providers and models
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -135,10 +135,10 @@ class ProviderInfo:
 
 
 # ---------------------------------------------------------------------------
-# Provider ID mapping: Hermes ↔ models.dev
+# Provider ID mapping: Hermes ��� models.dev
 # ---------------------------------------------------------------------------
 
-# Hermes provider names → models.dev provider IDs
+# Hermes provider names ��� models.dev provider IDs
 PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
     "openrouter": "openrouter",
     "anthropic": "anthropic",
@@ -146,6 +146,7 @@ PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
     "openai-codex": "openai",
     "zai": "zai",
     "kimi-coding": "kimi-for-coding",
+    "stepfun": "stepfun",
     "kimi-coding-cn": "kimi-for-coding",
     "minimax": "minimax",
     "minimax-cn": "minimax-cn",
@@ -172,7 +173,7 @@ PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
     "ollama-cloud": "ollama-cloud",
 }
 
-# Reverse mapping: models.dev → Hermes (built lazily)
+# Reverse mapping: models.dev ��� Hermes (built lazily)
 _MODELS_DEV_TO_PROVIDER: Optional[Dict[str, str]] = None
 
 
@@ -237,7 +238,7 @@ def fetch_models_dev(force_refresh: bool = False) -> Dict[str, Any]:
     except Exception as e:
         logger.debug("Failed to fetch models.dev: %s", e)
 
-    # Fall back to disk cache — use a short TTL (5 min) so we retry
+    # Fall back to disk cache ��� use a short TTL (5 min) so we retry
     # the network fetch soon instead of serving stale data for a full hour.
     if not _models_dev_cache:
         _models_dev_cache = _load_disk_cache()
@@ -362,12 +363,12 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
     Returns None if model not found.
 
     Extracts from model entry fields:
-      - reasoning  (bool)  → supports_reasoning
-      - tool_call  (bool)  → supports_tools
-      - attachment (bool)  → supports_vision
-      - limit.context (int) → context_window
-      - limit.output  (int) → max_output_tokens
-      - family     (str)   → model_family
+      - reasoning  (bool)  ��� supports_reasoning
+      - tool_call  (bool)  ��� supports_tools
+      - attachment (bool)  ��� supports_vision
+      - limit.context (int) ��� context_window
+      - limit.output  (int) ��� max_output_tokens
+      - family     (str)   ��� model_family
     """
     models = _get_provider_models(provider)
     if models is None:
@@ -417,10 +418,16 @@ def list_provider_models(provider: str) -> List[str]:
 
     Returns an empty list if the provider is unknown or has no data.
     """
+    from hermes_cli.models import normalize_provider
+    provider = normalize_provider(provider) or provider
+
     models = _get_provider_models(provider)
     if models is None:
         return []
-    return list(models.keys())
+    return [
+        mid for mid in models.keys()
+        if not _should_hide_from_provider_catalog(provider, mid)
+    ]
 
 
 # Patterns that indicate non-agentic or noise models (TTS, embedding,
@@ -431,6 +438,43 @@ _NOISE_PATTERNS: re.Pattern = re.compile(
     r"-image\b|-image-preview\b|-customtools\b",
     re.IGNORECASE,
 )
+
+# Google's live Gemini catalogs currently include a mix of stale slugs and
+# Gemma models whose TPM quotas are too small for normal Hermes agent traffic.
+# Keep capability metadata available for direct/manual use, but hide these from
+# the Gemini model catalogs we surface in setup and model selection.
+_GOOGLE_HIDDEN_MODELS = frozenset({
+    # Low-TPM Gemma models that trip Google input-token quota walls under
+    # agent-style traffic despite advertising large context windows.
+    "gemma-4-31b-it",
+    "gemma-4-26b-it",
+    "gemma-4-26b-a4b-it",
+    "gemma-3-1b",
+    "gemma-3-1b-it",
+    "gemma-3-2b",
+    "gemma-3-2b-it",
+    "gemma-3-4b",
+    "gemma-3-4b-it",
+    "gemma-3-12b",
+    "gemma-3-12b-it",
+    "gemma-3-27b",
+    "gemma-3-27b-it",
+    # Stale/retired Google slugs that still surface through models.dev-backed
+    # Gemini selection but 404 on the current Google endpoints.
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash-8b",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+})
+
+
+def _should_hide_from_provider_catalog(provider: str, model_id: str) -> bool:
+    provider_lower = (provider or "").strip().lower()
+    model_lower = (model_id or "").strip().lower()
+    if provider_lower in {"gemini", "google"} and model_lower in _GOOGLE_HIDDEN_MODELS:
+        return True
+    return False
 
 
 def list_agentic_models(provider: str) -> List[str]:
@@ -448,6 +492,8 @@ def list_agentic_models(provider: str) -> List[str]:
     for mid, entry in models.items():
         if not isinstance(entry, dict):
             continue
+        if _should_hide_from_provider_catalog(provider, mid):
+            continue
         if not entry.get("tool_call", False):
             continue
         if _NOISE_PATTERNS.search(mid):
@@ -458,7 +504,7 @@ def list_agentic_models(provider: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Rich dataclass constructors — parse raw models.dev JSON into dataclasses
+# Rich dataclass constructors ��� parse raw models.dev JSON into dataclasses
 # ---------------------------------------------------------------------------
 
 def _parse_model_info(model_id: str, raw: Dict[str, Any], provider_id: str) -> ModelInfo:
@@ -536,7 +582,7 @@ def get_provider_info(provider_id: str) -> Optional[ProviderInfo]:
     Accepts either a Hermes provider ID (e.g. "kilocode") or a models.dev
     ID (e.g. "kilo").  Returns None if the provider is not in the catalog.
     """
-    # Resolve Hermes ID → models.dev ID
+    # Resolve Hermes ID ��� models.dev ID
     mdev_id = PROVIDER_TO_MODELS_DEV.get(provider_id, provider_id)
 
     data = fetch_models_dev()
@@ -582,5 +628,3 @@ def get_model_info(
             return _parse_model_info(mid, mdata, mdev_id)
 
     return None
-
-

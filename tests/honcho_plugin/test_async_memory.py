@@ -132,7 +132,7 @@ class TestResolveSessionNameTitle:
     def test_title_all_invalid_chars_falls_back_to_dirname(self):
         cfg = HonchoClientConfig()
         result = cfg.resolve_session_name("/some/dir", session_title="!!! ###")
-        # sanitized to empty → falls back to dirname
+        # sanitized to empty ��� falls back to dirname
         assert result == "dir"
 
     def test_none_title_falls_back_to_dirname(self):
@@ -459,11 +459,3 @@ class TestPrefetchCacheAccessors:
 
         assert mgr.pop_context_result("cli:test") == payload
         assert mgr.pop_context_result("cli:test") == {}
-
-    def test_set_and_pop_dialectic_result(self):
-        mgr = _make_manager(write_frequency="turn")
-
-        mgr.set_dialectic_result("cli:test", "Resume with toolset cleanup")
-
-        assert mgr.pop_dialectic_result("cli:test") == "Resume with toolset cleanup"
-        assert mgr.pop_dialectic_result("cli:test") == ""

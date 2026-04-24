@@ -9,6 +9,7 @@ import copy
 import json
 import logging
 import tempfile
+import threading
 import os
 import re
 import uuid
@@ -34,6 +35,11 @@ except ImportError:
 HERMES_DIR = get_hermes_home().resolve()
 CRON_DIR = HERMES_DIR / "cron"
 JOBS_FILE = CRON_DIR / "jobs.json"
+
+# In-process lock protecting load_jobs���modify���save_jobs cycles.
+# Required when tick() runs jobs in parallel threads ��� without this,
+# concurrent mark_job_run / advance_next_run calls can clobber each other.
+_jobs_file_lock = threading.Lock()
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
@@ -96,20 +102,20 @@ def ensure_dirs():
 def parse_duration(s: str) -> int:
     """
     Parse duration string into minutes.
-    
+
     Examples:
-        "30m" → 30
-        "2h" → 120
-        "1d" → 1440
+        "30m" ��� 30
+        "2h" ��� 120
+        "1d" ��� 1440
     """
     s = s.strip().lower()
     match = re.match(r'^(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$', s)
     if not match:
         raise ValueError(f"Invalid duration: '{s}'. Use format like '30m', '2h', or '1d'")
-    
+
     value = int(match.group(1))
     unit = match.group(2)[0]  # First char: m, h, or d
-    
+
     multipliers = {'m': 1, 'h': 60, 'd': 1440}
     return value * multipliers[unit]
 
@@ -117,26 +123,26 @@ def parse_duration(s: str) -> int:
 def parse_schedule(schedule: str) -> Dict[str, Any]:
     """
     Parse schedule string into structured format.
-    
+
     Returns dict with:
         - kind: "once" | "interval" | "cron"
         - For "once": "run_at" (ISO timestamp)
         - For "interval": "minutes" (int)
         - For "cron": "expr" (cron expression)
-    
+
     Examples:
-        "30m"              → once in 30 minutes
-        "2h"               → once in 2 hours
-        "every 30m"        → recurring every 30 minutes
-        "every 2h"         → recurring every 2 hours
-        "0 9 * * *"        → cron expression
-        "2026-02-03T14:00" → once at timestamp
+        "30m"              ��� once in 30 minutes
+        "2h"               ��� once in 2 hours
+        "every 30m"        ��� recurring every 30 minutes
+        "every 2h"         ��� recurring every 2 hours
+        "0 9 * * *"        ��� cron expression
+        "2026-02-03T14:00" ��� once at timestamp
     """
     schedule = schedule.strip()
     original = schedule
     schedule_lower = schedule.lower()
-    
-    # "every X" pattern → recurring interval
+
+    # "every X" pattern ��� recurring interval
     if schedule_lower.startswith("every "):
         duration_str = schedule[6:].strip()
         minutes = parse_duration(duration_str)
@@ -145,7 +151,7 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
             "minutes": minutes,
             "display": f"every {minutes}m"
         }
-    
+
     # Check for cron expression (5 or 6 space-separated fields)
     # Cron fields: minute hour day month weekday [year]
     parts = schedule.split()
@@ -164,7 +170,7 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
             "expr": schedule,
             "display": schedule
         }
-    
+
     # ISO timestamp (contains T or looks like date)
     if 'T' in schedule or re.match(r'^\d{4}-\d{2}-\d{2}', schedule):
         try:
@@ -181,8 +187,8 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
             }
         except ValueError as e:
             raise ValueError(f"Invalid timestamp '{schedule}': {e}")
-    
-    # Duration like "30m", "2h", "1d" → one-shot from now
+
+    # Duration like "30m", "2h", "1d" ��� one-shot from now
     try:
         minutes = parse_duration(schedule)
         run_at = _hermes_now() + timedelta(minutes=minutes)
@@ -193,7 +199,7 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
         }
     except ValueError:
         pass
-    
+
     raise ValueError(
         f"Invalid schedule '{original}'. Use:\n"
         f"  - Duration: '30m', '2h', '1d' (one-shot)\n"
@@ -322,7 +328,7 @@ def load_jobs() -> List[Dict[str, Any]]:
     ensure_dirs()
     if not JOBS_FILE.exists():
         return []
-    
+
     try:
         with open(JOBS_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -378,6 +384,7 @@ def create_job(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     script: Optional[str] = None,
+    enabled_toolsets: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -397,6 +404,9 @@ def create_job(
         script: Optional path to a Python script whose stdout is injected into the
                 prompt each run.  The script runs before the agent turn, and its output
                 is prepended as context.  Useful for data collection / change detection.
+        enabled_toolsets: Optional list of toolset names to restrict the agent to.
+                          When set, only tools from these toolsets are loaded, reducing
+                          token overhead. When omitted, all default tools are loaded.
 
     Returns:
         The created job dict
@@ -427,6 +437,8 @@ def create_job(
     normalized_base_url = normalized_base_url or None
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
+    normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
+    normalized_toolsets = normalized_toolsets or None
 
     label_source = (prompt or (normalized_skills[0] if normalized_skills else None)) or "cron job"
     job = {
@@ -458,6 +470,7 @@ def create_job(
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
+        "enabled_toolsets": normalized_toolsets,
     }
 
     jobs = load_jobs()
@@ -587,50 +600,51 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                  delivery_error: Optional[str] = None):
     """
     Mark a job as having been run.
-    
+
     Updates last_run_at, last_status, increments completed count,
     computes next_run_at, and auto-deletes if repeat limit reached.
 
-    ``delivery_error`` is tracked separately from the agent error — a job
+    ``delivery_error`` is tracked separately from the agent error ��� a job
     can succeed (agent produced output) but fail delivery (platform down).
     """
-    jobs = load_jobs()
-    for i, job in enumerate(jobs):
-        if job["id"] == job_id:
-            now = _hermes_now().isoformat()
-            job["last_run_at"] = now
-            job["last_status"] = "ok" if success else "error"
-            job["last_error"] = error if not success else None
-            # Track delivery failures separately — cleared on successful delivery
-            job["last_delivery_error"] = delivery_error
-            
-            # Increment completed count
-            if job.get("repeat"):
-                job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
-                
-                # Check if we've hit the repeat limit
-                times = job["repeat"].get("times")
-                completed = job["repeat"]["completed"]
-                if times is not None and times > 0 and completed >= times:
-                    # Remove the job (limit reached)
-                    jobs.pop(i)
-                    save_jobs(jobs)
-                    return
-            
-            # Compute next run
-            job["next_run_at"] = compute_next_run(job["schedule"], now)
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job["id"] == job_id:
+                now = _hermes_now().isoformat()
+                job["last_run_at"] = now
+                job["last_status"] = "ok" if success else "error"
+                job["last_error"] = error if not success else None
+                # Track delivery failures separately ��� cleared on successful delivery
+                job["last_delivery_error"] = delivery_error
 
-            # If no next run (one-shot completed), disable
-            if job["next_run_at"] is None:
-                job["enabled"] = False
-                job["state"] = "completed"
-            elif job.get("state") != "paused":
-                job["state"] = "scheduled"
+                # Increment completed count
+                if job.get("repeat"):
+                    job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
 
-            save_jobs(jobs)
-            return
+                    # Check if we've hit the repeat limit
+                    times = job["repeat"].get("times")
+                    completed = job["repeat"]["completed"]
+                    if times is not None and times > 0 and completed >= times:
+                        # Remove the job (limit reached)
+                        jobs.pop(i)
+                        save_jobs(jobs)
+                        return
 
-    logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+                # Compute next run
+                job["next_run_at"] = compute_next_run(job["schedule"], now)
+
+                # If no next run (one-shot completed), disable
+                if job["next_run_at"] is None:
+                    job["enabled"] = False
+                    job["state"] = "completed"
+                elif job.get("state") != "paused":
+                    job["state"] = "scheduled"
+
+                save_jobs(jobs)
+                return
+
+        logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
 
 
 def advance_next_run(job_id: str) -> bool:
@@ -638,27 +652,28 @@ def advance_next_run(job_id: str) -> bool:
 
     Call this BEFORE run_job() so that if the process crashes mid-execution,
     the job won't re-fire on the next gateway restart.  This converts the
-    scheduler from at-least-once to at-most-once for recurring jobs — missing
+    scheduler from at-least-once to at-most-once for recurring jobs ��� missing
     one run is far better than firing dozens of times in a crash loop.
 
     One-shot jobs are left unchanged so they can still retry on restart.
 
     Returns True if next_run_at was advanced, False otherwise.
     """
-    jobs = load_jobs()
-    for job in jobs:
-        if job["id"] == job_id:
-            kind = job.get("schedule", {}).get("kind")
-            if kind not in ("cron", "interval"):
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] == job_id:
+                kind = job.get("schedule", {}).get("kind")
+                if kind not in ("cron", "interval"):
+                    return False
+                now = _hermes_now().isoformat()
+                new_next = compute_next_run(job["schedule"], now)
+                if new_next and new_next != job.get("next_run_at"):
+                    job["next_run_at"] = new_next
+                    save_jobs(jobs)
+                    return True
                 return False
-            now = _hermes_now().isoformat()
-            new_next = compute_next_run(job["schedule"], now)
-            if new_next and new_next != job.get("next_run_at"):
-                job["next_run_at"] = new_next
-                save_jobs(jobs)
-                return True
-            return False
-    return False
+        return False
 
 
 def get_due_jobs() -> List[Dict[str, Any]]:
@@ -712,7 +727,7 @@ def get_due_jobs() -> List[Dict[str, Any]]:
             # the next future occurrence instead of firing a stale run.
             grace = _compute_grace_seconds(schedule)
             if kind in ("cron", "interval") and (now - next_run_dt).total_seconds() > grace:
-                # Job is past its catch-up grace window — this is a stale missed run.
+                # Job is past its catch-up grace window ��� this is a stale missed run.
                 # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
                 new_next = compute_next_run(schedule, now.isoformat())
                 if new_next:
@@ -746,10 +761,10 @@ def save_job_output(job_id: str, output: str):
     job_output_dir = OUTPUT_DIR / job_id
     job_output_dir.mkdir(parents=True, exist_ok=True)
     _secure_dir(job_output_dir)
-    
+
     timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
     output_file = job_output_dir / f"{timestamp}.md"
-    
+
     fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -764,5 +779,5 @@ def save_job_output(job_id: str, output: str):
         except OSError:
             pass
         raise
-    
+
     return output_file
