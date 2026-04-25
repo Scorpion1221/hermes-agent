@@ -10,7 +10,7 @@ other Feishu inbound helpers without pulling in the full adapter.
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 FALLBACK_POST_TEXT = "[Rich text message]"
 FALLBACK_FORWARD_TEXT = "[Merged forward message]"
@@ -56,6 +56,12 @@ _SKIP_TEXT_KEYS = {
     "token",
     "template",
     "locale",
+    # CardKit json_card noise
+    "id",
+    "element_id",
+    "textAlign",
+    "textColor",
+    "textSize",
 }
 
 
@@ -454,6 +460,24 @@ def _normalize_share_chat_message(payload: dict[str, Any]) -> FeishuNormalizedMe
 
 
 def _normalize_interactive_message(message_type: str, payload: dict[str, Any]) -> FeishuNormalizedMessage:
+    # CardKit-hydrated cards come back as {"json_card": "<escaped JSON>"}; unwrap
+    # so the walkers below see the actual body/header/elements tree.
+    json_card = payload.get("json_card") if isinstance(payload, dict) else None
+    if isinstance(json_card, str) and json_card:
+        try:
+            parsed = json.loads(json_card)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            rendered = render_cardkit_body(parsed)
+            if rendered:
+                return FeishuNormalizedMessage(
+                    raw_type=message_type,
+                    text_content=rendered,
+                    relation_kind="interactive",
+                    metadata={"format": "cardkit_json_card"},
+                )
+            payload = parsed
     card_payload = payload.get("card") if isinstance(payload.get("card"), dict) else payload
     title = _first_non_empty_text(
         _find_header_title(card_payload),
@@ -480,6 +504,361 @@ def _normalize_interactive_message(message_type: str, payload: dict[str, Any]) -
         relation_kind="interactive",
         metadata={"title": title, "actions": actions},
     )
+
+
+# ---------------------------------------------------------------------------
+# CardKit json_card renderer
+#
+# When a CardKit card is fetched via im.v1.message.get with
+# card_msg_content_type=raw_card_content, Feishu serializes the rendered
+# element tree as {"json_card": "<escaped JSON>"}. The tree mirrors the
+# Markdown + Feishu rich-text extensions spec documented here:
+#   https://open.feishu.cn/document/feishu-cards/card-json-v2-structure
+#   https://open.feishu.cn/document/uAjLw4CM/ukzMukzMukzM/feishu-cards/
+#     card-json-v2-components/content-components/rich-text
+# This renderer walks that tree and emits Markdown. Tag handlers are
+# registered in dispatch tables (_CARDKIT_{BLOCK,INLINE}_RENDERERS); adding a
+# new tag = one entry + one small function, no control-flow surgery.
+# ---------------------------------------------------------------------------
+
+_CARDKIT_MAX_RENDER_CHARS = 4000
+_CARDKIT_BLOCK_RENDERERS: dict[str, Any] = {}
+_CARDKIT_INLINE_RENDERERS: dict[str, Any] = {}
+
+
+def render_cardkit_body(node: Any) -> str:
+    if not isinstance(node, dict):
+        return ""
+    body = node.get("body") if isinstance(node.get("body"), dict) else node
+    elements = (body.get("property") or {}).get("elements") if isinstance(body, dict) else None
+    if not isinstance(elements, list):
+        return ""
+    blocks = _cardkit_render_blocks(elements)
+    text = "\n\n".join(b for b in blocks if b).strip()
+    if len(text) > _CARDKIT_MAX_RENDER_CHARS:
+        text = text[:_CARDKIT_MAX_RENDER_CHARS].rstrip() + "…"
+    return text
+
+
+def _cardkit_render_blocks(elements: list[Any]) -> list[str]:
+    blocks: list[str] = []
+    inline_buffer: list[str] = []
+
+    def flush() -> None:
+        if not inline_buffer:
+            return
+        joined = "".join(inline_buffer).strip()
+        if joined:
+            blocks.append(joined)
+        inline_buffer.clear()
+
+    for el in elements or []:
+        if not isinstance(el, dict):
+            continue
+        tag = str(el.get("tag", "")).strip().lower()
+        if tag in _CARDKIT_INLINE_RENDERERS:
+            inline_buffer.append(_CARDKIT_INLINE_RENDERERS[tag](el))
+            continue
+        if tag in _CARDKIT_BLOCK_RENDERERS:
+            flush()
+            rendered = _CARDKIT_BLOCK_RENDERERS[tag](el)
+            if rendered:
+                blocks.append(rendered)
+            continue
+        # Unknown or pure container (markdown/paragraph): children decide level.
+        children = _cardkit_children(el)
+        if isinstance(children, list):
+            if _cardkit_children_have_blocks(children):
+                nested = _cardkit_render_blocks(children)
+                if nested:
+                    flush()
+                    blocks.extend(nested)
+            else:
+                inline_buffer.append("".join(_cardkit_render_inline(c) for c in children))
+    flush()
+    return [b for b in blocks if b]
+
+
+def _cardkit_render_inline(el: Any) -> str:
+    if isinstance(el, str):
+        return el
+    if not isinstance(el, dict):
+        return ""
+    tag = str(el.get("tag", "")).strip().lower()
+    if tag in _CARDKIT_INLINE_RENDERERS:
+        return _CARDKIT_INLINE_RENDERERS[tag](el)
+    # Block tags in an inline context: collapse their output to a flat string.
+    if tag in _CARDKIT_BLOCK_RENDERERS:
+        rendered = _CARDKIT_BLOCK_RENDERERS[tag](el)
+        return rendered.replace("\n", " ")
+    children = _cardkit_children(el)
+    if isinstance(children, list):
+        return "".join(_cardkit_render_inline(c) for c in children)
+    prop = el.get("property") if isinstance(el.get("property"), dict) else {}
+    return str(prop.get("content", "") or "")
+
+
+def _cardkit_children(el: Any) -> Optional[list[Any]]:
+    if not isinstance(el, dict):
+        return None
+    prop = el.get("property")
+    if not isinstance(prop, dict):
+        return None
+    children = prop.get("elements")
+    return children if isinstance(children, list) else None
+
+
+def _cardkit_children_have_blocks(children: list[Any]) -> bool:
+    for c in children:
+        if not isinstance(c, dict):
+            continue
+        t = str(c.get("tag", "")).strip().lower()
+        if t in _CARDKIT_BLOCK_RENDERERS:
+            return True
+        if t not in _CARDKIT_INLINE_RENDERERS:
+            sub = _cardkit_children(c)
+            if isinstance(sub, list) and _cardkit_children_have_blocks(sub):
+                return True
+    return False
+
+
+# --- inline renderers ------------------------------------------------------
+
+def _cardkit_prop(el: Any) -> dict[str, Any]:
+    prop = el.get("property") if isinstance(el, dict) else None
+    return prop if isinstance(prop, dict) else {}
+
+
+def _cardkit_inline_plain_text(el: Any) -> str:
+    prop = _cardkit_prop(el)
+    text = str(prop.get("content", "") or "")
+    if not text:
+        return ""
+    style = prop.get("textStyle") if isinstance(prop.get("textStyle"), dict) else {}
+    attrs = style.get("attributes") if isinstance(style.get("attributes"), list) else []
+    if text.strip():
+        if "bold" in attrs:
+            text = f"**{text}**"
+        if "italic" in attrs:
+            text = f"*{text}*"
+        if "strikethrough" in attrs:
+            text = f"~~{text}~~"
+    return text
+
+
+def _cardkit_inline_code_span(el: Any) -> str:
+    return f"`{_cardkit_prop(el).get('content', '') or ''}`"
+
+
+def _cardkit_inline_br(_el: Any) -> str:
+    return "\n"
+
+
+def _cardkit_inline_link(el: Any) -> str:
+    prop = _cardkit_prop(el)
+    text = str(prop.get("content", "") or prop.get("text", "") or "")
+    if not text:
+        # Nested inline children can also form the visible text.
+        children = _cardkit_children(el)
+        if isinstance(children, list):
+            text = "".join(_cardkit_render_inline(c) for c in children)
+    href = str(prop.get("href", "") or prop.get("url", "") or "")
+    if href and text:
+        return f"[{text}]({href})"
+    return text or href
+
+
+def _cardkit_inline_at(el: Any) -> str:
+    prop = _cardkit_prop(el)
+    name = str(prop.get("name", "") or prop.get("user_name", "") or prop.get("content", "") or "").strip()
+    uid = str(
+        prop.get("id", "") or prop.get("user_id", "") or prop.get("open_id", "") or prop.get("union_id", "") or ""
+    ).strip()
+    if uid == "all" or str(el.get("id", "")).strip().lower() == "all":
+        return "@全体成员"
+    if name:
+        return f"@{name}"
+    if uid:
+        return f"@{uid}"
+    return "@"
+
+
+def _cardkit_inline_text_tag(el: Any) -> str:
+    prop = _cardkit_prop(el)
+    text = prop.get("text") if isinstance(prop.get("text"), dict) else None
+    if text:
+        content = str(text.get("content", "") or "")
+    else:
+        content = str(prop.get("content", "") or "")
+    return f"[{content}]" if content else ""
+
+
+def _cardkit_inline_number_tag(el: Any) -> str:
+    prop = _cardkit_prop(el)
+    value = str(prop.get("content", "") or prop.get("text", "") or prop.get("value", "") or "").strip()
+    return f"({value})" if value else ""
+
+
+def _cardkit_inline_font(el: Any) -> str:
+    # <font color="red">text</font> — color is semantic noise in LLM context;
+    # surface the text verbatim.
+    children = _cardkit_children(el)
+    if isinstance(children, list):
+        return "".join(_cardkit_render_inline(c) for c in children)
+    return str(_cardkit_prop(el).get("content", "") or "")
+
+
+def _cardkit_inline_local_datetime(el: Any) -> str:
+    prop = _cardkit_prop(el)
+    return str(prop.get("content", "") or prop.get("timestamp", "") or "")
+
+
+def _cardkit_inline_audio(el: Any) -> str:
+    prop = _cardkit_prop(el)
+    name = str(prop.get("file_name", "") or prop.get("name", "") or "audio").strip()
+    return f"[Audio: {name}]"
+
+
+def _cardkit_inline_person(el: Any) -> str:
+    prop = _cardkit_prop(el)
+    name = str(prop.get("user_name", "") or prop.get("name", "") or prop.get("content", "") or "").strip()
+    return f"@{name}" if name else "@"
+
+
+def _cardkit_inline_image(el: Any) -> str:
+    prop = _cardkit_prop(el)
+    alt = str(prop.get("alt", "") or prop.get("hover_text", "") or prop.get("name", "") or "image").strip()
+    img_key = str(prop.get("img_key", "") or prop.get("image_key", "") or "").strip()
+    return f"![{alt}]({img_key})" if img_key else f"[{alt}]"
+
+
+# --- block renderers -------------------------------------------------------
+
+def _cardkit_block_heading(el: Any) -> str:
+    prop = _cardkit_prop(el)
+    try:
+        level = int(prop.get("level") or 1)
+    except (TypeError, ValueError):
+        level = 1
+    level = max(1, min(level, 6))
+    children = _cardkit_children(el) or []
+    inner = "".join(_cardkit_render_inline(c) for c in children).strip()
+    return ("#" * level) + " " + inner if inner else ""
+
+
+def _cardkit_block_code_block(el: Any) -> str:
+    prop = _cardkit_prop(el)
+    lang_raw = str(prop.get("language", "") or "").strip()
+    lang = "" if lang_raw.lower() in {"", "plain_text", "plaintext"} else lang_raw
+    rows = prop.get("contents") if isinstance(prop.get("contents"), list) else []
+    lines: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_contents = row.get("contents") if isinstance(row.get("contents"), list) else []
+        line = "".join(
+            str(c.get("content", "") or "") for c in row_contents if isinstance(c, dict)
+        )
+        lines.append(line)
+    body = "\n".join(lines)
+    fence = f"```{lang}" if lang else "```"
+    return f"{fence}\n{body}\n```"
+
+
+def _cardkit_block_table(el: Any) -> str:
+    prop = _cardkit_prop(el)
+    columns = prop.get("columns") if isinstance(prop.get("columns"), list) else []
+    rows = prop.get("rows") if isinstance(prop.get("rows"), list) else []
+    if not columns:
+        return ""
+    headers: list[str] = []
+    col_keys: list[str] = []
+    for idx, col in enumerate(columns):
+        if not isinstance(col, dict):
+            headers.append("")
+            col_keys.append(str(idx))
+            continue
+        headers.append(str(col.get("displayName") or col.get("name") or "").strip())
+        col_keys.append(str(col.get("name") or idx))
+    md = ["| " + " | ".join(headers) + " |", "| " + " | ".join("---" for _ in columns) + " |"]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cells: list[str] = []
+        for key in col_keys:
+            cell = row.get(key)
+            text = ""
+            if isinstance(cell, dict):
+                data = cell.get("data") if isinstance(cell.get("data"), dict) else None
+                if data is not None:
+                    text = _cardkit_render_inline(data)
+            cells.append(text.replace("|", "\\|").replace("\n", " ").strip())
+        md.append("| " + " | ".join(cells) + " |")
+    return "\n".join(md)
+
+
+def _cardkit_block_list_factory(ordered: bool):
+    def render(el: Any) -> str:
+        children = _cardkit_children(el) or []
+        items: list[str] = []
+        for idx, c in enumerate(children, 1):
+            if not isinstance(c, dict):
+                continue
+            sub = _cardkit_children(c)
+            if isinstance(sub, list):
+                text = "".join(_cardkit_render_inline(x) for x in sub).strip()
+            else:
+                text = _cardkit_render_inline(c).strip()
+            if text:
+                prefix = f"{idx}. " if ordered else "- "
+                items.append(prefix + text)
+        return "\n".join(items)
+    return render
+
+
+def _cardkit_block_blockquote(el: Any) -> str:
+    children = _cardkit_children(el) or []
+    if _cardkit_children_have_blocks(children):
+        inner = "\n\n".join(_cardkit_render_blocks(children))
+    else:
+        inner = "".join(_cardkit_render_inline(c) for c in children)
+    inner = inner.strip()
+    if not inner:
+        return ""
+    return "\n".join(f"> {line}" if line else ">" for line in inner.split("\n"))
+
+
+def _cardkit_block_hr(_el: Any) -> str:
+    return "---"
+
+
+_CARDKIT_INLINE_RENDERERS.update({
+    "plain_text": _cardkit_inline_plain_text,
+    "code_span": _cardkit_inline_code_span,
+    "br": _cardkit_inline_br,
+    "a": _cardkit_inline_link,
+    "link": _cardkit_inline_link,
+    "at": _cardkit_inline_at,
+    "mention": _cardkit_inline_at,
+    "text_tag": _cardkit_inline_text_tag,
+    "number_tag": _cardkit_inline_number_tag,
+    "font": _cardkit_inline_font,
+    "local_datetime": _cardkit_inline_local_datetime,
+    "audio": _cardkit_inline_audio,
+    "person": _cardkit_inline_person,
+    "image": _cardkit_inline_image,
+})
+
+_CARDKIT_BLOCK_RENDERERS.update({
+    "heading": _cardkit_block_heading,
+    "code_block": _cardkit_block_code_block,
+    "table": _cardkit_block_table,
+    "list": _cardkit_block_list_factory(ordered=False),
+    "bullet_list": _cardkit_block_list_factory(ordered=False),
+    "ordered_list": _cardkit_block_list_factory(ordered=True),
+    "blockquote": _cardkit_block_blockquote,
+    "hr": _cardkit_block_hr,
+})
 
 
 def _collect_forward_entries(payload: dict[str, Any]) -> list[str]:
