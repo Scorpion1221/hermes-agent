@@ -2717,11 +2717,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
-        user_name = (
-            self._get_cached_sender_name(open_id)
-            or coerce_feishu_sender_display_name(sender_id=open_id)
-            or "Unknown user"
-        )
+        user_name = self._resolve_card_action_user_name(open_id, loop)
 
         self._submit_on_loop(loop, self._resolve_approval(approval_id, choice, user_name))
 
@@ -2734,6 +2730,33 @@ class FeishuAdapter(BasePlatformAdapter):
             card.data = self._build_resolved_approval_card(choice=choice, user_name=user_name)
             response.card = card
         return response
+
+    def _resolve_card_action_user_name(self, open_id: str, loop: Any) -> str:
+        """Best-effort name resolution for a card-action operator.
+
+        Card-action callbacks fire on a worker thread (lark_oapi dispatcher),
+        not the asyncio loop. The cache hits whenever the user has DM'd the
+        bot recently; on miss we briefly block on the contact API so the
+        rendered "Approved by …" card actually shows a name. The 2s cap keeps
+        the click responsive even if Feishu contact lookup hangs.
+        """
+        cached = self._get_cached_sender_name(open_id)
+        if cached:
+            return cached
+        if open_id and self._loop_accepts_callbacks(loop):
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._resolve_sender_name_from_api(open_id), loop
+                )
+                resolved = future.result(timeout=2.0)
+            except Exception:
+                logger.info(
+                    "[Feishu] Card action name lookup failed for %s", open_id, exc_info=True
+                )
+                resolved = None
+            if resolved:
+                return resolved
+        return coerce_feishu_sender_display_name(sender_id=open_id) or "Unknown user"
 
     async def _resolve_approval(self, approval_id: Any, choice: str, user_name: str) -> None:
         """Pop approval state and unblock the waiting agent thread."""

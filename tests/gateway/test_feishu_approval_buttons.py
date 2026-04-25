@@ -444,3 +444,30 @@ class TestCardActionCallbackResponse:
         assert "Old Name" not in card["elements"][0]["content"]
         assert "Unknown user" in card["elements"][0]["content"]
         assert "ou_expired" not in card["elements"][0]["content"]
+
+    def test_resolves_uncached_name_via_contact_api(self, _patch_callback_card_types):
+        """Cache miss should fall back to a synchronous contact lookup so the
+        rendered card shows the real display name, not 'Unknown user'."""
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        data = _make_card_action_data(
+            {"hermes_action": "approve_session", "approval_id": 5},
+            open_id="ou_fresh",
+        )
+
+        def fake_run(coro, _loop):
+            coro.close()
+            fut = SimpleNamespace(
+                result=lambda timeout=None: "Charlie",
+                add_done_callback=lambda *_a, **_k: None,
+            )
+            return fut
+
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run):
+            response = adapter._on_card_action_trigger(data)
+
+        card = response.card.data
+        assert "Charlie" in card["elements"][0]["content"]
+        assert "Unknown user" not in card["elements"][0]["content"]
+
