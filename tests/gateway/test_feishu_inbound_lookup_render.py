@@ -396,6 +396,7 @@ def test_render_quoted_context_block_includes_history_truncation_image_analysis_
             "message_id: om_quote",
             "sender: Alice",
             f"summary: {'x' * 200}",
+            "",
             "image_analysis:",
             "detected screenshot with annotations",
             "media_count: 2",
