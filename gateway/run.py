@@ -4029,11 +4029,6 @@ class GatewayRunner:
                 found_in_history=found_in_history,
                 image_analysis=quoted_image_analysis,
             )
-            if quoted_block:
-                logger.info(
-                    "[Feishu] Quoted block rendered: len=%d has_ancestor=%s",
-                    len(quoted_block), "[Ancestor quote" in quoted_block,
-                )
             if not quoted_block:
                 reply_snippet = quoted_text[:200] if found_in_history else quoted_text[:500]
                 quoted_block = f'[Replying to: "{reply_snippet}"]'
