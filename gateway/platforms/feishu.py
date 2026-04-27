@@ -290,7 +290,13 @@ _APPROVAL_LABEL_MAP: Dict[str, str] = {
     "deny": "Denied",
 }
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
-_FEISHU_QUOTE_CHAIN_MAX_DEPTH = 3                 # Max parent hops when walking reply chains
+# Max parent hops when walking reply chains. Capped (not unlimited) to bound
+# API calls + prompt growth on pathologically deep threads; cache makes the
+# typical per-turn cost << 20 anyway. Override via the env var when needed.
+_FEISHU_QUOTE_CHAIN_MAX_DEPTH = max(
+    1,
+    int(os.environ.get("HERMES_FEISHU_QUOTE_CHAIN_MAX_DEPTH", "20") or 20),
+)
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
 
 # Feishu reactions render as prominent badges, unlike Discord/Telegram's
@@ -4246,6 +4252,15 @@ class FeishuAdapter(BasePlatformAdapter):
             )
             if parent_ctx is not None:
                 quoted_context = dataclasses.replace(quoted_context, parent=parent_ctx)
+            chain_len = 0
+            _walker = quoted_context
+            while _walker is not None:
+                chain_len += 1
+                _walker = getattr(_walker, "parent", None)
+            logger.info(
+                "[Feishu] Quoted chain for %s: depth=%d chain_len=%d has_parent=%s",
+                message_id, _depth, chain_len, parent_ctx is not None,
+            )
             self._quoted_context_cache[message_id] = quoted_context
             self._message_text_cache[message_id] = quoted_context.display_text or None
             return quoted_context
