@@ -46,6 +46,10 @@ class FeishuQuotedContext:
     media_types: tuple[str, ...] = ()
     stable_ref: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Direct reply parent (the message this one itself quoted). Lets the
+    # renderer walk the full quote chain without needing a separate lookup
+    # on the consumer side.
+    parent: Optional["FeishuQuotedContext"] = None
 
     @property
     def display_text(self) -> str:

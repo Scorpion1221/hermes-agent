@@ -61,6 +61,7 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
+import dataclasses
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -289,6 +290,7 @@ _APPROVAL_LABEL_MAP: Dict[str, str] = {
     "deny": "Denied",
 }
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
+_FEISHU_QUOTE_CHAIN_MAX_DEPTH = 3                 # Max parent hops when walking reply chains
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
 
 # Feishu reactions render as prominent badges, unlike Discord/Telegram's
@@ -4206,7 +4208,9 @@ class FeishuAdapter(BasePlatformAdapter):
 
         return media_urls, media_types
 
-    async def _fetch_quoted_context(self, message_id: str) -> Optional[FeishuQuotedContext]:
+    async def _fetch_quoted_context(
+        self, message_id: str, *, _depth: int = 0
+    ) -> Optional[FeishuQuotedContext]:
         if not self._client or not message_id:
             return None
         cached = self._quoted_context_cache.get(message_id)
@@ -4235,12 +4239,44 @@ class FeishuAdapter(BasePlatformAdapter):
                 resolve_sender_name=self._resolve_sender_name_from_api,
                 resolve_sender_name_sync=self._get_cached_sender_name,
             )
+            parent_ctx = await self._fetch_parent_quoted_context(
+                primary_item=primary_item,
+                current_message_id=message_id,
+                depth=_depth,
+            )
+            if parent_ctx is not None:
+                quoted_context = dataclasses.replace(quoted_context, parent=parent_ctx)
             self._quoted_context_cache[message_id] = quoted_context
             self._message_text_cache[message_id] = quoted_context.display_text or None
             return quoted_context
         except Exception:
             logger.warning("[Feishu] Failed to build quoted context for %s", message_id, exc_info=True)
             return None
+
+    async def _fetch_parent_quoted_context(
+        self,
+        *,
+        primary_item: Any,
+        current_message_id: str,
+        depth: int,
+    ) -> Optional[FeishuQuotedContext]:
+        """Walk one step up the reply chain, bounded by _FEISHU_QUOTE_CHAIN_MAX_DEPTH.
+
+        Each Feishu message item carries parent_id (the message it directly
+        replied to). Chasing it recursively gives the LLM the full quote chain
+        when the user replies to a bot reply that itself quoted an earlier
+        message; _quoted_context_cache absorbs repeat fetches cheaply.
+        """
+        if depth + 1 >= _FEISHU_QUOTE_CHAIN_MAX_DEPTH:
+            return None
+        parent_id = ""
+        if isinstance(primary_item, dict):
+            parent_id = str(primary_item.get("parent_id", "") or "").strip()
+        else:
+            parent_id = str(getattr(primary_item, "parent_id", "") or "").strip()
+        if not parent_id or parent_id == current_message_id:
+            return None
+        return await self._fetch_quoted_context(parent_id, _depth=depth + 1)
 
     async def _fetch_reply_context(self, message_id: str) -> tuple[Optional[str], List[str], List[str]]:
         quoted_context = await self._fetch_quoted_context(message_id)
