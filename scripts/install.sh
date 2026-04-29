@@ -722,6 +722,23 @@ clone_repo() {
             log_info "Existing installation found, updating..."
             cd "$INSTALL_DIR"
 
+            # Migrate origin if it still points to the old upstream
+            local current_origin
+            current_origin="$(git remote get-url origin 2>/dev/null || true)"
+            if [ -n "$current_origin" ] && echo "$current_origin" | grep -qi "NousResearch/hermes-agent"; then
+                log_info "Migrating origin from NousResearch → Scorpion1221 fork..."
+                if echo "$current_origin" | grep -q "^git@"; then
+                    git remote set-url origin "$REPO_URL_SSH"
+                else
+                    git remote set-url origin "$REPO_URL_HTTPS"
+                fi
+                if ! git remote get-url upstream &>/dev/null; then
+                    git remote add upstream "$current_origin"
+                    log_success "Old origin preserved as 'upstream' remote"
+                fi
+                log_success "Origin updated to $(git remote get-url origin)"
+            fi
+
             local autostash_ref=""
             if [ -n "$(git status --porcelain)" ]; then
                 local stash_name
