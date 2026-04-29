@@ -40,7 +40,7 @@ class TestCardKitRichTableHeading:
         assert "**完整原始结构**" in self.rendered
 
     def test_heading_is_standalone_block(self):
-        assert "\n### 观察分析\n" in self.rendered
+        assert "\n##### 观察分析\n" in self.rendered
 
     def test_code_block_fenced(self):
         assert "```\ntype: interactive" in self.rendered
@@ -79,9 +79,9 @@ class TestCardKitBlockquoteTable:
                 assert line.startswith("> "), f"terminal call not in blockquote: {line!r}"
 
     def test_heading_lines(self):
-        assert "### 🚀 SUP-65 已上线" in self.rendered
-        assert "### 🔄 接下来 CEO 会做什么" in self.rendered.split("\n", 200)[-1] or any(
-            "### 🔄" in l for l in self.rendered.splitlines()
+        assert "##### 🚀 SUP-65 已上线" in self.rendered
+        assert "##### 🔄 接下来 CEO 会做什么" in self.rendered.split("\n", 200)[-1] or any(
+            "##### 🔄" in l for l in self.rendered.splitlines()
         )
 
     def test_table_rows_rendered(self):
