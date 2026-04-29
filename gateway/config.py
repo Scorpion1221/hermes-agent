@@ -1123,9 +1123,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         feishu_verification_token = os.getenv("FEISHU_VERIFICATION_TOKEN", "")
         if feishu_verification_token:
             config.platforms[Platform.FEISHU].extra["verification_token"] = feishu_verification_token
-        feishu_streaming_transport = os.getenv("FEISHU_STREAMING_TRANSPORT", "")
-        if feishu_streaming_transport:
-            config.platforms[Platform.FEISHU].extra["streaming_transport"] = feishu_streaming_transport
+        feishu_streaming_transport = os.getenv("FEISHU_STREAMING_TRANSPORT", "cardkit")
+        config.platforms[Platform.FEISHU].extra["streaming_transport"] = feishu_streaming_transport
         feishu_home = os.getenv("FEISHU_HOME_CHANNEL")
         if feishu_home:
             config.platforms[Platform.FEISHU].home_channel = HomeChannel(
