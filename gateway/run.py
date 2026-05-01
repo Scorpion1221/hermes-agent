@@ -10918,6 +10918,15 @@ class GatewayRunner:
                 while True:
                     try:
                         raw = progress_queue.get_nowait()
+                        if isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
+                            # Internal control signal — not displayable content.
+                            # Signal a segment break so the card starts a fresh
+                            # section after tool progress, but do NOT render the
+                            # tuple itself into the card body.
+                            _sc = stream_consumer_holder[0]
+                            if _sc is not None:
+                                _sc.on_segment_break()
+                            continue
                         if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                             _, base_msg, count = raw
                             msg = f"{base_msg} (×{count + 1})"
