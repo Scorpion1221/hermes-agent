@@ -4874,6 +4874,9 @@ OFFICIAL_REPO_URLS = {
 }
 OFFICIAL_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
 SKIP_UPSTREAM_PROMPT_FILE = ".skip_upstream_prompt"
+FORK_INSTALL_URL = "https://raw.githubusercontent.com/Scorpion1221/hermes-agent/develop/scripts/install.sh"
+OFFICIAL_STABLE_BRANCH = "main"
+FORK_STABLE_BRANCH = "develop"
 
 
 def _get_origin_url(git_cmd: list[str], cwd: Path) -> Optional[str]:
@@ -4921,6 +4924,41 @@ def _has_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
         return result.returncode == 0
     except Exception:
         return False
+
+
+def _remote_branch_exists(git_cmd: list[str], cwd: Path, branch: str) -> bool:
+    """Return True when origin/<branch> exists."""
+    try:
+        result = subprocess.run(
+            git_cmd + ["rev-parse", "--verify", f"origin/{branch}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _select_update_branch(git_cmd: list[str], cwd: Path, current_branch: str, is_fork: bool) -> str:
+    """Choose the branch hermes update should track.
+
+    Policy:
+    - Prefer the current branch when origin/<current_branch> exists.
+    - Otherwise fall back to the repo's stable maintenance branch.
+    - For Scorpion1221 fork: develop
+    - For official repo: main
+    - Final fallback: main
+    """
+    preferred = current_branch if current_branch != "HEAD" else ""
+    if preferred and _remote_branch_exists(git_cmd, cwd, preferred):
+        return preferred
+
+    stable_branch = FORK_STABLE_BRANCH if is_fork else OFFICIAL_STABLE_BRANCH
+    if _remote_branch_exists(git_cmd, cwd, stable_branch):
+        return stable_branch
+
+    return OFFICIAL_STABLE_BRANCH
 
 
 def _add_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
@@ -5471,7 +5509,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         else:
             print("✗ Not a git repository. Please reinstall:")
             print(
-                "  curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash"
+                f"  curl -fsSL {FORK_INSTALL_URL} | bash"
             )
             sys.exit(1)
 
@@ -5548,21 +5586,24 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
         current_branch = result.stdout.strip()
 
-        # Always update against main
-        branch = "main"
+        # Pick update branch from current checkout + maintenance policy.
+        # For the Scorpion1221 fork we maintain `develop`; for the official repo
+        # the stable branch remains `main`.
+        branch = _select_update_branch(git_cmd, PROJECT_ROOT, current_branch, is_fork)
 
-        # If user is on a non-main branch or detached HEAD, switch to main
-        if current_branch != "main":
+        # If user is on a different branch (or detached HEAD), switch to the
+        # chosen update branch before pulling.
+        if current_branch != branch:
             label = (
                 "detached HEAD"
                 if current_branch == "HEAD"
                 else f"branch '{current_branch}'"
             )
-            print(f"  ⚠ Currently on {label} — switching to main for update...")
+            print(f"  ⚠ Currently on {label} — switching to {branch} for update...")
             # Stash before checkout so uncommitted work isn't lost
             auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
             subprocess.run(
-                git_cmd + ["checkout", "main"],
+                git_cmd + ["checkout", branch],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
@@ -5636,7 +5677,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     if reset_result.stderr.strip():
                         print(f"  {reset_result.stderr.strip()}")
                     print(
-                        "  Try manually: git fetch origin && git reset --hard origin/main"
+                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
                     )
                     sys.exit(1)
             update_succeeded = True

@@ -459,42 +459,32 @@ def test_cmd_update_no_reset_when_ff_only_succeeds(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Non-main branch → auto-checkout main
+# Update branch selection policy
 # ---------------------------------------------------------------------------
 
-def test_cmd_update_switches_to_main_from_feature_branch(monkeypatch, tmp_path, capsys):
-    """When on a feature branch, update checks out main before pulling."""
-    _setup_update_mocks(monkeypatch, tmp_path)
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+def test_select_update_branch_falls_back_to_develop_for_feature_branch(monkeypatch, tmp_path):
+    """On the Scorpion1221 fork, feature branches without a remote counterpart
+    fall back to the stable maintenance branch `develop`."""
+    monkeypatch.setattr(
+        hermes_main,
+        "_remote_branch_exists",
+        lambda _git_cmd, _cwd, branch: branch == "develop",
+    )
 
-    side_effect, recorded = _make_update_side_effect(current_branch="fix/something")
-    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
-
-    hermes_main.cmd_update(SimpleNamespace())
-
-    checkout_calls = [c for c in recorded if "checkout" in c and "main" in c]
-    assert len(checkout_calls) == 1
-
-    out = capsys.readouterr().out
-    assert "fix/something" in out
-    assert "switching to main" in out
+    branch = hermes_main._select_update_branch(["git"], tmp_path, "fix/something", is_fork=True)
+    assert branch == "develop"
 
 
-def test_cmd_update_switches_to_main_from_detached_head(monkeypatch, tmp_path, capsys):
-    """When in detached HEAD state, update checks out main before pulling."""
-    _setup_update_mocks(monkeypatch, tmp_path)
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+def test_select_update_branch_falls_back_to_develop_from_detached_head(monkeypatch, tmp_path):
+    """Detached HEAD also falls back to the fork's stable branch `develop`."""
+    monkeypatch.setattr(
+        hermes_main,
+        "_remote_branch_exists",
+        lambda _git_cmd, _cwd, branch: branch == "develop",
+    )
 
-    side_effect, recorded = _make_update_side_effect(current_branch="HEAD")
-    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
-
-    hermes_main.cmd_update(SimpleNamespace())
-
-    checkout_calls = [c for c in recorded if "checkout" in c and "main" in c]
-    assert len(checkout_calls) == 1
-
-    out = capsys.readouterr().out
-    assert "detached HEAD" in out
+    branch = hermes_main._select_update_branch(["git"], tmp_path, "HEAD", is_fork=True)
+    assert branch == "develop"
 
 
 def test_cmd_update_restores_stash_and_branch_when_already_up_to_date(monkeypatch, tmp_path, capsys):
@@ -532,7 +522,7 @@ def test_cmd_update_restores_stash_and_branch_when_already_up_to_date(monkeypatc
 
 
 def test_cmd_update_no_checkout_when_already_on_main(monkeypatch, tmp_path):
-    """When already on main, no checkout is needed."""
+    """When already on the tracked branch, no checkout is needed."""
     _setup_update_mocks(monkeypatch, tmp_path)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
 

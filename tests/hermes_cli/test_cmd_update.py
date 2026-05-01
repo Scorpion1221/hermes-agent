@@ -72,7 +72,7 @@ class TestCmdUpdateBranchFallback:
         self, mock_run, _mock_which, mock_args, capsys
     ):
         mock_run.side_effect = _make_run_side_effect(
-            branch="main", verify_ok=True, commit_count="2"
+            branch="develop", verify_ok=True, commit_count="2"
         )
 
         cmd_update(mock_args)
@@ -81,11 +81,11 @@ class TestCmdUpdateBranchFallback:
 
         rev_list_cmds = [c for c in commands if "rev-list" in c]
         assert len(rev_list_cmds) == 1
-        assert "origin/main" in rev_list_cmds[0]
+        assert "origin/develop" in rev_list_cmds[0]
 
         pull_cmds = [c for c in commands if "pull" in c]
         assert len(pull_cmds) == 1
-        assert "main" in pull_cmds[0]
+        assert "develop" in pull_cmds[0]
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")

@@ -6,7 +6,7 @@
 # Uses uv for desktop/server installs and Python's stdlib venv + pip on Termux.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Scorpion1221/hermes-agent/develop/scripts/install.sh | bash
 #
 # Or with options:
 #   curl -fsSL ... | bash -s -- --no-venv --skip-setup
@@ -78,7 +78,7 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --no-venv      Don't create virtual environment"
             echo "  --skip-setup   Skip interactive setup wizard"
-            echo "  --branch NAME  Git branch to install (default: main)"
+            echo "  --branch NAME  Git branch to install (default: develop)"
             echo "  --dir PATH     Installation directory (default: ~/.hermes/hermes-agent)"
             echo "  --hermes-home PATH  Data directory (default: ~/.hermes, or \$HERMES_HOME)"
             echo "  -h, --help     Show this help"
@@ -217,7 +217,7 @@ detect_os() {
             OS="windows"
             DISTRO="windows"
             log_error "Windows detected. Please use the PowerShell installer:"
-            log_info "  irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1 | iex"
+            log_info "  irm https://raw.githubusercontent.com/Scorpion1221/hermes-agent/develop/scripts/install.ps1 | iex"
             exit 1
             ;;
         *)
