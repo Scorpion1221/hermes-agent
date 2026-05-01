@@ -69,5 +69,5 @@ mini-swe-agent/
 .nix-stamps/
 result
 website/static/api/skills-index.json
-
 midscene_run/
+models-dev-upstream/
