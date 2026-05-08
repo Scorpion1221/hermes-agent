@@ -38,6 +38,7 @@ def allow_feishu_group_message(
     default_group_policy: str = '',
     group_policy: str = '',
     allowed_group_users: Iterable[str] = (),
+    is_bot: bool = False,
 ) -> bool:
     sender_ids = _sender_ids(sender_id)
     admin_ids = {str(value).strip() for value in admins if str(value).strip()}
@@ -56,6 +57,9 @@ def allow_feishu_group_message(
         return True
     if policy == 'admin_only':
         return False
+    # Bots cleared upstream by FEISHU_ALLOW_BOTS bypass allowlist/blacklist gates.
+    if is_bot:
+        return True
     if policy == 'allowlist':
         return bool(sender_ids and (sender_ids & allowlist))
     if policy == 'blacklist':

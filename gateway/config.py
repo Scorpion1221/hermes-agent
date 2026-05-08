@@ -36,11 +36,40 @@ def _coerce_bool(value: Any, default: bool = True) -> bool:
     return is_truthy_value(value, default=default)
 
 
+def _coerce_float(value: Any, default: float) -> float:
+    """Coerce numeric config values, falling back on malformed input."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    """Coerce integer config values, falling back on malformed input."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _normalize_unauthorized_dm_behavior(value: Any, default: str = "pair") -> str:
     """Normalize unauthorized DM behavior to a supported value."""
     if isinstance(value, str):
         normalized = value.strip().lower()
         if normalized in {"pair", "ignore"}:
+            return normalized
+    return default
+
+
+def _normalize_notice_delivery(value: Any, default: str = "public") -> str:
+    """Normalize notice delivery mode to a supported value."""
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"public", "private"}:
             return normalized
     return default
 
@@ -155,27 +184,34 @@ _BUILTIN_PLATFORM_VALUES = frozenset(m.value for m in Platform.__members__.value
 class HomeChannel:
     """
     Default destination for a platform.
-
+    
     When a cron job specifies deliver="telegram" without a specific chat ID,
-    messages are sent to this home channel.
+    messages are sent to this home channel. Thread-aware platforms may also
+    store a thread/topic ID so the bare platform target routes to the exact
+    conversation where /sethome was run.
     """
     platform: Platform
     chat_id: str
     name: str  # Human-readable name for display
-
+    thread_id: Optional[str] = None
+    
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "platform": self.platform.value,
             "chat_id": self.chat_id,
             "name": self.name,
         }
-
+        if self.thread_id:
+            result["thread_id"] = self.thread_id
+        return result
+    
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "HomeChannel":
         return cls(
             platform=Platform(data["platform"]),
             chat_id=str(data["chat_id"]),
             name=data.get("name", "Home"),
+            thread_id=str(data["thread_id"]) if data.get("thread_id") else None,
         )
 
 
@@ -183,7 +219,7 @@ class HomeChannel:
 class SessionResetPolicy:
     """
     Controls when sessions reset (lose context).
-
+    
     Modes:
     - "daily": Reset at a specific hour each day
     - "idle": Reset after N minutes of inactivity
@@ -195,7 +231,7 @@ class SessionResetPolicy:
     idle_minutes: int = 1440  # Minutes of inactivity before reset (24 hours)
     notify: bool = True  # Send a notification to the user when auto-reset occurs
     notify_exclude_platforms: tuple = ("api_server", "webhook")  # Platforms that don't get reset notifications
-
+    
     def to_dict(self) -> Dict[str, Any]:
         return {
             "mode": self.mode,
@@ -204,10 +240,10 @@ class SessionResetPolicy:
             "notify": self.notify,
             "notify_exclude_platforms": list(self.notify_exclude_platforms),
         }
-
+    
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SessionResetPolicy":
-        # Handle both missing keys and explicit null values (YAML null ��� None)
+        # Handle both missing keys and explicit null values (YAML null → None)
         mode = data.get("mode")
         at_hour = data.get("at_hour")
         idle_minutes = data.get("idle_minutes")
@@ -229,12 +265,19 @@ class PlatformConfig:
     token: Optional[str] = None  # Bot token (Telegram, Discord)
     api_key: Optional[str] = None  # API key if different from token
     home_channel: Optional[HomeChannel] = None
-
+    
     # Reply threading mode (Telegram/Slack)
     # - "off": Never thread replies to original message
     # - "first": Only first chunk threads to user's message (default)
     # - "all": All chunks in multi-part replies thread to user's message
     reply_to_mode: str = "first"
+
+    # Whether the gateway is allowed to send "♻️ Gateway online" /
+    # "♻ Gateway restarted" lifecycle notifications on this platform.
+    # Default True preserves prior behavior. Set False on platforms used
+    # by end users (e.g. Slack) where operator-flavored restart pings are
+    # noise; keep True for back-channels where the operator wants them.
+    gateway_restart_notification: bool = True
 
     # Platform-specific settings
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -244,6 +287,7 @@ class PlatformConfig:
             "enabled": self.enabled,
             "extra": self.extra,
             "reply_to_mode": self.reply_to_mode,
+            "gateway_restart_notification": self.gateway_restart_notification,
         }
         if self.token:
             result["token"] = self.token
@@ -265,6 +309,9 @@ class PlatformConfig:
             api_key=data.get("api_key"),
             home_channel=home_channel,
             reply_to_mode=data.get("reply_to_mode", "first"),
+            gateway_restart_notification=_coerce_bool(
+                data.get("gateway_restart_notification"), True
+            ),
             extra=data.get("extra", {}),
         )
 
@@ -301,13 +348,13 @@ class StreamingConfig:
         if not data:
             return cls()
         return cls(
-            enabled=data.get("enabled", False),
+            enabled=_coerce_bool(data.get("enabled"), False),
             transport=data.get("transport", "edit"),
-            edit_interval=float(data.get("edit_interval", 1.0)),
-            buffer_threshold=int(data.get("buffer_threshold", 40)),
+            edit_interval=_coerce_float(data.get("edit_interval"), 1.0),
+            buffer_threshold=_coerce_int(data.get("buffer_threshold"), 40),
             cursor=data.get("cursor", " ▉"),
-            fresh_final_after_seconds=float(
-                data.get("fresh_final_after_seconds", 60.0)
+            fresh_final_after_seconds=_coerce_float(
+                data.get("fresh_final_after_seconds"), 60.0
             ),
         )
 
@@ -354,26 +401,26 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
 class GatewayConfig:
     """
     Main gateway configuration.
-
+    
     Manages all platform connections, session policies, and delivery settings.
     """
     # Platform configurations
     platforms: Dict[Platform, PlatformConfig] = field(default_factory=dict)
-
+    
     # Session reset policies by type
     default_reset_policy: SessionResetPolicy = field(default_factory=SessionResetPolicy)
     reset_by_type: Dict[str, SessionResetPolicy] = field(default_factory=dict)
     reset_by_platform: Dict[Platform, SessionResetPolicy] = field(default_factory=dict)
-
+    
     # Reset trigger commands
     reset_triggers: List[str] = field(default_factory=lambda: ["/new", "/reset"])
 
     # User-defined quick commands (slash commands that bypass the agent loop)
     quick_commands: Dict[str, Any] = field(default_factory=dict)
-
+    
     # Storage paths
     sessions_dir: Path = field(default_factory=lambda: get_hermes_home() / "sessions")
-
+    
     # Delivery settings
     always_log_local: bool = True  # Always save cron outputs to local files
 
@@ -393,7 +440,7 @@ class GatewayConfig:
     # Session store pruning: drop SessionEntry records older than this many
     # days from the in-memory dict and sessions.json.  Keeps the store from
     # growing unbounded in gateways serving many chats/threads/users over
-    # months.  Pruning is invisible to users ��� if they resume, they get a
+    # months.  Pruning is invisible to users — if they resume, they get a
     # fresh session exactly as if the reset policy had fired.  0 = disabled.
     session_store_max_age_days: int = 90
 
@@ -440,34 +487,34 @@ class GatewayConfig:
             pass  # Registry not yet initialised during early import
 
         return False
-
+    
     def get_home_channel(self, platform: Platform) -> Optional[HomeChannel]:
         """Get the home channel for a platform."""
         config = self.platforms.get(platform)
         if config:
             return config.home_channel
         return None
-
+    
     def get_reset_policy(
-        self,
+        self, 
         platform: Optional[Platform] = None,
         session_type: Optional[str] = None
     ) -> SessionResetPolicy:
         """
         Get the appropriate reset policy for a session.
-
+        
         Priority: platform override > type override > default
         """
         # Platform-specific override takes precedence
         if platform and platform in self.reset_by_platform:
             return self.reset_by_platform[platform]
-
+        
         # Type-specific override (dm, group, thread)
         if session_type and session_type in self.reset_by_type:
             return self.reset_by_type[session_type]
-
+        
         return self.default_reset_policy
-
+    
     def to_dict(self) -> Dict[str, Any]:
         return {
             "platforms": {
@@ -491,7 +538,7 @@ class GatewayConfig:
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
         }
-
+    
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "GatewayConfig":
         platforms = {}
@@ -501,11 +548,11 @@ class GatewayConfig:
                 platforms[platform] = PlatformConfig.from_dict(platform_data)
             except ValueError:
                 pass  # Skip unknown platforms
-
+        
         reset_by_type = {}
         for type_name, policy_data in data.get("reset_by_type", {}).items():
             reset_by_type[type_name] = SessionResetPolicy.from_dict(policy_data)
-
+        
         reset_by_platform = {}
         for platform_name, policy_data in data.get("reset_by_platform", {}).items():
             try:
@@ -513,15 +560,15 @@ class GatewayConfig:
                 reset_by_platform[platform] = SessionResetPolicy.from_dict(policy_data)
             except ValueError:
                 pass
-
+        
         default_policy = SessionResetPolicy()
         if "default_reset_policy" in data:
             default_policy = SessionResetPolicy.from_dict(data["default_reset_policy"])
-
+        
         sessions_dir = get_hermes_home() / "sessions"
         if "sessions_dir" in data:
             sessions_dir = Path(data["sessions_dir"])
-
+        
         quick_commands = data.get("quick_commands", {})
         if not isinstance(quick_commands, dict):
             quick_commands = {}
@@ -572,6 +619,17 @@ class GatewayConfig:
                 )
         return self.unauthorized_dm_behavior
 
+    def get_notice_delivery(self, platform: Optional[Platform] = None) -> str:
+        """Return the effective notice-delivery mode for a platform."""
+        if platform:
+            platform_cfg = self.platforms.get(platform)
+            if platform_cfg and "notice_delivery" in platform_cfg.extra:
+                return _normalize_notice_delivery(
+                    platform_cfg.extra.get("notice_delivery"),
+                    "public",
+                )
+        return "public"
+
 
 def load_gateway_config() -> GatewayConfig:
     """
@@ -580,7 +638,7 @@ def load_gateway_config() -> GatewayConfig:
     Priority (highest to lowest):
     1. Environment variables
     2. ~/.hermes/config.yaml (primary user-facing config)
-    3. ~/.hermes/gateway.json (legacy ��� provides defaults under config.yaml)
+    3. ~/.hermes/gateway.json (legacy — provides defaults under config.yaml)
     4. Built-in defaults
     """
     _home = get_hermes_home()
@@ -594,7 +652,7 @@ def load_gateway_config() -> GatewayConfig:
             with open(gateway_json_path, "r", encoding="utf-8") as f:
                 gw_data = json.load(f) or {}
             logger.info(
-                "Loaded legacy %s ��� consider moving settings to config.yaml",
+                "Loaded legacy %s — consider moving settings to config.yaml",
                 gateway_json_path,
             )
         except Exception as e:
@@ -608,7 +666,7 @@ def load_gateway_config() -> GatewayConfig:
             with open(config_yaml_path, encoding="utf-8") as f:
                 yaml_cfg = yaml.safe_load(f) or {}
 
-            # Map config.yaml keys ��� GatewayConfig.from_dict() schema.
+            # Map config.yaml keys → GatewayConfig.from_dict() schema.
             # Each key overwrites whatever gateway.json may have set.
             sr = yaml_cfg.get("session_reset")
             if sr and isinstance(sr, dict):
@@ -687,6 +745,11 @@ def load_gateway_config() -> GatewayConfig:
                         platform_cfg.get("unauthorized_dm_behavior"),
                         gw_data.get("unauthorized_dm_behavior", "pair"),
                     )
+                if "notice_delivery" in platform_cfg:
+                    bridged["notice_delivery"] = _normalize_notice_delivery(
+                        platform_cfg.get("notice_delivery"),
+                        "public",
+                    )
                 if "reply_prefix" in platform_cfg:
                     bridged["reply_prefix"] = platform_cfg["reply_prefix"]
                 if "reply_in_thread" in platform_cfg:
@@ -730,7 +793,7 @@ def load_gateway_config() -> GatewayConfig:
                     extra["_enabled_explicit"] = True
                 extra.update(bridged)
 
-            # Slack settings ��� env vars (env vars take precedence)
+            # Slack settings → env vars (env vars take precedence)
             slack_cfg = yaml_cfg.get("slack", {})
             if isinstance(slack_cfg, dict):
                 if "require_mention" in slack_cfg and not os.getenv("SLACK_REQUIRE_MENTION"):
@@ -746,8 +809,14 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["SLACK_FREE_RESPONSE_CHANNELS"] = str(frc)
                 if "reactions" in slack_cfg and not os.getenv("SLACK_REACTIONS"):
                     os.environ["SLACK_REACTIONS"] = str(slack_cfg["reactions"]).lower()
+                # allowed_channels: if set, bot ONLY responds in these channels (whitelist)
+                ac = slack_cfg.get("allowed_channels")
+                if ac is not None and not os.getenv("SLACK_ALLOWED_CHANNELS"):
+                    if isinstance(ac, list):
+                        ac = ",".join(str(v) for v in ac)
+                    os.environ["SLACK_ALLOWED_CHANNELS"] = str(ac)
 
-            # Discord settings ��� env vars (env vars take precedence)
+            # Discord settings → env vars (env vars take precedence)
             discord_cfg = yaml_cfg.get("discord", {})
             if isinstance(discord_cfg, dict):
                 if "require_mention" in discord_cfg and not os.getenv("DISCORD_REQUIRE_MENTION"):
@@ -793,12 +862,36 @@ def load_gateway_config() -> GatewayConfig:
                     ):
                         if yaml_key in allow_mentions_cfg and not os.getenv(env_key):
                             os.environ[env_key] = str(allow_mentions_cfg[yaml_key]).lower()
+                # reply_to_mode: top-level preferred, falls back to extra.reply_to_mode
+                # YAML 1.1 parses bare 'off' as boolean False — coerce to string "off".
+                _discord_extra = discord_cfg.get("extra") if isinstance(discord_cfg.get("extra"), dict) else {}
+                _discord_rtm = (
+                    discord_cfg["reply_to_mode"] if "reply_to_mode" in discord_cfg
+                    else _discord_extra.get("reply_to_mode")
+                )
+                if _discord_rtm is not None and not os.getenv("DISCORD_REPLY_TO_MODE"):
+                    _rtm_str = "off" if _discord_rtm is False else str(_discord_rtm).lower()
+                    os.environ["DISCORD_REPLY_TO_MODE"] = _rtm_str
 
-            # Telegram settings ��� env vars (env vars take precedence)
+            # Bridge top-level require_mention to Telegram when the telegram: section
+            # does not already provide one.  Users often write "require_mention: true"
+            # at the top level alongside group_sessions_per_user, expecting it to work
+            # the same way (#3979).
+            _tl_require_mention = yaml_cfg.get("require_mention")
+            if _tl_require_mention is not None:
+                _tg_section = yaml_cfg.get("telegram") or {}
+                if "require_mention" not in _tg_section:
+                    _tg_plat = platforms_data.setdefault(Platform.TELEGRAM.value, {})
+                    _tg_extra = _tg_plat.setdefault("extra", {})
+                    _tg_extra.setdefault("require_mention", _tl_require_mention)
+
+            # Telegram settings → env vars (env vars take precedence)
             telegram_cfg = yaml_cfg.get("telegram", {})
             if isinstance(telegram_cfg, dict):
-                if "require_mention" in telegram_cfg and not os.getenv("TELEGRAM_REQUIRE_MENTION"):
-                    os.environ["TELEGRAM_REQUIRE_MENTION"] = str(telegram_cfg["require_mention"]).lower()
+                # Prefer telegram.require_mention; fall back to the top-level shorthand.
+                _effective_rm = telegram_cfg.get("require_mention", yaml_cfg.get("require_mention"))
+                if _effective_rm is not None and not os.getenv("TELEGRAM_REQUIRE_MENTION"):
+                    os.environ["TELEGRAM_REQUIRE_MENTION"] = str(_effective_rm).lower()
                 if "mention_patterns" in telegram_cfg and not os.getenv("TELEGRAM_MENTION_PATTERNS"):
                     os.environ["TELEGRAM_MENTION_PATTERNS"] = json.dumps(telegram_cfg["mention_patterns"])
                 frc = telegram_cfg.get("free_response_chats")
@@ -806,6 +899,12 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] = str(frc)
+                # allowed_chats: if set, bot ONLY responds in these group chats (whitelist)
+                ac = telegram_cfg.get("allowed_chats")
+                if ac is not None and not os.getenv("TELEGRAM_ALLOWED_CHATS"):
+                    if isinstance(ac, list):
+                        ac = ",".join(str(v) for v in ac)
+                    os.environ["TELEGRAM_ALLOWED_CHATS"] = str(ac)
                 ignored_threads = telegram_cfg.get("ignored_threads")
                 if ignored_threads is not None and not os.getenv("TELEGRAM_IGNORED_THREADS"):
                     if isinstance(ignored_threads, list):
@@ -815,6 +914,16 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["TELEGRAM_REACTIONS"] = str(telegram_cfg["reactions"]).lower()
                 if "proxy_url" in telegram_cfg and not os.getenv("TELEGRAM_PROXY"):
                     os.environ["TELEGRAM_PROXY"] = str(telegram_cfg["proxy_url"]).strip()
+                # reply_to_mode: top-level preferred, falls back to extra.reply_to_mode
+                # YAML 1.1 parses bare 'off' as boolean False — coerce to string "off".
+                _telegram_extra = telegram_cfg.get("extra") if isinstance(telegram_cfg.get("extra"), dict) else {}
+                _telegram_rtm = (
+                    telegram_cfg["reply_to_mode"] if "reply_to_mode" in telegram_cfg
+                    else _telegram_extra.get("reply_to_mode")
+                )
+                if _telegram_rtm is not None and not os.getenv("TELEGRAM_REPLY_TO_MODE"):
+                    _rtm_str = "off" if _telegram_rtm is False else str(_telegram_rtm).lower()
+                    os.environ["TELEGRAM_REPLY_TO_MODE"] = _rtm_str
                 allowed_users = telegram_cfg.get("allow_from")
                 if allowed_users is not None and not os.getenv("TELEGRAM_ALLOWED_USERS"):
                     if isinstance(allowed_users, list):
@@ -867,7 +976,7 @@ def load_gateway_config() -> GatewayConfig:
                         gaf = ",".join(str(v) for v in gaf)
                     os.environ["WHATSAPP_GROUP_ALLOWED_USERS"] = str(gaf)
 
-            # DingTalk settings ��� env vars (env vars take precedence)
+            # DingTalk settings → env vars (env vars take precedence)
             dingtalk_cfg = yaml_cfg.get("dingtalk", {})
             if isinstance(dingtalk_cfg, dict):
                 if "require_mention" in dingtalk_cfg and not os.getenv("DINGTALK_REQUIRE_MENTION"):
@@ -879,13 +988,36 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["DINGTALK_FREE_RESPONSE_CHATS"] = str(frc)
+                # allowed_chats: if set, bot ONLY responds in these group chats (whitelist)
+                ac = dingtalk_cfg.get("allowed_chats")
+                if ac is not None and not os.getenv("DINGTALK_ALLOWED_CHATS"):
+                    if isinstance(ac, list):
+                        ac = ",".join(str(v) for v in ac)
+                    os.environ["DINGTALK_ALLOWED_CHATS"] = str(ac)
                 allowed = dingtalk_cfg.get("allowed_users")
                 if allowed is not None and not os.getenv("DINGTALK_ALLOWED_USERS"):
                     if isinstance(allowed, list):
                         allowed = ",".join(str(v) for v in allowed)
                     os.environ["DINGTALK_ALLOWED_USERS"] = str(allowed)
 
-            # Matrix settings ��� env vars (env vars take precedence)
+            # Mattermost settings → env vars (env vars take precedence)
+            mattermost_cfg = yaml_cfg.get("mattermost", {})
+            if isinstance(mattermost_cfg, dict):
+                if "require_mention" in mattermost_cfg and not os.getenv("MATTERMOST_REQUIRE_MENTION"):
+                    os.environ["MATTERMOST_REQUIRE_MENTION"] = str(mattermost_cfg["require_mention"]).lower()
+                frc = mattermost_cfg.get("free_response_channels")
+                if frc is not None and not os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS"):
+                    if isinstance(frc, list):
+                        frc = ",".join(str(v) for v in frc)
+                    os.environ["MATTERMOST_FREE_RESPONSE_CHANNELS"] = str(frc)
+                # allowed_channels: if set, bot ONLY responds in these channels (whitelist)
+                ac = mattermost_cfg.get("allowed_channels")
+                if ac is not None and not os.getenv("MATTERMOST_ALLOWED_CHANNELS"):
+                    if isinstance(ac, list):
+                        ac = ",".join(str(v) for v in ac)
+                    os.environ["MATTERMOST_ALLOWED_CHANNELS"] = str(ac)
+
+            # Matrix settings → env vars (env vars take precedence)
             matrix_cfg = yaml_cfg.get("matrix", {})
             if isinstance(matrix_cfg, dict):
                 if "require_mention" in matrix_cfg and not os.getenv("MATRIX_REQUIRE_MENTION"):
@@ -895,14 +1027,26 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["MATRIX_FREE_RESPONSE_ROOMS"] = str(frc)
+                # allowed_rooms: if set, bot ONLY responds in these rooms (whitelist)
+                ar = matrix_cfg.get("allowed_rooms")
+                if ar is not None and not os.getenv("MATRIX_ALLOWED_ROOMS"):
+                    if isinstance(ar, list):
+                        ar = ",".join(str(v) for v in ar)
+                    os.environ["MATRIX_ALLOWED_ROOMS"] = str(ar)
                 if "auto_thread" in matrix_cfg and not os.getenv("MATRIX_AUTO_THREAD"):
                     os.environ["MATRIX_AUTO_THREAD"] = str(matrix_cfg["auto_thread"]).lower()
                 if "dm_mention_threads" in matrix_cfg and not os.getenv("MATRIX_DM_MENTION_THREADS"):
                     os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
 
+            # Feishu settings → env vars (env vars take precedence)
+            feishu_cfg = yaml_cfg.get("feishu", {})
+            if isinstance(feishu_cfg, dict):
+                if "allow_bots" in feishu_cfg and not os.getenv("FEISHU_ALLOW_BOTS"):
+                    os.environ["FEISHU_ALLOW_BOTS"] = str(feishu_cfg["allow_bots"]).lower()
+
     except Exception as e:
         logger.warning(
-            "Failed to process config.yaml ��� falling back to .env / gateway.json values. "
+            "Failed to process config.yaml — falling back to .env / gateway.json values. "
             "Check %s for syntax errors. Error: %s",
             _home / "config.yaml",
             e,
@@ -912,7 +1056,7 @@ def load_gateway_config() -> GatewayConfig:
 
     # Override with environment variables
     _apply_env_overrides(config)
-
+    
     # --- Validate loaded values ---
     _validate_gateway_config(config)
 
@@ -940,7 +1084,7 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
         )
         policy.idle_minutes = 1440
 
-    # Warn about empty bot tokens ��� platforms that loaded an empty string
+    # Warn about empty bot tokens — platforms that loaded an empty string
     # won't connect and the cause can be confusing without a log line.
     _token_env_names = {
         Platform.TELEGRAM: "TELEGRAM_BOT_TOKEN",
@@ -990,7 +1134,7 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
 
 def _apply_env_overrides(config: GatewayConfig) -> None:
     """Apply environment variable overrides to config."""
-
+    
     # Telegram
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
     if telegram_token:
@@ -998,14 +1142,14 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.platforms[Platform.TELEGRAM] = PlatformConfig()
         config.platforms[Platform.TELEGRAM].enabled = True
         config.platforms[Platform.TELEGRAM].token = telegram_token
-
+    
     # Reply threading mode for Telegram (off/first/all)
     telegram_reply_mode = os.getenv("TELEGRAM_REPLY_TO_MODE", "").lower()
     if telegram_reply_mode in ("off", "first", "all"):
         if Platform.TELEGRAM not in config.platforms:
             config.platforms[Platform.TELEGRAM] = PlatformConfig()
         config.platforms[Platform.TELEGRAM].reply_to_mode = telegram_reply_mode
-
+    
     telegram_fallback_ips = os.getenv("TELEGRAM_FALLBACK_IPS", "")
     if telegram_fallback_ips:
         if Platform.TELEGRAM not in config.platforms:
@@ -1020,8 +1164,9 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             platform=Platform.TELEGRAM,
             chat_id=telegram_home,
             name=os.getenv("TELEGRAM_HOME_CHANNEL_NAME", "Home"),
+            thread_id=os.getenv("TELEGRAM_HOME_CHANNEL_THREAD_ID") or None,
         )
-
+    
     # Discord
     discord_token = os.getenv("DISCORD_BOT_TOKEN")
     if discord_token:
@@ -1029,28 +1174,44 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.platforms[Platform.DISCORD] = PlatformConfig()
         config.platforms[Platform.DISCORD].enabled = True
         config.platforms[Platform.DISCORD].token = discord_token
-
+    
     discord_home = os.getenv("DISCORD_HOME_CHANNEL")
     if discord_home and Platform.DISCORD in config.platforms:
         config.platforms[Platform.DISCORD].home_channel = HomeChannel(
             platform=Platform.DISCORD,
             chat_id=discord_home,
             name=os.getenv("DISCORD_HOME_CHANNEL_NAME", "Home"),
+            thread_id=os.getenv("DISCORD_HOME_CHANNEL_THREAD_ID") or None,
         )
-
+    
     # Reply threading mode for Discord (off/first/all)
     discord_reply_mode = os.getenv("DISCORD_REPLY_TO_MODE", "").lower()
     if discord_reply_mode in ("off", "first", "all"):
         if Platform.DISCORD not in config.platforms:
             config.platforms[Platform.DISCORD] = PlatformConfig()
         config.platforms[Platform.DISCORD].reply_to_mode = discord_reply_mode
-
+    
     # WhatsApp (typically uses different auth mechanism)
     whatsapp_enabled = os.getenv("WHATSAPP_ENABLED", "").lower() in ("true", "1", "yes")
-    if whatsapp_enabled:
-        if Platform.WHATSAPP not in config.platforms:
-            config.platforms[Platform.WHATSAPP] = PlatformConfig()
-        config.platforms[Platform.WHATSAPP].enabled = True
+    whatsapp_disabled_explicitly = os.getenv("WHATSAPP_ENABLED", "").lower() in ("false", "0", "no")
+    if Platform.WHATSAPP in config.platforms:
+        # YAML config exists — respect explicit disable
+        wa_cfg = config.platforms[Platform.WHATSAPP]
+        if whatsapp_disabled_explicitly:
+            wa_cfg.enabled = False
+        elif whatsapp_enabled:
+            wa_cfg.enabled = True
+        # else: keep whatever the YAML set
+    elif whatsapp_enabled:
+        config.platforms[Platform.WHATSAPP] = PlatformConfig(enabled=True)
+    whatsapp_home = os.getenv("WHATSAPP_HOME_CHANNEL")
+    if whatsapp_home and Platform.WHATSAPP in config.platforms:
+        config.platforms[Platform.WHATSAPP].home_channel = HomeChannel(
+            platform=Platform.WHATSAPP,
+            chat_id=whatsapp_home,
+            name=os.getenv("WHATSAPP_HOME_CHANNEL_NAME", "Home"),
+            thread_id=os.getenv("WHATSAPP_HOME_CHANNEL_THREAD_ID") or None,
+        )
 
     # Slack
     slack_token = os.getenv("SLACK_BOT_TOKEN")
@@ -1077,8 +1238,9 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             platform=Platform.SLACK,
             chat_id=slack_home,
             name=os.getenv("SLACK_HOME_CHANNEL_NAME", ""),
+            thread_id=os.getenv("SLACK_HOME_CHANNEL_THREAD_ID") or None,
         )
-
+    
     # Signal
     signal_url = os.getenv("SIGNAL_HTTP_URL")
     signal_account = os.getenv("SIGNAL_ACCOUNT")
@@ -1097,6 +1259,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             platform=Platform.SIGNAL,
             chat_id=signal_home,
             name=os.getenv("SIGNAL_HOME_CHANNEL_NAME", "Home"),
+            thread_id=os.getenv("SIGNAL_HOME_CHANNEL_THREAD_ID") or None,
         )
 
     # Mattermost
@@ -1116,6 +1279,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             platform=Platform.MATTERMOST,
             chat_id=mattermost_home,
             name=os.getenv("MATTERMOST_HOME_CHANNEL_NAME", "Home"),
+            thread_id=os.getenv("MATTERMOST_HOME_CHANNEL_THREAD_ID") or None,
         )
 
     # Matrix
@@ -1147,6 +1311,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             platform=Platform.MATRIX,
             chat_id=matrix_home,
             name=os.getenv("MATRIX_HOME_ROOM_NAME", "Home"),
+            thread_id=os.getenv("MATRIX_HOME_ROOM_THREAD_ID") or None,
         )
 
     # Home Assistant
@@ -1180,6 +1345,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             platform=Platform.EMAIL,
             chat_id=email_home,
             name=os.getenv("EMAIL_HOME_ADDRESS_NAME", "Home"),
+            thread_id=os.getenv("EMAIL_HOME_ADDRESS_THREAD_ID") or None,
         )
 
     # SMS (Twilio)
@@ -1195,6 +1361,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             platform=Platform.SMS,
             chat_id=sms_home,
             name=os.getenv("SMS_HOME_CHANNEL_NAME", "Home"),
+            thread_id=os.getenv("SMS_HOME_CHANNEL_THREAD_ID") or None,
         )
 
     # API Server
@@ -1257,6 +1424,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 platform=Platform.DINGTALK,
                 chat_id=dingtalk_home,
                 name=os.getenv("DINGTALK_HOME_CHANNEL_NAME", "Home"),
+                thread_id=os.getenv("DINGTALK_HOME_CHANNEL_THREAD_ID") or None,
             )
 
     # Feishu / Lark
@@ -1278,14 +1446,13 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         feishu_verification_token = os.getenv("FEISHU_VERIFICATION_TOKEN", "")
         if feishu_verification_token:
             config.platforms[Platform.FEISHU].extra["verification_token"] = feishu_verification_token
-        feishu_streaming_transport = os.getenv("FEISHU_STREAMING_TRANSPORT", "cardkit")
-        config.platforms[Platform.FEISHU].extra["streaming_transport"] = feishu_streaming_transport
         feishu_home = os.getenv("FEISHU_HOME_CHANNEL")
         if feishu_home:
             config.platforms[Platform.FEISHU].home_channel = HomeChannel(
                 platform=Platform.FEISHU,
                 chat_id=feishu_home,
                 name=os.getenv("FEISHU_HOME_CHANNEL_NAME", "Home"),
+                thread_id=os.getenv("FEISHU_HOME_CHANNEL_THREAD_ID") or None,
             )
 
     # WeCom (Enterprise WeChat)
@@ -1308,6 +1475,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 platform=Platform.WECOM,
                 chat_id=wecom_home,
                 name=os.getenv("WECOM_HOME_CHANNEL_NAME", "Home"),
+                thread_id=os.getenv("WECOM_HOME_CHANNEL_THREAD_ID") or None,
             )
 
     # WeCom callback mode (self-built apps)
@@ -1366,6 +1534,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 platform=Platform.WEIXIN,
                 chat_id=weixin_home,
                 name=os.getenv("WEIXIN_HOME_CHANNEL_NAME", "Home"),
+                thread_id=os.getenv("WEIXIN_HOME_CHANNEL_THREAD_ID") or None,
             )
 
     # BlueBubbles (iMessage)
@@ -1389,6 +1558,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             platform=Platform.BLUEBUBBLES,
             chat_id=bluebubbles_home,
             name=os.getenv("BLUEBUBBLES_HOME_CHANNEL_NAME", "Home"),
+            thread_id=os.getenv("BLUEBUBBLES_HOME_CHANNEL_THREAD_ID") or None,
         )
 
     # QQ (Official Bot API v2)
@@ -1426,6 +1596,11 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 platform=Platform.QQBOT,
                 chat_id=qq_home,
                 name=os.getenv("QQBOT_HOME_CHANNEL_NAME") or os.getenv(qq_home_name_env, "Home"),
+                thread_id=(
+                    os.getenv("QQBOT_HOME_CHANNEL_THREAD_ID")
+                    or os.getenv("QQ_HOME_CHANNEL_THREAD_ID")
+                    or None
+                ),
             )
 
     # Yuanbao — YUANBAO_APP_ID preferred
@@ -1456,6 +1631,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 platform=Platform.YUANBAO,
                 chat_id=yuanbao_home,
                 name=os.getenv("YUANBAO_HOME_CHANNEL_NAME", "Home"),
+                thread_id=os.getenv("YUANBAO_HOME_CHANNEL_THREAD_ID") or None,
             )
         yuanbao_dm_policy = os.getenv("YUANBAO_DM_POLICY")
         if yuanbao_dm_policy:
@@ -1477,7 +1653,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.default_reset_policy.idle_minutes = int(idle_minutes)
         except ValueError:
             pass
-
+    
     reset_hour = os.getenv("SESSION_RESET_HOUR")
     if reset_hour:
         try:
@@ -1488,7 +1664,10 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     # Registry-driven enable for plugin platforms.  Built-ins have explicit
     # blocks above; plugins expose check_fn() which is the single source of
     # truth for "are my env vars set?".  When it returns True, ensure the
-    # platform is enabled so start() will create its adapter.
+    # platform is enabled so start() will create its adapter.  Plugins that
+    # need to seed ``PlatformConfig.extra`` from env vars (e.g. Google Chat's
+    # project_id / subscription_name) can supply ``env_enablement_fn`` on
+    # their PlatformEntry — called here BEFORE adapter construction.
     try:
         from hermes_cli.plugins import discover_plugins
         discover_plugins()  # idempotent
@@ -1504,5 +1683,31 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             if platform not in config.platforms:
                 config.platforms[platform] = PlatformConfig()
             config.platforms[platform].enabled = True
+            # Seed extras from env if the plugin opted in.
+            if entry.env_enablement_fn is not None:
+                try:
+                    seed = entry.env_enablement_fn()
+                except Exception as e:
+                    logger.debug(
+                        "env_enablement_fn for %s raised: %s", entry.name, e
+                    )
+                    seed = None
+                if isinstance(seed, dict) and seed:
+                    # Extract the home_channel dict (if provided) so we wire it
+                    # up as a proper HomeChannel dataclass.  Everything else is
+                    # merged into ``extra``.
+                    home = seed.pop("home_channel", None)
+                    config.platforms[platform].extra.update(seed)
+                    if isinstance(home, dict) and home.get("chat_id"):
+                        config.platforms[platform].home_channel = HomeChannel(
+                            platform=platform,
+                            chat_id=str(home["chat_id"]),
+                            name=str(home.get("name") or "Home"),
+                            thread_id=(
+                                str(home["thread_id"])
+                                if home.get("thread_id")
+                                else None
+                            ),
+                        )
     except Exception as e:
         logger.debug("Plugin platform enable pass failed: %s", e)
