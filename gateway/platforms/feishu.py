@@ -3172,7 +3172,11 @@ class FeishuAdapter(BasePlatformAdapter):
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
 
-        thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None) or None
+        # IMPORTANT: thread_id is ONLY for Feishu topics (话题). Do NOT fall back
+        # to root_id — that's the quote-chain root, not a topic, and conflating
+        # them makes every quoted reply auto-create a thread. See SDK
+        # `EventMessage` — thread_id / root_id / parent_id are independent fields.
+        thread_id = getattr(message, "thread_id", None) or None
         reply_to_message_id = (
             getattr(message, "parent_id", None)
             or getattr(message, "root_id", None)
