@@ -18,17 +18,6 @@ _MARKDOWN_ATX_HEADING_RE = re.compile(
 )
 
 
-class _NormalizedCardMarkdown(str):
-    """Markdown that already had Feishu card heading normalization applied.
-
-    The transform intentionally maps level 1->3, 2->4, 3->5, and 4->6.
-    That cannot be idempotent from raw Markdown text alone: after one pass,
-    an original H1 is indistinguishable from an original H3.  This in-process
-    marker lets Hermes helpers safely call the normalizer at more than one
-    outbound boundary without compounding the level shift.
-    """
-
-
 def _ns(**kwargs: Any) -> SimpleNamespace:
     return SimpleNamespace(**kwargs)
 
@@ -56,16 +45,18 @@ def _split_line_ending(line: str) -> tuple[str, str]:
     return line, ""
 
 
-def normalize_markdown_headings_for_card(content: str) -> str:
-    """Downshift outbound Markdown ATX headings for Feishu Card readability.
+def render_markdown_for_card(content: str) -> str:
+    """Render raw assistant Markdown for Feishu Card readability.
 
     Feishu Card 2.0 renders top-level Markdown headings very large. Hermes
     messages usually live inside an already-framed card, so render Markdown
     headings two levels lower (# -> ###, ## -> ####, capped at ######).
     Fenced code blocks are left untouched.
+
+    Keep this as a render-only boundary: callers should pass raw assistant
+    text/session state and must not store this returned card-specific Markdown
+    back into conversation or streaming state.
     """
-    if isinstance(content, _NormalizedCardMarkdown):
-        return content
     if not content or "#" not in content:
         return content
 
@@ -103,7 +94,7 @@ def normalize_markdown_headings_for_card(content: str) -> str:
 
         lines.append(raw_line)
 
-    return _NormalizedCardMarkdown("".join(lines))
+    return "".join(lines)
 
 
 def build_streaming_card_body() -> dict:
@@ -141,7 +132,7 @@ def build_final_card_body(content: str, *, elapsed_seconds: float = 0.0, stopped
     elements: list[dict] = [
         {
             "tag": "markdown",
-            "content": normalize_markdown_headings_for_card(content),
+            "content": render_markdown_for_card(content),
             "text_align": "left",
             "text_size": "normal_v2",
         },
@@ -200,7 +191,10 @@ async def create_streaming_card(client: Any) -> Optional[str]:
 async def stream_card_element(
     client: Any, *, card_id: str, element_id: str, content: str, sequence: int,
 ) -> bool:
-    content = normalize_markdown_headings_for_card(content)
+    # Render raw streaming text only at the Feishu CardKit API boundary.  Do not
+    # write this card-specific Markdown back to CardKitState or conversation
+    # state; doing so would make a later final render downshift headings again.
+    content = render_markdown_for_card(content)
     try:
         from lark_oapi.api.cardkit.v1.model.content_card_element_request import ContentCardElementRequest
         from lark_oapi.api.cardkit.v1.model.content_card_element_request_body import ContentCardElementRequestBody
@@ -284,7 +278,7 @@ __all__ = [
     "CardKitState",
     "build_streaming_card_body",
     "build_final_card_body",
-    "normalize_markdown_headings_for_card",
+    "render_markdown_for_card",
     "create_streaming_card",
     "stream_card_element",
     "update_card",

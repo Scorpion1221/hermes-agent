@@ -180,7 +180,7 @@ from gateway.platforms.feishu_inbound.cardkit import (
     build_card_id_message_content,
     build_final_card_body,
     create_streaming_card,
-    normalize_markdown_headings_for_card,
+    render_markdown_for_card,
     set_card_streaming_mode,
     stream_card_element,
     update_card as cardkit_update_card,
@@ -693,7 +693,7 @@ def _build_card_v2_payload(content: str) -> str:
     including GFM pipe tables, which the post-mode `tag: "md"` element
     does not render. Using cards uniformly keeps formatting consistent.
     """
-    content = normalize_markdown_headings_for_card(content)
+    content = render_markdown_for_card(content)
     return json.dumps(
         {
             "schema": "2.0",
