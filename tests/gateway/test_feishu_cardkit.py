@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from gateway.platforms.feishu import _build_card_v2_payload
 from gateway.platforms.feishu_inbound.cardkit import (
     STREAMING_ELEMENT_ID,
     CardKitState,
@@ -30,6 +31,21 @@ def test_build_final_card_body_disables_streaming():
     body = build_final_card_body("hello world")
     assert body["config"]["streaming_mode"] is False
     assert body["body"]["elements"][0]["content"] == "hello world"
+
+
+def test_build_final_card_body_downshifts_markdown_headings():
+    body = build_final_card_body("# H1\n## H2\n### H3")
+    assert body["body"]["elements"][0]["content"] == "### H1\n#### H2\n##### H3"
+
+
+def test_build_card_v2_payload_downshifts_markdown_headings_before_send():
+    payload = json.loads(_build_card_v2_payload("# H1\n## H2\nplain"))
+    assert payload["body"]["elements"][0]["content"] == "### H1\n#### H2\nplain"
+
+
+def test_card_heading_downshift_ignores_fenced_code_blocks():
+    payload = json.loads(_build_card_v2_payload("```md\n# code\n```\n# Real"))
+    assert payload["body"]["elements"][0]["content"] == "```md\n# code\n```\n### Real"
 
 
 def test_build_card_id_message_content_format():

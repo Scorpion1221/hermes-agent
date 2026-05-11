@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -11,6 +12,10 @@ logger = logging.getLogger(__name__)
 
 STREAMING_ELEMENT_ID = "streaming_content"
 LOADING_ELEMENT_ID = "streaming_loading"
+_MARKDOWN_FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,}).*$")
+_MARKDOWN_ATX_HEADING_RE = re.compile(
+    r"^(?P<indent>[ ]{0,3})(?P<marks>#{1,6})(?P<rest>(?:[ \t]+.*)?)$"
+)
 
 
 def _ns(**kwargs: Any) -> SimpleNamespace:
@@ -28,6 +33,64 @@ class CardKitState:
     last_content: str = ""
     stopped: bool = False
     reply_to_message_id: str = ""
+
+
+def _split_line_ending(line: str) -> tuple[str, str]:
+    if line.endswith("\r\n"):
+        return line[:-2], "\r\n"
+    if line.endswith("\n"):
+        return line[:-1], "\n"
+    if line.endswith("\r"):
+        return line[:-1], "\r"
+    return line, ""
+
+
+def normalize_markdown_headings_for_card(content: str) -> str:
+    """Downshift outbound Markdown ATX headings for Feishu Card readability.
+
+    Feishu Card 2.0 renders top-level Markdown headings very large. Hermes
+    messages usually live inside an already-framed card, so render Markdown
+    headings two levels lower (# -> ###, ## -> ####, capped at ######).
+    Fenced code blocks are left untouched.
+    """
+    if not content or "#" not in content:
+        return content
+
+    lines: list[str] = []
+    fence_char = ""
+    fence_len = 0
+    for raw_line in content.splitlines(keepends=True):
+        line, ending = _split_line_ending(raw_line)
+        if fence_char:
+            lines.append(raw_line)
+            if re.match(rf"^[ ]{{0,3}}{re.escape(fence_char)}{{{fence_len},}}[ \t]*$", line):
+                fence_char = ""
+                fence_len = 0
+            continue
+
+        fence_match = _MARKDOWN_FENCE_OPEN_RE.match(line)
+        if fence_match:
+            fence = fence_match.group("fence")
+            fence_char = fence[0]
+            fence_len = len(fence)
+            lines.append(raw_line)
+            continue
+
+        heading_match = _MARKDOWN_ATX_HEADING_RE.match(line)
+        if heading_match:
+            marks = heading_match.group("marks")
+            new_level = min(len(marks) + 2, 6)
+            line = (
+                f"{heading_match.group('indent')}"
+                f"{'#' * new_level}"
+                f"{heading_match.group('rest')}"
+            )
+            lines.append(line + ending)
+            continue
+
+        lines.append(raw_line)
+
+    return "".join(lines)
 
 
 def build_streaming_card_body() -> dict:
@@ -65,7 +128,7 @@ def build_final_card_body(content: str, *, elapsed_seconds: float = 0.0, stopped
     elements: list[dict] = [
         {
             "tag": "markdown",
-            "content": content,
+            "content": normalize_markdown_headings_for_card(content),
             "text_align": "left",
             "text_size": "normal_v2",
         },
@@ -124,6 +187,7 @@ async def create_streaming_card(client: Any) -> Optional[str]:
 async def stream_card_element(
     client: Any, *, card_id: str, element_id: str, content: str, sequence: int,
 ) -> bool:
+    content = normalize_markdown_headings_for_card(content)
     try:
         from lark_oapi.api.cardkit.v1.model.content_card_element_request import ContentCardElementRequest
         from lark_oapi.api.cardkit.v1.model.content_card_element_request_body import ContentCardElementRequestBody
@@ -207,6 +271,7 @@ __all__ = [
     "CardKitState",
     "build_streaming_card_body",
     "build_final_card_body",
+    "normalize_markdown_headings_for_card",
     "create_streaming_card",
     "stream_card_element",
     "update_card",
