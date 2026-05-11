@@ -18,6 +18,17 @@ _MARKDOWN_ATX_HEADING_RE = re.compile(
 )
 
 
+class _NormalizedCardMarkdown(str):
+    """Markdown that already had Feishu card heading normalization applied.
+
+    The transform intentionally maps level 1->3, 2->4, 3->5, and 4->6.
+    That cannot be idempotent from raw Markdown text alone: after one pass,
+    an original H1 is indistinguishable from an original H3.  This in-process
+    marker lets Hermes helpers safely call the normalizer at more than one
+    outbound boundary without compounding the level shift.
+    """
+
+
 def _ns(**kwargs: Any) -> SimpleNamespace:
     return SimpleNamespace(**kwargs)
 
@@ -53,6 +64,8 @@ def normalize_markdown_headings_for_card(content: str) -> str:
     headings two levels lower (# -> ###, ## -> ####, capped at ######).
     Fenced code blocks are left untouched.
     """
+    if isinstance(content, _NormalizedCardMarkdown):
+        return content
     if not content or "#" not in content:
         return content
 
@@ -90,7 +103,7 @@ def normalize_markdown_headings_for_card(content: str) -> str:
 
         lines.append(raw_line)
 
-    return "".join(lines)
+    return _NormalizedCardMarkdown("".join(lines))
 
 
 def build_streaming_card_body() -> dict:

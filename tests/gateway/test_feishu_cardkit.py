@@ -14,6 +14,7 @@ from gateway.platforms.feishu_inbound.cardkit import (
     build_final_card_body,
     build_streaming_card_body,
     create_streaming_card,
+    normalize_markdown_headings_for_card,
     set_card_streaming_mode,
     stream_card_element,
     update_card,
@@ -34,8 +35,15 @@ def test_build_final_card_body_disables_streaming():
 
 
 def test_build_final_card_body_downshifts_markdown_headings():
-    body = build_final_card_body("# H1\n## H2\n### H3")
-    assert body["body"]["elements"][0]["content"] == "### H1\n#### H2\n##### H3"
+    body = build_final_card_body("# H1\n## H2\n### H3\n#### H4")
+    assert body["body"]["elements"][0]["content"] == "### H1\n#### H2\n##### H3\n###### H4"
+
+
+def test_markdown_heading_downshift_is_idempotent():
+    once = normalize_markdown_headings_for_card("# H1\n## H2\n### H3\n#### H4")
+    twice = normalize_markdown_headings_for_card(once)
+    assert once == "### H1\n#### H2\n##### H3\n###### H4"
+    assert twice == once
 
 
 def test_build_card_v2_payload_downshifts_markdown_headings_before_send():
