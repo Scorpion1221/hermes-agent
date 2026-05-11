@@ -740,7 +740,7 @@ def _cardkit_block_heading(el: Any) -> str:
         level = int(prop.get("level") or 1)
     except (TypeError, ValueError):
         level = 1
-    level = max(1, min(level + 2, 6))
+    level = max(1, min(level, 6))
     children = _cardkit_children(el) or []
     inner = "".join(_cardkit_render_inline(c) for c in children).strip()
     return ("#" * level) + " " + inner if inner else ""
