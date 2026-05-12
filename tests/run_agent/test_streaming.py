@@ -273,6 +273,79 @@ class TestStreamingAccumulator:
         assert len(response.choices[0].message.tool_calls) == 1
 
 
+class TestStreamingResourceCleanup:
+    """Regression coverage for local-proxy streams that can otherwise leave
+    unread CLOSE-WAIT sockets behind."""
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_chat_completion_stream_is_closed_after_success(self, mock_close, mock_create):
+        """The OpenAI SDK stream object should be explicitly closed even when
+        iteration appears to complete normally.
+        """
+        from run_agent import AIAgent
+
+        class _ClosableStream:
+            def __init__(self):
+                self.closed = False
+                self.response = SimpleNamespace(headers={})
+
+            def __iter__(self):
+                return iter([
+                    _make_stream_chunk(content="done", finish_reason="stop"),
+                ])
+
+            def close(self):
+                self.closed = True
+
+        stream = _ClosableStream()
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = stream
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert response.choices[0].message.content == "done"
+        assert stream.closed is True
+
+    def test_local_stream_stale_timeout_is_finite_by_default(self, monkeypatch):
+        """Loopback OpenAI-compatible proxies such as LiteLLM must not disable
+        stale-stream cleanup; otherwise a closed response can hang forever in
+        CLOSE-WAIT.
+        """
+        from run_agent import AIAgent
+
+        monkeypatch.delenv("HERMES_STREAM_STALE_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_DISABLE_LOCAL_STREAM_STALE_DETECTOR", raising=False)
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="http://127.0.0.1:4000/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+
+        timeout = agent._compute_stream_stale_timeout([
+            {"role": "user", "content": "hello"},
+        ])
+
+        assert timeout == 180.0
+
+
 # ── Test: Streaming Callbacks ────────────────────────────────────────────
 
 
@@ -1504,4 +1577,3 @@ class TestCopilotACPStreamingDecision:
             _use_streaming = False
 
         assert _use_streaming is True
-

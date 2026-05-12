@@ -2947,6 +2947,49 @@ class AIAgent:
             return max(stale_base, 450.0)
         return stale_base
 
+    def _resolved_stream_stale_timeout_base(self) -> tuple[float, bool]:
+        """Resolve the base streaming stale timeout.
+
+        Returns ``(timeout_seconds, uses_implicit_default)`` so local endpoint
+        compatibility can distinguish "user explicitly configured this" from
+        the built-in default.
+        """
+        env_timeout = os.getenv("HERMES_STREAM_STALE_TIMEOUT")
+        if env_timeout is not None:
+            return float(env_timeout), False
+        return 180.0, True
+
+    def _compute_stream_stale_timeout(self, messages: list[dict[str, Any]]) -> float:
+        """Compute the effective stale timeout for streamed chat responses.
+
+        Historically Hermes disabled this detector for every loopback/private
+        base URL to avoid killing slow local model prefill.  That also covered
+        local OpenAI-compatible proxies such as LiteLLM; if the proxy closed a
+        streamed response while the SDK still had unread bytes, the worker could
+        remain blocked forever with a CLOSE-WAIT socket.  Keep the detector
+        finite by default, but preserve an explicit emergency opt-out for users
+        running unusually slow local inference.
+        """
+        stale_base, uses_implicit_default = self._resolved_stream_stale_timeout_base()
+        est_tokens = sum(len(str(v)) for v in messages) // 4
+        if est_tokens > 100_000:
+            stale_timeout = max(stale_base, 300.0)
+        elif est_tokens > 50_000:
+            stale_timeout = max(stale_base, 240.0)
+        else:
+            stale_timeout = stale_base
+
+        base_url = getattr(self, "_base_url", None) or self.base_url or ""
+        if (
+            uses_implicit_default
+            and base_url
+            and is_local_endpoint(base_url)
+            and env_var_enabled("HERMES_DISABLE_LOCAL_STREAM_STALE_DETECTOR")
+        ):
+            return float("inf")
+
+        return stale_timeout
+
     def _is_openrouter_url(self) -> bool:
         """Return True when the base URL targets OpenRouter."""
         return base_url_host_matches(self._base_url_lower, "openrouter.ai")
@@ -7133,215 +7176,227 @@ class AIAgent:
             # attempt's start, not a previous attempt's last chunk.
             last_chunk_time["t"] = time.time()
             self._touch_activity("waiting for provider response (streaming)")
-            stream = request_client_holder["client"].chat.completions.create(**stream_kwargs)
+            stream = None
+            try:
+                stream = request_client_holder["client"].chat.completions.create(**stream_kwargs)
 
-            # Capture rate limit headers from the initial HTTP response.
-            # The OpenAI SDK Stream object exposes the underlying httpx
-            # response via .response before any chunks are consumed.
-            self._capture_rate_limits(getattr(stream, "response", None))
+                # Capture rate limit headers from the initial HTTP response.
+                # The OpenAI SDK Stream object exposes the underlying httpx
+                # response via .response before any chunks are consumed.
+                self._capture_rate_limits(getattr(stream, "response", None))
 
-            # Log OpenRouter response cache status when present.
-            self._check_openrouter_cache_status(getattr(stream, "response", None))
+                # Log OpenRouter response cache status when present.
+                self._check_openrouter_cache_status(getattr(stream, "response", None))
 
-            content_parts: list = []
-            tool_calls_acc: dict = {}
-            tool_gen_notified: set = set()
-            # Ollama-compatible endpoints reuse index 0 for every tool call
-            # in a parallel batch, distinguishing them only by id.  Track
-            # the last seen id per raw index so we can detect a new tool
-            # call starting at the same index and redirect it to a fresh slot.
-            _last_id_at_idx: dict = {}      # raw_index -> last seen non-empty id
-            _active_slot_by_idx: dict = {}  # raw_index -> current slot in tool_calls_acc
-            finish_reason = None
-            model_name = None
-            role = "assistant"
-            reasoning_parts: list = []
-            usage_obj = None
-            for chunk in stream:
-                last_chunk_time["t"] = time.time()
-                self._touch_activity("receiving stream response")
+                content_parts: list = []
+                tool_calls_acc: dict = {}
+                tool_gen_notified: set = set()
+                # Ollama-compatible endpoints reuse index 0 for every tool call
+                # in a parallel batch, distinguishing them only by id.  Track
+                # the last seen id per raw index so we can detect a new tool
+                # call starting at the same index and redirect it to a fresh slot.
+                _last_id_at_idx: dict = {}      # raw_index -> last seen non-empty id
+                _active_slot_by_idx: dict = {}  # raw_index -> current slot in tool_calls_acc
+                finish_reason = None
+                model_name = None
+                role = "assistant"
+                reasoning_parts: list = []
+                usage_obj = None
+                for chunk in stream:
+                    last_chunk_time["t"] = time.time()
+                    self._touch_activity("receiving stream response")
 
-                if self._interrupt_requested:
-                    break
+                    if self._interrupt_requested:
+                        break
 
-                if not chunk.choices:
+                    if not chunk.choices:
+                        if hasattr(chunk, "model") and chunk.model:
+                            model_name = chunk.model
+                        # Usage comes in the final chunk with empty choices
+                        if hasattr(chunk, "usage") and chunk.usage:
+                            usage_obj = chunk.usage
+                        continue
+
+                    delta = chunk.choices[0].delta
                     if hasattr(chunk, "model") and chunk.model:
                         model_name = chunk.model
-                    # Usage comes in the final chunk with empty choices
+
+                    # Accumulate reasoning content
+                    reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                    if reasoning_text:
+                        reasoning_parts.append(reasoning_text)
+                        _fire_first_delta()
+                        self._fire_reasoning_delta(reasoning_text)
+
+                    # Accumulate text content — fire callback only when no tool calls
+                    if delta and delta.content:
+                        content_parts.append(delta.content)
+                        if not tool_calls_acc:
+                            _fire_first_delta()
+                            self._fire_stream_delta(delta.content)
+                            deltas_were_sent["yes"] = True
+                        else:
+                            # Tool calls suppress regular content streaming (avoids
+                            # displaying chatty "I'll use the tool..." text alongside
+                            # tool calls).  But reasoning tags embedded in suppressed
+                            # content should still reach the display — otherwise the
+                            # reasoning box only appears as a post-response fallback,
+                            # rendering it confusingly after the already-streamed
+                            # response.  Route suppressed content through the stream
+                            # delta callback so its tag extraction can fire the
+                            # reasoning display.  Non-reasoning text is harmlessly
+                            # suppressed by the CLI's _stream_delta when the stream
+                            # box is already closed (tool boundary flush).
+                            if self.stream_delta_callback:
+                                try:
+                                    self.stream_delta_callback(delta.content)
+                                    self._record_streamed_assistant_text(delta.content)
+                                except Exception:
+                                    pass
+
+                    # Accumulate tool call deltas — notify display on first name
+                    if delta and delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            raw_idx = tc_delta.index if tc_delta.index is not None else 0
+                            delta_id = tc_delta.id or ""
+
+                            # Ollama fix: detect a new tool call reusing the same
+                            # raw index (different id) and redirect to a fresh slot.
+                            if raw_idx not in _active_slot_by_idx:
+                                _active_slot_by_idx[raw_idx] = raw_idx
+                            if (
+                                delta_id
+                                and raw_idx in _last_id_at_idx
+                                and delta_id != _last_id_at_idx[raw_idx]
+                            ):
+                                new_slot = max(tool_calls_acc, default=-1) + 1
+                                _active_slot_by_idx[raw_idx] = new_slot
+                            if delta_id:
+                                _last_id_at_idx[raw_idx] = delta_id
+                            idx = _active_slot_by_idx[raw_idx]
+
+                            if idx not in tool_calls_acc:
+                                tool_calls_acc[idx] = {
+                                    "id": tc_delta.id or "",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                    "extra_content": None,
+                                }
+                            entry = tool_calls_acc[idx]
+                            if tc_delta.id:
+                                entry["id"] = tc_delta.id
+                            if tc_delta.function:
+                                if tc_delta.function.name:
+                                    # Use assignment, not +=.  Function names are
+                                    # atomic identifiers delivered complete in the
+                                    # first chunk (OpenAI spec).  Some providers
+                                    # (MiniMax M2.7 via NVIDIA NIM) resend the full
+                                    # name in every chunk; concatenation would
+                                    # produce "read_fileread_file".  Assignment
+                                    # (matching the OpenAI Node SDK / LiteLLM /
+                                    # Vercel AI patterns) is immune to this.
+                                    entry["function"]["name"] = tc_delta.function.name
+                                if tc_delta.function.arguments:
+                                    entry["function"]["arguments"] += tc_delta.function.arguments
+                            extra = getattr(tc_delta, "extra_content", None)
+                            if extra is None and hasattr(tc_delta, "model_extra"):
+                                extra = (tc_delta.model_extra or {}).get("extra_content")
+                            if extra is not None:
+                                if hasattr(extra, "model_dump"):
+                                    extra = extra.model_dump()
+                                entry["extra_content"] = extra
+                            # Fire once per tool when the full name is available
+                            name = entry["function"]["name"]
+                            if name and idx not in tool_gen_notified:
+                                tool_gen_notified.add(idx)
+                                _fire_first_delta()
+                                self._fire_tool_gen_started(name)
+                                # Record the partial tool-call name so the outer
+                                # stub-builder can surface a user-visible warning
+                                # if streaming dies before this tool's arguments
+                                # are fully delivered.  Without this, a stall
+                                # during tool-call JSON generation lets the stub
+                                # at line ~6107 return `tool_calls=None`, silently
+                                # discarding the attempted action.
+                                result["partial_tool_names"].append(name)
+
+                    if chunk.choices[0].finish_reason:
+                        finish_reason = chunk.choices[0].finish_reason
+
+                    # Usage in the final chunk
                     if hasattr(chunk, "usage") and chunk.usage:
                         usage_obj = chunk.usage
-                    continue
 
-                delta = chunk.choices[0].delta
-                if hasattr(chunk, "model") and chunk.model:
-                    model_name = chunk.model
-
-                # Accumulate reasoning content
-                reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
-                if reasoning_text:
-                    reasoning_parts.append(reasoning_text)
-                    _fire_first_delta()
-                    self._fire_reasoning_delta(reasoning_text)
-
-                # Accumulate text content — fire callback only when no tool calls
-                if delta and delta.content:
-                    content_parts.append(delta.content)
-                    if not tool_calls_acc:
-                        _fire_first_delta()
-                        self._fire_stream_delta(delta.content)
-                        deltas_were_sent["yes"] = True
-                    else:
-                        # Tool calls suppress regular content streaming (avoids
-                        # displaying chatty "I'll use the tool..." text alongside
-                        # tool calls).  But reasoning tags embedded in suppressed
-                        # content should still reach the display — otherwise the
-                        # reasoning box only appears as a post-response fallback,
-                        # rendering it confusingly after the already-streamed
-                        # response.  Route suppressed content through the stream
-                        # delta callback so its tag extraction can fire the
-                        # reasoning display.  Non-reasoning text is harmlessly
-                        # suppressed by the CLI's _stream_delta when the stream
-                        # box is already closed (tool boundary flush).
-                        if self.stream_delta_callback:
+                # Build mock response matching non-streaming shape
+                full_content = "".join(content_parts) or None
+                mock_tool_calls = None
+                has_truncated_tool_args = False
+                if tool_calls_acc:
+                    mock_tool_calls = []
+                    for idx in sorted(tool_calls_acc):
+                        tc = tool_calls_acc[idx]
+                        arguments = tc["function"]["arguments"]
+                        tool_name = tc["function"]["name"] or "?"
+                        if arguments and arguments.strip():
                             try:
-                                self.stream_delta_callback(delta.content)
-                                self._record_streamed_assistant_text(delta.content)
-                            except Exception:
-                                pass
+                                json.loads(arguments)
+                            except json.JSONDecodeError:
+                                # Attempt repair before flagging as truncated.
+                                # Models like GLM-5.1 via Ollama produce trailing
+                                # commas, unclosed brackets, Python None, etc.
+                                # Without repair, these hit the truncation handler
+                                # and kill the session.  _repair_tool_call_arguments
+                                # returns "{}" for unrepairable args, which is far
+                                # better than a crashed session.
+                                repaired = _repair_tool_call_arguments(arguments, tool_name)
+                                if repaired != "{}":
+                                    # Successfully repaired — use the fixed args
+                                    arguments = repaired
+                                else:
+                                    # Unrepairable — flag for truncation handling
+                                    has_truncated_tool_args = True
+                        mock_tool_calls.append(SimpleNamespace(
+                            id=tc["id"],
+                            type=tc["type"],
+                            extra_content=tc.get("extra_content"),
+                            function=SimpleNamespace(
+                                name=tc["function"]["name"],
+                                arguments=arguments,
+                            ),
+                        ))
 
-                # Accumulate tool call deltas — notify display on first name
-                if delta and delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        raw_idx = tc_delta.index if tc_delta.index is not None else 0
-                        delta_id = tc_delta.id or ""
+                effective_finish_reason = finish_reason or "stop"
+                if has_truncated_tool_args:
+                    effective_finish_reason = "length"
 
-                        # Ollama fix: detect a new tool call reusing the same
-                        # raw index (different id) and redirect to a fresh slot.
-                        if raw_idx not in _active_slot_by_idx:
-                            _active_slot_by_idx[raw_idx] = raw_idx
-                        if (
-                            delta_id
-                            and raw_idx in _last_id_at_idx
-                            and delta_id != _last_id_at_idx[raw_idx]
-                        ):
-                            new_slot = max(tool_calls_acc, default=-1) + 1
-                            _active_slot_by_idx[raw_idx] = new_slot
-                        if delta_id:
-                            _last_id_at_idx[raw_idx] = delta_id
-                        idx = _active_slot_by_idx[raw_idx]
-
-                        if idx not in tool_calls_acc:
-                            tool_calls_acc[idx] = {
-                                "id": tc_delta.id or "",
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                                "extra_content": None,
-                            }
-                        entry = tool_calls_acc[idx]
-                        if tc_delta.id:
-                            entry["id"] = tc_delta.id
-                        if tc_delta.function:
-                            if tc_delta.function.name:
-                                # Use assignment, not +=.  Function names are
-                                # atomic identifiers delivered complete in the
-                                # first chunk (OpenAI spec).  Some providers
-                                # (MiniMax M2.7 via NVIDIA NIM) resend the full
-                                # name in every chunk; concatenation would
-                                # produce "read_fileread_file".  Assignment
-                                # (matching the OpenAI Node SDK / LiteLLM /
-                                # Vercel AI patterns) is immune to this.
-                                entry["function"]["name"] = tc_delta.function.name
-                            if tc_delta.function.arguments:
-                                entry["function"]["arguments"] += tc_delta.function.arguments
-                        extra = getattr(tc_delta, "extra_content", None)
-                        if extra is None and hasattr(tc_delta, "model_extra"):
-                            extra = (tc_delta.model_extra or {}).get("extra_content")
-                        if extra is not None:
-                            if hasattr(extra, "model_dump"):
-                                extra = extra.model_dump()
-                            entry["extra_content"] = extra
-                        # Fire once per tool when the full name is available
-                        name = entry["function"]["name"]
-                        if name and idx not in tool_gen_notified:
-                            tool_gen_notified.add(idx)
-                            _fire_first_delta()
-                            self._fire_tool_gen_started(name)
-                            # Record the partial tool-call name so the outer
-                            # stub-builder can surface a user-visible warning
-                            # if streaming dies before this tool's arguments
-                            # are fully delivered.  Without this, a stall
-                            # during tool-call JSON generation lets the stub
-                            # at line ~6107 return `tool_calls=None`, silently
-                            # discarding the attempted action.
-                            result["partial_tool_names"].append(name)
-
-                if chunk.choices[0].finish_reason:
-                    finish_reason = chunk.choices[0].finish_reason
-
-                # Usage in the final chunk
-                if hasattr(chunk, "usage") and chunk.usage:
-                    usage_obj = chunk.usage
-
-            # Build mock response matching non-streaming shape
-            full_content = "".join(content_parts) or None
-            mock_tool_calls = None
-            has_truncated_tool_args = False
-            if tool_calls_acc:
-                mock_tool_calls = []
-                for idx in sorted(tool_calls_acc):
-                    tc = tool_calls_acc[idx]
-                    arguments = tc["function"]["arguments"]
-                    tool_name = tc["function"]["name"] or "?"
-                    if arguments and arguments.strip():
-                        try:
-                            json.loads(arguments)
-                        except json.JSONDecodeError:
-                            # Attempt repair before flagging as truncated.
-                            # Models like GLM-5.1 via Ollama produce trailing
-                            # commas, unclosed brackets, Python None, etc.
-                            # Without repair, these hit the truncation handler
-                            # and kill the session.  _repair_tool_call_arguments
-                            # returns "{}" for unrepairable args, which is far
-                            # better than a crashed session.
-                            repaired = _repair_tool_call_arguments(arguments, tool_name)
-                            if repaired != "{}":
-                                # Successfully repaired — use the fixed args
-                                arguments = repaired
-                            else:
-                                # Unrepairable — flag for truncation handling
-                                has_truncated_tool_args = True
-                    mock_tool_calls.append(SimpleNamespace(
-                        id=tc["id"],
-                        type=tc["type"],
-                        extra_content=tc.get("extra_content"),
-                        function=SimpleNamespace(
-                            name=tc["function"]["name"],
-                            arguments=arguments,
-                        ),
-                    ))
-
-            effective_finish_reason = finish_reason or "stop"
-            if has_truncated_tool_args:
-                effective_finish_reason = "length"
-
-            full_reasoning = "".join(reasoning_parts) or None
-            mock_message = SimpleNamespace(
-                role=role,
-                content=full_content,
-                tool_calls=mock_tool_calls,
-                reasoning_content=full_reasoning,
-            )
-            mock_choice = SimpleNamespace(
-                index=0,
-                message=mock_message,
-                finish_reason=effective_finish_reason,
-            )
-            return SimpleNamespace(
-                id="stream-" + str(uuid.uuid4()),
-                model=model_name,
-                choices=[mock_choice],
-                usage=usage_obj,
-            )
+                full_reasoning = "".join(reasoning_parts) or None
+                mock_message = SimpleNamespace(
+                    role=role,
+                    content=full_content,
+                    tool_calls=mock_tool_calls,
+                    reasoning_content=full_reasoning,
+                )
+                mock_choice = SimpleNamespace(
+                    index=0,
+                    message=mock_message,
+                    finish_reason=effective_finish_reason,
+                )
+                return SimpleNamespace(
+                    id="stream-" + str(uuid.uuid4()),
+                    model=model_name,
+                    choices=[mock_choice],
+                    usage=usage_obj,
+                )
+            finally:
+                close_fn = getattr(stream, "close", None)
+                if callable(close_fn):
+                    try:
+                        close_fn()
+                    except Exception as exc:
+                        logger.debug(
+                            "OpenAI chat completion stream close failed: %s",
+                            exc,
+                        )
 
         def _call_anthropic():
             """Stream an Anthropic Messages API response.
@@ -7663,26 +7718,21 @@ class AIAgent:
                 if request_client is not None:
                     self._close_request_openai_client(request_client, reason="stream_request_complete")
 
-        _stream_stale_timeout_base = float(os.getenv("HERMES_STREAM_STALE_TIMEOUT", 180.0))
-        # Local providers (Ollama, oMLX, llama-cpp) can take 300+ seconds
-        # for prefill on large contexts.  Disable the stale detector unless
-        # the user explicitly set HERMES_STREAM_STALE_TIMEOUT.
-        if _stream_stale_timeout_base == 180.0 and self.base_url and is_local_endpoint(self.base_url):
-            _stream_stale_timeout = float("inf")
-            logger.debug("Local provider detected (%s) — stale stream timeout disabled", self.base_url)
-        else:
-            # Scale the stale timeout for large contexts: slow models (like Opus)
-            # can legitimately think for minutes before producing the first token
-            # when the context is large.  Without this, the stale detector kills
-            # healthy connections during the model's thinking phase, producing
-            # spurious RemoteProtocolError ("peer closed connection").
-            _est_tokens = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
-            if _est_tokens > 100_000:
-                _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
-            elif _est_tokens > 50_000:
-                _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
+        _stream_stale_timeout = self._compute_stream_stale_timeout(
+            api_kwargs.get("messages", [])
+        )
+        if self.base_url and is_local_endpoint(self.base_url):
+            if _stream_stale_timeout == float("inf"):
+                logger.debug(
+                    "Local provider detected (%s) — stale stream timeout disabled by env override",
+                    self.base_url,
+                )
             else:
-                _stream_stale_timeout = _stream_stale_timeout_base
+                logger.debug(
+                    "Local provider/proxy detected (%s) — stale stream timeout %.0fs",
+                    self.base_url,
+                    _stream_stale_timeout,
+                )
 
         t = threading.Thread(target=_call, daemon=True)
         t.start()
