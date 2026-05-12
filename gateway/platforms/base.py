@@ -917,6 +917,12 @@ class MessageEvent:
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
+    # Set by a platform adapter after it has already applied platform-specific
+    # admission control (for example, Feishu per-group ACLs).  This bypasses
+    # only the gateway's generic user allowlist gate; it is deliberately
+    # separate from ``internal`` because the message is still user-originated.
+    platform_auth_passed: bool = False
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
     

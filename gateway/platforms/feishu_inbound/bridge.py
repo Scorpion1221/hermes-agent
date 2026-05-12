@@ -238,6 +238,7 @@ def build_message_event(
     auto_skill: Optional[str | list[str]] = None,
     channel_prompt: Optional[str] = None,
     internal: bool = False,
+    platform_auth_passed: bool = False,
     timestamp: Optional[datetime] = None,
 ) -> MessageEvent:
     reply = reply_context or FeishuReplyContextData()
@@ -258,6 +259,7 @@ def build_message_event(
         auto_skill=auto_skill,
         channel_prompt=channel_prompt,
         internal=internal,
+        platform_auth_passed=platform_auth_passed,
         timestamp=timestamp or datetime.now(),
     )
 
@@ -332,6 +334,7 @@ def build_feishu_message_event(
     auto_skill: Optional[str | list[str]] = None,
     channel_prompt: Optional[str] = None,
     internal: bool = False,
+    platform_auth_passed: bool = False,
     timestamp: Optional[datetime] = None,
 ) -> MessageEvent:
     return build_message_event(
@@ -343,6 +346,7 @@ def build_feishu_message_event(
         auto_skill=auto_skill,
         channel_prompt=channel_prompt,
         internal=internal,
+        platform_auth_passed=platform_auth_passed,
         timestamp=timestamp,
     )
 

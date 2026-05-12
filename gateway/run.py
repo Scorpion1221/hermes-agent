@@ -4993,7 +4993,10 @@ class GatewayRunner:
             # flow with a None user_id.
             logger.debug("Ignoring message with no user_id from %s", source.platform.value)
             return None
-        elif not self._is_user_authorized(source):
+        elif (
+            not bool(getattr(event, "platform_auth_passed", False))
+            and not self._is_user_authorized(source)
+        ):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             # In DMs: offer pairing code. In groups: silently ignore.
             if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
