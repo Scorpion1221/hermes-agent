@@ -16,37 +16,6 @@ _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,}).*$")
 _MARKDOWN_ATX_HEADING_RE = re.compile(
     r"^(?P<indent>[ ]{0,3})(?P<marks>#{1,6})(?P<rest>(?:[ \t]+.*)?)$"
 )
-# Inline code spans: prefer multi-backtick delimiters over single, and disallow
-# the same delimiter sequence inside the body. We deliberately do NOT match
-# unbalanced backticks so e.g. ``"the user typed `code"`` stays intact.
-_INLINE_CODE_RE = re.compile(r"(?P<delim>`+)(?P<body>(?:(?!(?P=delim))[\s\S])+?)(?P=delim)")
-
-
-def _escape_inline_code_html(text: str) -> str:
-    """Escape ``<`` / ``>`` inside Markdown inline code spans.
-
-    Feishu's CardKit renderer parses the raw card-text payload as HTML before
-    Markdown, so a literal ``<tag>`` sequence inside a single-backtick inline
-    code span (e.g. ``\\`<relevant-memories>\\```) gets stripped as an unknown
-    HTML element — leaving the user with two empty backticks. Pre-escaping the
-    angle brackets to ``&lt;``/``&gt;`` keeps the inline code visually intact
-    and renders identically inside Feishu's Markdown widget.
-
-    We only touch the *content* inside the span, never the surrounding
-    backticks, and we leave any span without ``<`` / ``>`` untouched. Callers
-    must invoke this only on lines outside fenced code blocks; fenced blocks
-    intentionally preserve verbatim source.
-    """
-
-    def _sub(match: re.Match[str]) -> str:
-        body = match.group("body")
-        if "<" not in body and ">" not in body:
-            return match.group(0)
-        escaped = body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        delim = match.group("delim")
-        return f"{delim}{escaped}{delim}"
-
-    return _INLINE_CODE_RE.sub(_sub, text)
 
 
 def _ns(**kwargs: Any) -> SimpleNamespace:
@@ -84,21 +53,11 @@ def render_markdown_for_card(content: str) -> str:
     headings two levels lower (# -> ###, ## -> ####, capped at ######).
     Fenced code blocks are left untouched.
 
-    We additionally pre-escape ``<`` / ``>`` inside inline code spans on
-    non-fenced lines, because Feishu's card text widget runs an HTML pass
-    before Markdown — without the escape, ``\\`<tag>\\``` payloads get
-    stripped as unknown HTML elements and the user sees an empty pair of
-    backticks. See :func:`_escape_inline_code_html`.
-
     Keep this as a render-only boundary: callers should pass raw assistant
     text/session state and must not store this returned card-specific Markdown
     back into conversation or streaming state.
     """
-    if not content:
-        return content
-    needs_heading_pass = "#" in content
-    needs_inline_pass = "`" in content and ("<" in content or ">" in content)
-    if not needs_heading_pass and not needs_inline_pass:
+    if not content or "#" not in content:
         return content
 
     lines: list[str] = []
@@ -130,11 +89,10 @@ def render_markdown_for_card(content: str) -> str:
                 f"{'#' * new_level}"
                 f"{heading_match.group('rest')}"
             )
+            lines.append(line + ending)
+            continue
 
-        if needs_inline_pass and "`" in line and ("<" in line or ">" in line):
-            line = _escape_inline_code_html(line)
-
-        lines.append(line + ending)
+        lines.append(raw_line)
 
     return "".join(lines)
 
@@ -237,6 +195,16 @@ async def stream_card_element(
     # write this card-specific Markdown back to CardKitState or conversation
     # state; doing so would make a later final render downshift headings again.
     content = render_markdown_for_card(content)
+    # DEBUG: log the exact bytes shipped to CardKit so we can correlate
+    # rendering bugs (e.g. inline code spans being swallowed) against the
+    # raw markdown the server actually sees. Enable with `--log-level DEBUG`
+    # or by setting LOG_LEVEL=DEBUG. Truncate at 4 KB to keep logs sane.
+    if logger.isEnabledFor(logging.DEBUG):
+        preview = content if len(content) <= 4096 else content[:4096] + f"...[+{len(content) - 4096} bytes]"
+        logger.debug(
+            "[CardKit] stream_card_element card_id=%s element_id=%s seq=%d bytes=%d content=%r",
+            card_id, element_id, sequence, len(content), preview,
+        )
     try:
         from lark_oapi.api.cardkit.v1.model.content_card_element_request import ContentCardElementRequest
         from lark_oapi.api.cardkit.v1.model.content_card_element_request_body import ContentCardElementRequestBody
@@ -262,6 +230,25 @@ async def stream_card_element(
 async def update_card(
     client: Any, *, card_id: str, card_body: dict, sequence: int,
 ) -> bool:
+    # DEBUG: log the final card body so we can post-mortem rendering bugs
+    # without needing to re-fetch raw_card_content from the message-get API.
+    if logger.isEnabledFor(logging.DEBUG):
+        try:
+            elements = card_body.get("body", {}).get("elements", [])
+            md_contents = [
+                e.get("content") for e in elements
+                if isinstance(e, dict) and e.get("tag") == "markdown"
+            ]
+            for idx, md in enumerate(md_contents):
+                if md is None:
+                    continue
+                preview = md if len(md) <= 4096 else md[:4096] + f"...[+{len(md) - 4096} bytes]"
+                logger.debug(
+                    "[CardKit] update_card card_id=%s seq=%d elem=%d bytes=%d markdown=%r",
+                    card_id, sequence, idx, len(md), preview,
+                )
+        except Exception:
+            logger.debug("[CardKit] update_card debug log failed", exc_info=True)
     try:
         from lark_oapi.api.cardkit.v1.model.update_card_request import UpdateCardRequest
         from lark_oapi.api.cardkit.v1.model.update_card_request_body import UpdateCardRequestBody

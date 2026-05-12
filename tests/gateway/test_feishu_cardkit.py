@@ -54,61 +54,6 @@ def test_card_heading_downshift_ignores_fenced_code_blocks():
     assert payload["body"]["elements"][0]["content"] == "```md\n# code\n```\n### Real"
 
 
-def test_render_markdown_for_card_escapes_angle_brackets_in_inline_code():
-    """Single-backtick inline code spans must escape ``<``/``>`` so Feishu's
-    pre-Markdown HTML pass doesn't strip them as unknown tags. See the bug
-    where ``\\`<relevant-memories>\\``` rendered as two empty backticks."""
-    rendered = render_markdown_for_card("see `<relevant-memories>` for context")
-    assert rendered == "see `&lt;relevant-memories&gt;` for context"
-
-
-def test_render_markdown_for_card_escapes_inline_code_with_attributes():
-    rendered = render_markdown_for_card('use `<div class="x">` here')
-    assert rendered == 'use `&lt;div class=&quot;x&quot;&gt;` here'.replace("&quot;", '"')
-
-
-def test_render_markdown_for_card_leaves_plain_inline_code_untouched():
-    rendered = render_markdown_for_card("call `mempalace_search` first")
-    assert rendered == "call `mempalace_search` first"
-
-
-def test_render_markdown_for_card_leaves_fenced_code_block_untouched():
-    rendered = render_markdown_for_card("```\n<tag>\n```")
-    assert rendered == "```\n<tag>\n```"
-
-
-def test_render_markdown_for_card_escapes_multiple_inline_codes_per_line():
-    rendered = render_markdown_for_card("`<a>` and `<b>` and `safe`")
-    assert rendered == "`&lt;a&gt;` and `&lt;b&gt;` and `safe`"
-
-
-def test_render_markdown_for_card_escapes_double_backtick_spans():
-    """``...`` (double-backtick) spans containing single backticks should
-    still get their angle brackets escaped."""
-    rendered = render_markdown_for_card("see ``<x>`` for x")
-    assert rendered == "see ``&lt;x&gt;`` for x"
-
-
-def test_render_markdown_for_card_handles_inline_code_in_table():
-    """Inline code inside a Markdown table cell is the most common trigger in
-    practice — explicitly cover it."""
-    rendered = render_markdown_for_card("| col | `<tag>` |")
-    assert rendered == "| col | `&lt;tag&gt;` |"
-
-
-def test_render_markdown_for_card_escapes_existing_amp_in_inline_code():
-    """Idempotency: re-running the renderer on already-escaped text must not
-    double-encode literal ``&`` characters that were already in the source."""
-    rendered = render_markdown_for_card("`a & b <c>`")
-    assert rendered == "`a &amp; b &lt;c&gt;`"
-
-
-def test_render_markdown_for_card_combines_heading_and_inline_escape():
-    """Both passes should compose: heading downshift + inline-code escape."""
-    rendered = render_markdown_for_card("## See `<tag>`")
-    assert rendered == "#### See `&lt;tag&gt;`"
-
-
 def test_build_card_id_message_content_format():
     content = build_card_id_message_content("card_abc123")
     parsed = json.loads(content)
