@@ -4622,6 +4622,37 @@ class GatewayRunner:
             return YuanbaoAdapter(config)
 
         return None
+
+    @staticmethod
+    def _source_auth_user_ids(source: SessionSource) -> List[str]:
+        """Return all platform IDs that should be considered for auth.
+
+        ``source.user_id`` remains the canonical session/user identifier, but
+        some platforms expose multiple stable IDs for the same person.  Feishu,
+        for example, can start populating tenant-scoped ``user_id`` after a
+        scope change while existing allowlists/pairing approvals still contain
+        app-scoped ``open_id``.  Adapters can populate ``auth_user_ids`` with
+        those aliases so the generic gateway gate stays backward compatible.
+        """
+        values: List[Any] = [getattr(source, "user_id", None)]
+        aliases = getattr(source, "auth_user_ids", None) or []
+        if isinstance(aliases, str):
+            values.append(aliases)
+        else:
+            try:
+                values.extend(list(aliases))
+            except TypeError:
+                pass
+
+        result: List[str] = []
+        seen: set[str] = set()
+        for value in values:
+            text = str(value or "").strip()
+            if text and text not in seen:
+                seen.add(text)
+                result.append(text)
+        return result
+
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
         Check if a user is authorized to use the bot.
@@ -4644,6 +4675,7 @@ class GatewayRunner:
         user_id = source.user_id
         if not user_id:
             return False
+        source_auth_ids = self._source_auth_user_ids(source)
 
         platform_env_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",
@@ -4733,8 +4765,9 @@ class GatewayRunner:
 
         # Check pairing store (always checked, regardless of allowlists)
         platform_name = source.platform.value if source.platform else ""
-        if self.pairing_store.is_approved(platform_name, user_id):
-            return True
+        for auth_id in source_auth_ids:
+            if self.pairing_store.is_approved(platform_name, auth_id):
+                return True
 
         # Check platform-specific and global allowlists
         platform_allowlist = os.getenv(platform_env_map.get(source.platform, ""), "").strip()
@@ -4806,9 +4839,10 @@ class GatewayRunner:
         if "*" in allowed_ids:
             return True
 
-        check_ids = {user_id}
-        if "@" in user_id:
-            check_ids.add(user_id.split("@")[0])
+        check_ids = set(source_auth_ids)
+        for auth_id in list(check_ids):
+            if "@" in auth_id:
+                check_ids.add(auth_id.split("@")[0])
 
         # WhatsApp: resolve phone↔LID aliases from bridge session mapping files
         if source.platform == Platform.WHATSAPP:

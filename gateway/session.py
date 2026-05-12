@@ -16,7 +16,7 @@ import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -91,6 +91,7 @@ class SessionSource:
     guild_id: Optional[str] = None  # Discord guild / Slack workspace / Matrix server scope
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+    auth_user_ids: List[str] = field(default_factory=list)  # Alternate IDs accepted for auth/pairing
     
     @property
     def description(self) -> str:
@@ -126,6 +127,8 @@ class SessionSource:
         }
         if self.user_id_alt:
             d["user_id_alt"] = self.user_id_alt
+        if self.auth_user_ids:
+            d["auth_user_ids"] = list(self.auth_user_ids)
         if self.chat_id_alt:
             d["chat_id_alt"] = self.chat_id_alt
         if self.guild_id:
@@ -148,6 +151,11 @@ class SessionSource:
             thread_id=data.get("thread_id"),
             chat_topic=data.get("chat_topic"),
             user_id_alt=data.get("user_id_alt"),
+            auth_user_ids=[
+                str(value).strip()
+                for value in (data.get("auth_user_ids") or [])
+                if str(value or "").strip()
+            ],
             chat_id_alt=data.get("chat_id_alt"),
             guild_id=data.get("guild_id"),
             parent_chat_id=data.get("parent_chat_id"),

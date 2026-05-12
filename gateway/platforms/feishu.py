@@ -2686,6 +2686,7 @@ class FeishuAdapter(BasePlatformAdapter):
             user_name=sender_profile["user_name"],
             thread_id=None,
             user_id_alt=sender_profile["user_id_alt"],
+            auth_user_ids=sender_profile.get("auth_user_ids"),
         )
         event = MessageEvent(
             text=turn.prompt,
@@ -2893,6 +2894,7 @@ class FeishuAdapter(BasePlatformAdapter):
             user_name=sender_profile["user_name"],
             thread_id=None,
             user_id_alt=sender_profile["user_id_alt"],
+            auth_user_ids=sender_profile.get("auth_user_ids"),
         )
         synthetic_event = MessageEvent(
             text=synthetic_text,
@@ -2955,6 +2957,7 @@ class FeishuAdapter(BasePlatformAdapter):
             user_name=sender_profile["user_name"],
             thread_id=None,
             user_id_alt=sender_profile["user_id_alt"],
+            auth_user_ids=sender_profile.get("auth_user_ids"),
         )
         synthetic_event = MessageEvent(
             text=synthetic_text,
@@ -3230,6 +3233,7 @@ class FeishuAdapter(BasePlatformAdapter):
             user_name=sender_profile["user_name"],
             thread_id=thread_id,
             user_id_alt=sender_profile["user_id_alt"],
+            auth_user_ids=sender_profile.get("auth_user_ids"),
             is_bot=is_bot,
         )
         inbound_content = FeishuInboundContentBridge(
@@ -4099,6 +4103,13 @@ class FeishuAdapter(BasePlatformAdapter):
         union_id = getattr(sender_id, "union_id", None) or None
         # Prefer tenant-scoped user_id; fall back to app-scoped open_id.
         primary_id = user_id or open_id
+        auth_user_ids = tuple(
+            dict.fromkeys(
+                str(value).strip()
+                for value in (user_id, open_id, union_id)
+                if str(value or "").strip()
+            )
+        )
         # bot/v3/bots/basic_batch only accepts open_id.
         name_lookup_id = open_id if is_bot else (primary_id or union_id)
         display_name = await self._resolve_sender_name_from_api(
@@ -4108,6 +4119,7 @@ class FeishuAdapter(BasePlatformAdapter):
             "user_id": primary_id,
             "user_name": display_name,
             "user_id_alt": union_id,
+            "auth_user_ids": auth_user_ids,
         }
 
     def _get_cached_sender_name(self, sender_id: Optional[str]) -> Optional[str]:

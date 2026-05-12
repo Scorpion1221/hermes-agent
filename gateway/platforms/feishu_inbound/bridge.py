@@ -61,6 +61,7 @@ class FeishuSenderProfile:
     user_id: Optional[str]
     user_name: Optional[str]
     user_id_alt: Optional[str]
+    auth_user_ids: tuple[str, ...] = ()
 
 
 def resolve_feishu_media_message_type(media_type: str, *, default: MessageType) -> MessageType:
@@ -220,11 +221,19 @@ async def build_feishu_sender_profile(
     user_id = getattr(sender_id, "user_id", None) or None
     union_id = getattr(sender_id, "union_id", None) or None
     primary_id = open_id or user_id
+    auth_user_ids = tuple(
+        dict.fromkeys(
+            str(value).strip()
+            for value in (user_id, open_id, union_id)
+            if str(value or "").strip()
+        )
+    )
     display_name = await resolve_display_name(primary_id or union_id)
     return FeishuSenderProfile(
         user_id=primary_id,
         user_name=display_name,
         user_id_alt=union_id,
+        auth_user_ids=auth_user_ids,
     )
 
 

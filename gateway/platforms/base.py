@@ -3307,6 +3307,7 @@ class BasePlatformAdapter(ABC):
         thread_id: Optional[str] = None,
         chat_topic: Optional[str] = None,
         user_id_alt: Optional[str] = None,
+        auth_user_ids: Optional[List[str]] = None,
         chat_id_alt: Optional[str] = None,
         is_bot: bool = False,
         guild_id: Optional[str] = None,
@@ -3327,6 +3328,11 @@ class BasePlatformAdapter(ABC):
             thread_id=str(thread_id) if thread_id else None,
             chat_topic=chat_topic.strip() if chat_topic else None,
             user_id_alt=user_id_alt,
+            auth_user_ids=[
+                str(value).strip()
+                for value in (auth_user_ids or [])
+                if str(value or "").strip()
+            ],
             chat_id_alt=chat_id_alt,
             is_bot=is_bot,
             guild_id=str(guild_id) if guild_id else None,

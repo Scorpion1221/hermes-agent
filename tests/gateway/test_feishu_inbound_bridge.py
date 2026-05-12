@@ -57,6 +57,7 @@ async def test_build_feishu_sender_profile_uses_resolved_display_name_and_preser
         user_id="ou_user",
         user_name="Alice",
         user_id_alt="on_union",
+        auth_user_ids=("u_user", "ou_user", "on_union"),
     )
 
 

@@ -11,6 +11,79 @@ from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
 
+def test_feishu_allowlist_matches_open_id_alias_when_primary_id_is_tenant_id(
+    monkeypatch,
+):
+    """Legacy open_id allowlists must keep working when Feishu provides user_id."""
+    monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_legacy")
+    monkeypatch.delenv("FEISHU_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+
+    runner = GatewayRunner(GatewayConfig())
+    runner.pairing_store = SimpleNamespace(is_approved=lambda *_args: False)
+
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_dm",
+        chat_type="dm",
+        user_id="433ff9f5",
+        user_name="Alice",
+    )
+    source.auth_user_ids = ["433ff9f5", "ou_legacy"]
+
+    assert runner._is_user_authorized(source) is True
+
+
+def test_feishu_pairing_matches_open_id_alias_when_primary_id_is_tenant_id(
+    monkeypatch,
+):
+    """Existing pairing approvals keyed by open_id should survive user_id hydration."""
+    monkeypatch.delenv("FEISHU_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("FEISHU_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+
+    runner = GatewayRunner(GatewayConfig())
+    runner.pairing_store = SimpleNamespace(
+        is_approved=lambda platform, user_id: platform == "feishu" and user_id == "ou_legacy"
+    )
+
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_dm",
+        chat_type="dm",
+        user_id="433ff9f5",
+        user_name="Alice",
+    )
+    source.auth_user_ids = ["433ff9f5", "ou_legacy"]
+
+    assert runner._is_user_authorized(source) is True
+
+
+@pytest.mark.asyncio
+async def test_feishu_sender_profile_keeps_all_sender_ids_for_auth(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter
+
+    adapter = FeishuAdapter(PlatformConfig())
+    monkeypatch.setattr(
+        adapter,
+        "_resolve_sender_name_from_api",
+        AsyncMock(return_value="Alice"),
+    )
+    sender_id = SimpleNamespace(
+        open_id="ou_legacy",
+        user_id="433ff9f5",
+        union_id="on_union",
+    )
+
+    profile = await adapter._resolve_sender_profile(sender_id)
+
+    assert profile["user_id"] == "433ff9f5"
+    assert profile["user_id_alt"] == "on_union"
+    assert profile["auth_user_ids"] == ("433ff9f5", "ou_legacy", "on_union")
+
+
 @pytest.mark.asyncio
 async def test_feishu_group_event_admitted_by_platform_acl_skips_gateway_user_allowlist(
     monkeypatch,
@@ -98,6 +171,7 @@ async def test_feishu_process_inbound_group_message_marks_platform_auth_passed(
                 "user_id": "u_stranger",
                 "user_name": "stranger",
                 "user_id_alt": None,
+                "auth_user_ids": ("u_stranger", "ou_stranger"),
             }
         ),
     )
@@ -130,3 +204,4 @@ async def test_feishu_process_inbound_group_message_marks_platform_auth_passed(
 
     assert len(captured) == 1
     assert getattr(captured[0], "platform_auth_passed", False) is True
+    assert captured[0].source.auth_user_ids == ["u_stranger", "ou_stranger"]
