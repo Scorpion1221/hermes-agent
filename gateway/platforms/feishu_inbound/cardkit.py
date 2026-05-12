@@ -195,6 +195,16 @@ async def stream_card_element(
     # write this card-specific Markdown back to CardKitState or conversation
     # state; doing so would make a later final render downshift headings again.
     content = render_markdown_for_card(content)
+    # DEBUG: log the exact bytes shipped to CardKit so we can correlate
+    # rendering bugs (e.g. inline code spans being swallowed) against the
+    # raw markdown the server actually sees. Enable with `--log-level DEBUG`
+    # or by setting LOG_LEVEL=DEBUG. Truncate at 4 KB to keep logs sane.
+    if logger.isEnabledFor(logging.DEBUG):
+        preview = content if len(content) <= 4096 else content[:4096] + f"...[+{len(content) - 4096} bytes]"
+        logger.debug(
+            "[CardKit] stream_card_element card_id=%s element_id=%s seq=%d bytes=%d content=%r",
+            card_id, element_id, sequence, len(content), preview,
+        )
     try:
         from lark_oapi.api.cardkit.v1.model.content_card_element_request import ContentCardElementRequest
         from lark_oapi.api.cardkit.v1.model.content_card_element_request_body import ContentCardElementRequestBody
@@ -220,6 +230,25 @@ async def stream_card_element(
 async def update_card(
     client: Any, *, card_id: str, card_body: dict, sequence: int,
 ) -> bool:
+    # DEBUG: log the final card body so we can post-mortem rendering bugs
+    # without needing to re-fetch raw_card_content from the message-get API.
+    if logger.isEnabledFor(logging.DEBUG):
+        try:
+            elements = card_body.get("body", {}).get("elements", [])
+            md_contents = [
+                e.get("content") for e in elements
+                if isinstance(e, dict) and e.get("tag") == "markdown"
+            ]
+            for idx, md in enumerate(md_contents):
+                if md is None:
+                    continue
+                preview = md if len(md) <= 4096 else md[:4096] + f"...[+{len(md) - 4096} bytes]"
+                logger.debug(
+                    "[CardKit] update_card card_id=%s seq=%d elem=%d bytes=%d markdown=%r",
+                    card_id, sequence, idx, len(md), preview,
+                )
+        except Exception:
+            logger.debug("[CardKit] update_card debug log failed", exc_info=True)
     try:
         from lark_oapi.api.cardkit.v1.model.update_card_request import UpdateCardRequest
         from lark_oapi.api.cardkit.v1.model.update_card_request_body import UpdateCardRequestBody
