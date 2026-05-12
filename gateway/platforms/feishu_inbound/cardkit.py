@@ -16,6 +16,37 @@ _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,}).*$")
 _MARKDOWN_ATX_HEADING_RE = re.compile(
     r"^(?P<indent>[ ]{0,3})(?P<marks>#{1,6})(?P<rest>(?:[ \t]+.*)?)$"
 )
+# Inline code spans: prefer multi-backtick delimiters over single, and disallow
+# the same delimiter sequence inside the body. We deliberately do NOT match
+# unbalanced backticks so e.g. ``"the user typed `code"`` stays intact.
+_INLINE_CODE_RE = re.compile(r"(?P<delim>`+)(?P<body>(?:(?!(?P=delim))[\s\S])+?)(?P=delim)")
+
+
+def _escape_inline_code_html(text: str) -> str:
+    """Escape ``<`` / ``>`` inside Markdown inline code spans.
+
+    Feishu's CardKit renderer parses the raw card-text payload as HTML before
+    Markdown, so a literal ``<tag>`` sequence inside a single-backtick inline
+    code span (e.g. ``\\`<relevant-memories>\\```) gets stripped as an unknown
+    HTML element — leaving the user with two empty backticks. Pre-escaping the
+    angle brackets to ``&lt;``/``&gt;`` keeps the inline code visually intact
+    and renders identically inside Feishu's Markdown widget.
+
+    We only touch the *content* inside the span, never the surrounding
+    backticks, and we leave any span without ``<`` / ``>`` untouched. Callers
+    must invoke this only on lines outside fenced code blocks; fenced blocks
+    intentionally preserve verbatim source.
+    """
+
+    def _sub(match: re.Match[str]) -> str:
+        body = match.group("body")
+        if "<" not in body and ">" not in body:
+            return match.group(0)
+        escaped = body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        delim = match.group("delim")
+        return f"{delim}{escaped}{delim}"
+
+    return _INLINE_CODE_RE.sub(_sub, text)
 
 
 def _ns(**kwargs: Any) -> SimpleNamespace:
@@ -53,11 +84,21 @@ def render_markdown_for_card(content: str) -> str:
     headings two levels lower (# -> ###, ## -> ####, capped at ######).
     Fenced code blocks are left untouched.
 
+    We additionally pre-escape ``<`` / ``>`` inside inline code spans on
+    non-fenced lines, because Feishu's card text widget runs an HTML pass
+    before Markdown — without the escape, ``\\`<tag>\\``` payloads get
+    stripped as unknown HTML elements and the user sees an empty pair of
+    backticks. See :func:`_escape_inline_code_html`.
+
     Keep this as a render-only boundary: callers should pass raw assistant
     text/session state and must not store this returned card-specific Markdown
     back into conversation or streaming state.
     """
-    if not content or "#" not in content:
+    if not content:
+        return content
+    needs_heading_pass = "#" in content
+    needs_inline_pass = "`" in content and ("<" in content or ">" in content)
+    if not needs_heading_pass and not needs_inline_pass:
         return content
 
     lines: list[str] = []
@@ -89,10 +130,11 @@ def render_markdown_for_card(content: str) -> str:
                 f"{'#' * new_level}"
                 f"{heading_match.group('rest')}"
             )
-            lines.append(line + ending)
-            continue
 
-        lines.append(raw_line)
+        if needs_inline_pass and "`" in line and ("<" in line or ">" in line):
+            line = _escape_inline_code_html(line)
+
+        lines.append(line + ending)
 
     return "".join(lines)
 
