@@ -12285,17 +12285,20 @@ class GatewayRunner:
         if not adapter:
             return
         try:
+            anchor_message_id = getattr(source, "message_id", None) or None
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
+                message_id=anchor_message_id,
             )
             logger.info(
-                "Watch pattern notification — injecting for %s chat=%s thread=%s",
+                "Watch pattern notification — injecting for %s chat=%s thread=%s anchor=%s",
                 platform_name,
                 source.chat_id,
                 source.thread_id,
+                anchor_message_id or "<none>",
             )
             await adapter.handle_message(synth_event)
         except Exception as e:
@@ -12389,18 +12392,29 @@ class GatewayRunner:
                             break
                     if adapter and source.chat_id:
                         try:
+                            # Reuse the originating message id (persisted on the
+                            # session origin) as a reply anchor so streaming-card
+                            # delivery into Feishu threads can attach via reply_to
+                            # and stay inside the topic instead of falling back to
+                            # the chat root.  Without this, watcher-triggered
+                            # synth events have no message_id, which makes
+                            # `_progress_reply_to`/CardKit `reply_to` empty and the
+                            # final card pops out of the thread.
+                            anchor_message_id = getattr(source, "message_id", None) or None
                             synth_event = MessageEvent(
                                 text=synth_text,
                                 message_type=MessageType.TEXT,
                                 source=source,
                                 internal=True,
+                                message_id=anchor_message_id,
                             )
                             logger.info(
-                                "Process %s finished — injecting agent notification for session %s chat=%s thread=%s",
+                                "Process %s finished — injecting agent notification for session %s chat=%s thread=%s anchor=%s",
                                 session_id,
                                 session_key,
                                 source.chat_id,
                                 source.thread_id,
+                                anchor_message_id or "<none>",
                             )
                             await adapter.handle_message(synth_event)
                         except Exception as e:
