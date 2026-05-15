@@ -1621,7 +1621,23 @@ async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=No
         domain_name = getattr(adapter, "_domain_name", "feishu")
         domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
         adapter._client = adapter._build_lark_client(domain)
-        metadata = {"thread_id": thread_id} if thread_id else None
+        # Feishu's reply-into-topic API requires a *message anchor* — sending
+        # with only ``thread_id`` falls back to the ``create`` endpoint, which
+        # drops the message on the chat root instead of the topic.  When the
+        # gateway set a session message_id (i.e. the inbound message that
+        # triggered this agent run), use it as the anchor so the message
+        # actually lands inside the topic.
+        metadata = None
+        if thread_id:
+            metadata = {"thread_id": thread_id}
+            from gateway.session_context import get_session_env
+            session_thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "").strip()
+            anchor = get_session_env("HERMES_SESSION_MESSAGE_ID", "").strip()
+            # Only attach the anchor when we're confident the inbound message
+            # belongs to the *same* topic — otherwise the reply API would
+            # graft the new message into a foreign topic.
+            if anchor and session_thread_id and session_thread_id == str(thread_id):
+                metadata["reply_to_message_id"] = anchor
 
         last_result = None
         if message.strip():

@@ -4938,7 +4938,7 @@ class GatewayRunner:
         if config and hasattr(config, "get_notice_delivery"):
             notice_delivery = config.get_notice_delivery(source.platform)
 
-        metadata = {"thread_id": source.thread_id} if getattr(source, "thread_id", None) else None
+        metadata = self._thread_metadata_for_source(source)
         if notice_delivery == "private" and getattr(source, "user_id", None):
             try:
                 result = await adapter.send_private_notice(
@@ -8183,7 +8183,7 @@ class GatewayRunner:
                         lines.append("_(session only — use `/model <name> --global` to persist)_")
                         return "\n".join(lines)
 
-                    metadata = {"thread_id": source.thread_id} if source.thread_id else None
+                    metadata = self._thread_metadata_for_source(source)
                     result = await adapter.send_model_picker(
                         chat_id=source.chat_id,
                         providers=providers,
@@ -9397,7 +9397,7 @@ class GatewayRunner:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
             return
 
-        _thread_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+        _thread_metadata = self._thread_metadata_for_source(source)
 
         try:
             user_config = _load_gateway_config()
@@ -11253,11 +11253,23 @@ class GatewayRunner:
             return {}
 
     def _thread_metadata_for_source(self, source) -> Optional[Dict[str, Any]]:
-        """Build the metadata dict platforms need for thread-aware replies."""
+        """Build the metadata dict platforms need for thread-aware replies.
+
+        For Feishu topics the API requires a *reply anchor* — sending with
+        only ``thread_id`` falls back to the ``create`` endpoint, which
+        drops the message onto the chat root instead of the topic.  When
+        the source carries the inbound ``message_id``, attach it as
+        ``reply_to_message_id`` so adapters can use the ``reply`` endpoint
+        and the message actually lands inside the topic.
+        """
         thread_id = getattr(source, "thread_id", None)
         if thread_id is None:
             return None
-        return {"thread_id": thread_id}
+        metadata: Dict[str, Any] = {"thread_id": thread_id}
+        anchor = getattr(source, "message_id", None)
+        if anchor:
+            metadata["reply_to_message_id"] = str(anchor)
+        return metadata
 
 
     # ------------------------------------------------------------------
@@ -11975,6 +11987,7 @@ class GatewayRunner:
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            message_id=str(context.source.message_id) if context.source.message_id else "",
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -13022,7 +13035,7 @@ class GatewayRunner:
         )
 
         if source.thread_id:
-            _thread_metadata: Optional[Dict[str, Any]] = {"thread_id": source.thread_id}
+            _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source)
         else:
             _thread_metadata = None
 
