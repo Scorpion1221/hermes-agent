@@ -429,6 +429,91 @@ class TestBuildSessionContextPrompt:
         assert "**User:** Alice" in prompt
         assert "Multi-user thread" not in prompt
 
+    def test_reply_target_hint_for_group_source(self):
+        """The prompt must surface the exact send_message target string for
+        the current source. Without this, the agent has no chat_id for the
+        source in its prompt — only the chat_name — and tends to reach for
+        the only chat_id it can see (the home channel ID), which fans replies
+        out to the wrong chat in multi-deployment setups."""
+        config = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    token="fake",
+                    home_channel=HomeChannel(
+                        platform=Platform.FEISHU,
+                        chat_id="oc_home_dm_id",
+                        name="Bot Owner DM",
+                    ),
+                ),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_group_chat_id",
+            chat_name="Web小队 - 开发组",
+            chat_type="group",
+            user_name="何丽梅",
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        # Source chat_id must be present as the explicit reply target so the
+        # agent doesn't have to guess.
+        assert "**Reply Target:**" in prompt
+        assert "feishu:oc_group_chat_id" in prompt
+        # And it must explicitly warn against the bare-platform form.
+        assert "Do NOT use the bare" in prompt
+        # Home channel chat_id should still be rendered (for cron delivery),
+        # but the reply target must be a different, more prominent string.
+        assert "oc_home_dm_id" in prompt
+        # Reply Target should appear BEFORE the Home Channels block so the
+        # agent reads the right answer first.
+        assert prompt.index("Reply Target:") < prompt.index("Home Channels")
+
+    def test_reply_target_hint_includes_thread_id(self):
+        """When the source has a thread_id, the reply target string must
+        encode `platform:chat_id:thread_id`."""
+        config = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(enabled=True, token="fake"),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_group_chat_id",
+            chat_name="Web小队 - 开发组",
+            chat_type="group",
+            thread_id="omt_topic_xyz",
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "feishu:oc_group_chat_id:omt_topic_xyz" in prompt
+
+    def test_reply_target_hint_skipped_when_pii_redacted(self):
+        """Reply Target should not leak raw chat_id when PII redaction is on
+        (e.g. Telegram for screenshot-safe demos). Routing via SessionSource
+        is unchanged — only the prompt rendering is affected."""
+        config = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake"),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001234567890",
+            chat_name="Test Group",
+            chat_type="group",
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx, redact_pii=True)
+
+        # No raw chat_id in the prompt when PII-redacted
+        assert "-1001234567890" not in prompt
+        # And no Reply Target line either (would leak the same id)
+        assert "Reply Target:" not in prompt
+
 
 class TestSessionStoreRewriteTranscript:
     """Regression: /retry and /undo must persist truncated history to disk."""

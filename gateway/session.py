@@ -297,6 +297,26 @@ def build_session_context_prompt(
             desc = src.description
         lines.append(f"**Source:** {platform_name} ({desc})")
 
+        # Reply target hint — emit the exact send_message target string the
+        # agent should use when replying to *this* source.  Without this, the
+        # agent has no chat_id for the current source in its prompt (only the
+        # human-readable chat_name shows up above) and tends to reach for the
+        # only chat_id it can see — the home-channel ID rendered further down
+        # in "Home Channels".  In multi-deployment setups (e.g. bot owner's
+        # home channel is a personal DM) that fan-outs replies to the wrong
+        # chat.  Skip for LOCAL (CLI) and when the chat_id is empty / hashed.
+        if not redact_pii and src.chat_id:
+            _tgt = f"{context.source.platform.value}:{src.chat_id}"
+            if src.thread_id:
+                _tgt = f"{_tgt}:{src.thread_id}"
+            lines.append(
+                f"**Reply Target:** `{_tgt}` — use this exact string as the "
+                f"`target` arg of `send_message` when replying inside this "
+                f"conversation. Do NOT use the bare `{context.source.platform.value}` "
+                f"form (that resolves to the home channel below, which is usually "
+                f"a different chat)."
+            )
+
     # Channel topic (if available - provides context about the channel's purpose)
     if context.source.chat_topic:
         lines.append(f"**Channel Topic:** {context.source.chat_topic}")
