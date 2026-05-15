@@ -1994,3 +1994,164 @@ class TestSendSignalChunking:
         # Only the existing file made it into the RPC
         params = fake.calls[0]["payload"]["params"]
         assert len(params["attachments"]) == 1
+
+
+
+class TestSessionDefaultRouting:
+    """Regression tests for the session-default fallback that prevents
+    `target="<platform>"` from leaking into the home channel when the
+    agent is replying inside an active inbound session.
+
+    Bug history: Feishu users observed that solvely-web-e2e completion
+    cards leaked into the bot owner's DM (FEISHU_HOME_CHANNEL) instead
+    of returning to the originating group chat. Root cause: the agent
+    called `send_message(target="feishu", ...)` from inside a group
+    inbound session, and the legacy fallback path collapsed to the
+    home channel (= the bot owner's DM in that deployment).
+
+    Fix: when chat_id is unspecified AND there's an active inbound
+    session matching the requested platform, route to the session's
+    own chat_id (and thread_id). Home channel fallback now only
+    kicks in for cron / agent-initiated work with no session context.
+    """
+
+    def _run_with_session(self, monkeypatch, *, platform_env, chat_id_env, thread_id_env, target):
+        """Helper: set session vars, call send_message_tool, return parsed result + send_mock."""
+        from gateway.session_context import set_session_vars, clear_session_vars
+        # Build a config that has BOTH feishu and telegram configured so the
+        # cross-platform test can verify behaviour when target.platform !=
+        # session.platform without tripping the "not configured" error.
+        telegram_cfg = SimpleNamespace(enabled=True, token="***", extra={})
+        feishu_cfg = SimpleNamespace(enabled=True, token="***", extra={})
+        home = SimpleNamespace(chat_id="home-channel-id")
+        config = SimpleNamespace(
+            platforms={Platform.TELEGRAM: telegram_cfg, Platform.FEISHU: feishu_cfg},
+            get_home_channel=lambda _platform: home,
+        )
+
+        tokens = set_session_vars(
+            platform=platform_env,
+            chat_id=chat_id_env,
+            thread_id=thread_id_env,
+            user_id="user-123",
+            user_name="tester",
+        )
+        try:
+            with patch("gateway.config.load_gateway_config", return_value=config), \
+                 patch("tools.interrupt.is_interrupted", return_value=False), \
+                 patch("model_tools._run_async", side_effect=_run_async_immediately), \
+                 patch(
+                     "tools.send_message_tool._send_to_platform",
+                     new=AsyncMock(return_value={"success": True}),
+                 ) as send_mock, \
+                 patch("gateway.mirror.mirror_to_session", return_value=True):
+                result = json.loads(
+                    send_message_tool(
+                        {"action": "send", "target": target, "message": "hello"}
+                    )
+                )
+        finally:
+            clear_session_vars(tokens)
+        return result, send_mock
+
+    def test_inbound_session_routes_to_source_chat_not_home_channel(self, monkeypatch):
+        """target='feishu' (no chat_id) inside an inbound Feishu session
+        must route to the session's chat_id, NOT the home channel."""
+        result, send_mock = self._run_with_session(
+            monkeypatch,
+            platform_env="feishu",
+            chat_id_env="oc_a768e4ad_group",
+            thread_id_env="",
+            target="feishu",
+        )
+        assert result["success"] is True
+        assert send_mock.await_count == 1
+        _platform, _pconfig, used_chat_id = send_mock.await_args.args[:3]
+        thread_kwarg = send_mock.await_args.kwargs.get("thread_id")
+        assert used_chat_id == "oc_a768e4ad_group", \
+            f"Expected session chat_id 'oc_a768e4ad_group', got '{used_chat_id}' (home channel leak)"
+        assert thread_kwarg in (None, ""), \
+            f"Expected no thread_id (session had none), got '{thread_kwarg}'"
+
+    def test_inbound_session_with_thread_id_propagates_thread(self, monkeypatch):
+        """When the session has a thread_id and target has no chat_id,
+        both chat_id and thread_id come from the session context."""
+        result, send_mock = self._run_with_session(
+            monkeypatch,
+            platform_env="feishu",
+            chat_id_env="oc_a768e4ad_group",
+            thread_id_env="omt_topic_123",
+            target="feishu",
+        )
+        assert result["success"] is True
+        _platform, _pconfig, used_chat_id = send_mock.await_args.args[:3]
+        thread_kwarg = send_mock.await_args.kwargs.get("thread_id")
+        assert used_chat_id == "oc_a768e4ad_group"
+        assert thread_kwarg == "omt_topic_123", \
+            f"Expected session thread_id to propagate, got '{thread_kwarg}'"
+
+    def test_no_session_context_still_uses_home_channel(self, monkeypatch):
+        """When there is NO inbound session (cron / agent-initiated), the
+        home channel fallback still applies — preserves legacy behaviour."""
+        # Don't set session vars — leave the contextvars as _UNSET so
+        # get_session_env returns "".
+        feishu_cfg = SimpleNamespace(enabled=True, token="***", extra={})
+        home = SimpleNamespace(chat_id="home-channel-id")
+        config = SimpleNamespace(
+            platforms={Platform.FEISHU: feishu_cfg},
+            get_home_channel=lambda _platform: home,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch(
+                 "tools.send_message_tool._send_to_platform",
+                 new=AsyncMock(return_value={"success": True}),
+             ) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {"action": "send", "target": "feishu", "message": "hello"}
+                )
+            )
+        assert result["success"] is True
+        _platform, _pconfig, used_chat_id = send_mock.await_args.args[:3]
+        assert used_chat_id == "home-channel-id", \
+            f"Expected home channel fallback when no session context, got '{used_chat_id}'"
+        # Home-channel note should be present (preserves observability)
+        assert "home channel" in result.get("note", "").lower()
+
+    def test_explicit_chat_id_overrides_session_default(self, monkeypatch):
+        """target='feishu:oc_explicit' must NOT be hijacked by session default —
+        explicit chat_id always wins."""
+        result, send_mock = self._run_with_session(
+            monkeypatch,
+            platform_env="feishu",
+            chat_id_env="oc_session-chat",
+            thread_id_env="omt_session-thread",
+            target="feishu:oc_explicitchat123",
+        )
+        assert result["success"] is True
+        _platform, _pconfig, used_chat_id = send_mock.await_args.args[:3]
+        thread_kwarg = send_mock.await_args.kwargs.get("thread_id")
+        assert used_chat_id == "oc_explicitchat123"
+        # Session's thread_id should NOT bleed in when an explicit target
+        # was given (caller's intent is explicit chat without thread).
+        assert thread_kwarg in (None, "")
+
+    def test_cross_platform_session_does_not_route(self, monkeypatch):
+        """Inbound session is Telegram, target is 'feishu' — session-default
+        must NOT cross platforms. Falls back to Feishu home channel."""
+        result, send_mock = self._run_with_session(
+            monkeypatch,
+            platform_env="telegram",
+            chat_id_env="-1001234567890",
+            thread_id_env="",
+            target="feishu",
+        )
+        assert result["success"] is True
+        _platform, _pconfig, used_chat_id = send_mock.await_args.args[:3]
+        # Should land in Feishu home, NOT the Telegram session chat_id
+        assert used_chat_id == "home-channel-id", \
+            f"Cross-platform session leak: expected home channel, got '{used_chat_id}'"

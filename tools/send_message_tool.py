@@ -133,7 +133,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
+                "description": "Delivery target. PREFERRED format: 'platform:chat_id' or 'platform:chat_id:thread_id' (for Telegram topics, Discord threads, Feishu topics) — this guarantees the message lands where you intend. When you are replying inside an active inbound conversation (the user just messaged you / a watcher fired), pass the source chat_id + thread_id verbatim — do NOT collapse to 'platform' alone, because that triggers home-channel fallback which is usually a different chat. The bare 'platform' form (e.g. 'feishu') resolves to the configured home channel and is intended for agent-initiated / cron messages with no inbound context; using it from inside an inbound session will route into the current session's chat instead (a safety net — explicit chat_id is still preferred). Other accepted forms: 'platform:#channel-name' (resolves via channel directory). Examples: 'feishu:oc_abc123:omt_xyz' (group topic), 'feishu:oc_abc123' (group root), 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)."
             },
             "message": {
                 "type": "string",
@@ -252,6 +252,37 @@ def _handle_send(args):
     mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
 
     used_home_channel = False
+    used_session_default = False
+    if not chat_id:
+        # When the agent is responding inside a live inbound session (gateway
+        # turn triggered by a real user message / watcher), defaulting to the
+        # home channel is almost always wrong: the user sees their reply
+        # disappear into a different chat (typically the bot owner's DM).
+        # Prefer the session's own chat_id + thread_id as the natural target,
+        # so `target="<platform>"` behaves like "reply where I'm currently
+        # talking to you" instead of "fan out to home channel".
+        # Home channel fallback is still kept below for cron / agent-initiated
+        # work where no session context exists.
+        try:
+            from gateway.session_context import get_session_env as _gse
+            session_platform = (_gse("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
+            session_chat_id = (_gse("HERMES_SESSION_CHAT_ID", "") or "").strip()
+            session_thread_id = (_gse("HERMES_SESSION_THREAD_ID", "") or "").strip()
+        except Exception:
+            session_platform = ""
+            session_chat_id = ""
+            session_thread_id = ""
+        if session_chat_id and session_platform == platform_name:
+            chat_id = session_chat_id
+            if session_thread_id and not thread_id:
+                thread_id = session_thread_id
+            used_session_default = True
+            logger.info(
+                "send_message: target='%s' (no chat_id) → routing to current session "
+                "chat=%s thread=%s instead of %s home channel (avoiding stray fan-out)",
+                target, chat_id, thread_id or "<none>", platform_name,
+            )
+
     if not chat_id:
         home = config.get_home_channel(platform)
         if not home and platform_name == "weixin":
