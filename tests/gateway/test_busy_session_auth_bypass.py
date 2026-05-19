@@ -196,6 +196,58 @@ class TestBusySessionAuthBypass:
         adapter._send_with_retry.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_internal_event_bypasses_auth_in_busy_path(self):
+        """Internal=True events (e.g. background-process completion notifications)
+        must skip the user-allowlist gate, matching the cold-path exemption.
+
+        Regression: on Feishu, the synthetic event injected by _run_process_watcher
+        carries the spawn-time user_id, which can be the short user_id while the
+        allowlist is keyed on open_id (or vice versa).  Without the bypass, the
+        completion notification is dropped silently and the agent never delivers
+        the "process finished" message back to chat.
+        """
+        from gateway.run import GatewayRunner
+
+        runner, sentinel = _make_runner(authorized_users={"user1"})
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter()
+
+        # Build a synthetic completion notification: internal=True, with a
+        # user_id that is NOT on the allowlist (mimics the open_id/user_id
+        # mismatch on Feishu).
+        source = SessionSource(
+            platform=MagicMock(value="feishu"),
+            chat_id="oc_chat",
+            chat_type="group",
+            user_id="dc8fdgb4",  # short user_id, not on allowlist
+            user_name="HeJunhao",
+            thread_id="thread-xyz",
+        )
+        synth_event = MessageEvent(
+            text="[Background process proc_abc finished (exit code 0)...]",
+            message_type=MessageType.TEXT,
+            source=source,
+            internal=True,
+            message_id="anchor-msg",
+        )
+        sk = build_session_key(source)
+
+        running_agent = MagicMock()
+        running_agent.get_activity_summary.return_value = {}
+        runner._running_agents[sk] = running_agent
+        runner._running_agents_ts[sk] = time.time()
+        runner.adapters[source.platform] = adapter
+
+        result = await GatewayRunner._handle_active_session_busy_message(
+            runner, synth_event, sk
+        )
+
+        # Must NOT be silently dropped by the auth gate
+        assert result is True  # handled, but via normal busy-message path
+        # The synth event should have been merged into pending (queue mode)
+        assert sk in adapter._pending_messages
+
+    @pytest.mark.asyncio
     async def test_unauthorized_user_cannot_steer_active_agent(self):
         """Steer mode must not allow unauthorized users to inject mid-run guidance."""
         from gateway.run import GatewayRunner

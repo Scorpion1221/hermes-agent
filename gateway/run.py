@@ -2569,7 +2569,14 @@ class GatewayRunner:
         # creating a session.  The busy path must enforce the same check;
         # otherwise unauthorized users in shared threads (Slack/Telegram/Discord)
         # can inject messages into an active session they don't own.
-        if not self._is_user_authorized(event.source):
+        #
+        # Internal events (e.g. background-process completion notifications
+        # injected by _run_process_watcher) are system-generated and carry
+        # whatever user_id was captured at spawn time.  On platforms with
+        # multiple stable IDs per person (Feishu open_id vs. user_id, etc.)
+        # that captured id may not match the allowlist, so the gate would
+        # silently drop the notification.  Mirror the cold-path exemption.
+        if not bool(getattr(event, "internal", False)) and not self._is_user_authorized(event.source):
             logger.warning(
                 "Dropping message from unauthorized user in active session: "
                 "user=%s (%s), platform=%s, session=%s",
