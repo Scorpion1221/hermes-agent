@@ -61,6 +61,10 @@ _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
 # ``reply_to_message_id``.
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
 _SESSION_ID: ContextVar = ContextVar("HERMES_SESSION_ID", default=_UNSET)
+# ID of the message that triggered the current turn. Used as a reply anchor
+# so background-process notifications stay inside the originating Telegram
+# private-chat topic (those lanes route only with thread id + reply anchor).
+_SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
@@ -78,10 +82,26 @@ _VAR_MAP = {
     "HERMES_SESSION_KEY": _SESSION_KEY,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_ID": _SESSION_ID,
+    "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
 }
+
+
+def set_current_session_id(session_id: str) -> None:
+    """Synchronize ``HERMES_SESSION_ID`` across ContextVar and ``os.environ``.
+
+    Long-lived single-process entrypoints like the CLI can rotate sessions via
+    ``/new``, ``/resume``, ``/branch``, or compression splits without
+    reconstructing the entire agent. Tools still consult
+    ``get_session_env("HERMES_SESSION_ID")`` with an ``os.environ`` fallback,
+    so both storage paths must move together when the active session changes.
+    """
+    import os
+
+    os.environ["HERMES_SESSION_ID"] = session_id
+    _SESSION_ID.set(session_id)
 
 
 def set_session_vars(

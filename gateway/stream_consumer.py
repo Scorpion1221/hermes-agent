@@ -16,6 +16,7 @@ Credit: jobless0x (#774, #1312), OutThisLife (#798), clicksingh (#697).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import queue
 import re
@@ -65,9 +66,9 @@ class StreamConsumerConfig:
     #             when the adapter + chat supports it; fall back to edit.
     #   "draft" — explicitly request native draft streaming; fall back to
     #             edit when unsupported.
-    #   "edit"  — progressive editMessageText (legacy behavior).
+    #   "edit"  — progressive editMessageText (legacy/default behavior).
     #   "off"   — handled by the gateway before the consumer is even built.
-    transport: str = "auto"
+    transport: str = "edit"
     # Hint for the consumer about the originating chat type (e.g. "dm",
     # "group", "supergroup", "forum").  Used to gate native draft streaming,
     # which is platform-specific (Telegram drafts are DM-only).
@@ -193,10 +194,44 @@ class GatewayStreamConsumer:
         return self._final_response_sent
 
     @property
+    def message_id(self) -> str | None:
+        """The Discord/chat message ID of the last-sent or edited message."""
+        return self._message_id
+
+    @property
     def final_content_delivered(self) -> bool:
         """True when the final response content reached the user, even if
         the subsequent cosmetic edit (cursor removal) failed."""
         return self._final_content_delivered
+
+    async def _edit_message(
+        self,
+        *,
+        message_id: str,
+        content: str,
+        finalize: bool = False,
+    ):
+        """Edit via the adapter, passing routing metadata when supported."""
+        kwargs = {
+            "chat_id": self.chat_id,
+            "message_id": message_id,
+            "content": content,
+        }
+        # Keep the long-standing stream-consumer contract: concrete adapters
+        # must accept finalize= even when it is False (guarded by tests).
+        kwargs["finalize"] = finalize
+
+        if self.metadata:
+            try:
+                params = inspect.signature(self.adapter.edit_message).parameters
+                if "metadata" in params or any(
+                    param.kind is inspect.Parameter.VAR_KEYWORD
+                    for param in params.values()
+                ):
+                    kwargs["metadata"] = self.metadata
+            except (TypeError, ValueError):
+                pass
+        return await self.adapter.edit_message(**kwargs)
 
     def on_segment_break(self) -> None:
         """Finalize the current stream segment and start a fresh message."""
@@ -534,11 +569,6 @@ class GatewayStreamConsumer:
                         self._consecutive_failures = 0
 
                 if got_done:
-                    # Record that the final content reached the user even
-                    # if the cosmetic final edit below fails.
-                    if current_update_visible and self._accumulated:
-                        self._final_content_delivered = True
-
                     # Final edit without cursor. If progressive editing failed
                     # mid-stream, send a single continuation/fallback message
                     # here instead of letting the base gateway path send the
@@ -555,6 +585,7 @@ class GatewayStreamConsumer:
                             # final edit — but only for adapters that don't
                             # need an explicit finalize signal.
                             self._final_response_sent = True
+                            self._final_content_delivered = True
                         elif self._message_id:
                             # Either the mid-stream edit didn't run (no
                             # visible update this tick) OR the adapter needs
@@ -562,10 +593,21 @@ class GatewayStreamConsumer:
                             self._final_response_sent = await self._send_or_edit(
                                 self._accumulated, finalize=True,
                             )
-                            if not self._final_response_sent and self._fallback_final_send:
+                            if self._final_response_sent:
+                                self._final_content_delivered = True
+                            elif self._fallback_final_send and not self._adapter_requires_finalize:
+                                # The finalize edit failed and dropped us into
+                                # fallback mode. For adapters that do NOT require
+                                # an explicit finalize, deliver the unsent tail
+                                # here. For adapters that DO require finalize
+                                # (e.g. Telegram), leave _final_content_delivered
+                                # False so the gateway runs its own fallback
+                                # send instead (#25010).
                                 await self._send_fallback_final(self._accumulated)
                         elif not self._already_sent:
                             self._final_response_sent = await self._send_or_edit(self._accumulated)
+                            if self._final_response_sent:
+                                self._final_content_delivered = True
                     if self._message_id and getattr(type(self.adapter), "finalize_streaming_message", None):
                         try:
                             await self.adapter.finalize_streaming_message(self._message_id, self._accumulated or "")
@@ -639,6 +681,7 @@ class GatewayStreamConsumer:
             # "Let me search…") had been delivered, not the real answer.
             if _best_effort_ok and not self._final_response_sent:
                 self._final_response_sent = True
+                self._final_content_delivered = True
         except Exception as e:
             logger.error("Stream consumer error: %s", e)
 
@@ -766,8 +809,7 @@ class GatewayStreamConsumer:
                 ):
                     clean_text = self._last_sent_text[:-len(self.cfg.cursor)]
                     try:
-                        result = await self.adapter.edit_message(
-                            chat_id=self.chat_id,
+                        result = await self._edit_message(
                             message_id=self._message_id,
                             content=clean_text,
                         )
@@ -777,6 +819,7 @@ class GatewayStreamConsumer:
                         pass
                 self._already_sent = True
                 self._final_response_sent = True
+                self._final_content_delivered = True
                 return
 
         raw_limit = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
@@ -813,11 +856,13 @@ class GatewayStreamConsumer:
 
             if not result or not result.success:
                 if sent_any_chunk:
-                    # Some continuation text already reached the user. Suppress
-                    # the base gateway final-send path so we don't resend the
-                    # full response and create another duplicate.
+                    # Some continuation text already reached the user, but not
+                    # the full response. Do NOT set _final_response_sent — the
+                    # base gateway final-send path should still deliver the
+                    # complete response so the user gets the full answer.
+                    # Suppress only _already_sent to avoid a duplicate send
+                    # of the same partial content.
                     self._already_sent = True
-                    self._final_response_sent = True
                     self._message_id = last_message_id
                     self._last_sent_text = last_successful_chunk
                     self._fallback_prefix = ""
@@ -855,6 +900,7 @@ class GatewayStreamConsumer:
         self._message_id = last_message_id
         self._already_sent = True
         self._final_response_sent = True
+        self._final_content_delivered = True
         self._last_sent_text = chunks[-1]
         self._fallback_prefix = ""
 
@@ -879,7 +925,7 @@ class GatewayStreamConsumer:
         the chat type (e.g. Telegram drafts are DM-only) and platform-version
         gates (e.g. python-telegram-bot 22.6+).
         """
-        transport = (self.cfg.transport or "auto").lower()
+        transport = (self.cfg.transport or "edit").lower()
         if transport == "edit":
             return False
         # "off" is filtered upstream by the gateway; treat as edit defensively.
@@ -992,8 +1038,7 @@ class GatewayStreamConsumer:
         if not prefix or not prefix.strip():
             return
         try:
-            await self.adapter.edit_message(
-                chat_id=self.chat_id,
+            await self._edit_message(
                 message_id=self._message_id,
                 content=prefix,
             )
@@ -1200,8 +1245,7 @@ class GatewayStreamConsumer:
                     ):
                         return True
                     # Edit existing message
-                    result = await self.adapter.edit_message(
-                        chat_id=self.chat_id,
+                    result = await self._edit_message(
                         message_id=self._message_id,
                         content=text,
                         finalize=finalize,

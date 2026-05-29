@@ -53,6 +53,7 @@ class _StubAdapter(BasePlatformAdapter):
 def _make_adapter():
     config = PlatformConfig(enabled=True, token="test-token")
     adapter = _StubAdapter(config, Platform.TELEGRAM)
+    adapter._busy_text_mode = ""
     adapter.sent_responses = []
 
     async def _mock_send_retry(chat_id, content, **kwargs):

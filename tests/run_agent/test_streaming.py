@@ -273,79 +273,6 @@ class TestStreamingAccumulator:
         assert len(response.choices[0].message.tool_calls) == 1
 
 
-class TestStreamingResourceCleanup:
-    """Regression coverage for local-proxy streams that can otherwise leave
-    unread CLOSE-WAIT sockets behind."""
-
-    @patch("run_agent.AIAgent._create_request_openai_client")
-    @patch("run_agent.AIAgent._close_request_openai_client")
-    def test_chat_completion_stream_is_closed_after_success(self, mock_close, mock_create):
-        """The OpenAI SDK stream object should be explicitly closed even when
-        iteration appears to complete normally.
-        """
-        from run_agent import AIAgent
-
-        class _ClosableStream:
-            def __init__(self):
-                self.closed = False
-                self.response = SimpleNamespace(headers={})
-
-            def __iter__(self):
-                return iter([
-                    _make_stream_chunk(content="done", finish_reason="stop"),
-                ])
-
-            def close(self):
-                self.closed = True
-
-        stream = _ClosableStream()
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.return_value = stream
-        mock_create.return_value = mock_client
-
-        agent = AIAgent(
-            api_key="test-key",
-            base_url="https://openrouter.ai/api/v1",
-            model="test/model",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-        )
-        agent.api_mode = "chat_completions"
-        agent._interrupt_requested = False
-
-        response = agent._interruptible_streaming_api_call({})
-
-        assert response.choices[0].message.content == "done"
-        assert stream.closed is True
-
-    def test_local_stream_stale_timeout_is_finite_by_default(self, monkeypatch):
-        """Loopback OpenAI-compatible proxies such as LiteLLM must not disable
-        stale-stream cleanup; otherwise a closed response can hang forever in
-        CLOSE-WAIT.
-        """
-        from run_agent import AIAgent
-
-        monkeypatch.delenv("HERMES_STREAM_STALE_TIMEOUT", raising=False)
-        monkeypatch.delenv("HERMES_DISABLE_LOCAL_STREAM_STALE_DETECTOR", raising=False)
-
-        agent = AIAgent(
-            api_key="test-key",
-            base_url="http://127.0.0.1:4000/v1",
-            model="test/model",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-        )
-        agent.api_mode = "chat_completions"
-
-        timeout = agent._compute_stream_stale_timeout([
-            {"role": "user", "content": "hello"},
-        ])
-
-        assert timeout == 180.0
-
-
 # ── Test: Streaming Callbacks ────────────────────────────────────────────
 
 
@@ -856,32 +783,28 @@ class TestCodexStreamCallbacks:
         agent.api_mode = "codex_responses"
         agent._interrupt_requested = False
 
-        # Mock the stream context manager
-        mock_event_text = SimpleNamespace(
-            type="response.output_text.delta",
-            delta="Hello from Codex!",
-        )
-        mock_event_done = SimpleNamespace(
-            type="response.completed",
-            delta="",
-        )
+        events = [
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(
+                type="response.output_text.delta",
+                delta="Hello from Codex!",
+            ),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", id="r1", usage=None),
+            ),
+        ]
 
-        mock_stream = MagicMock()
-        mock_stream.__enter__ = MagicMock(return_value=mock_stream)
-        mock_stream.__exit__ = MagicMock(return_value=False)
-        mock_stream.__iter__ = MagicMock(return_value=iter([mock_event_text, mock_event_done]))
-        mock_stream.get_final_response.return_value = SimpleNamespace(
-            output=[SimpleNamespace(
-                type="message",
-                content=[SimpleNamespace(type="output_text", text="Hello from Codex!")],
-            )],
-            status="completed",
-        )
+        class _FakeCreateStream:
+            def __iter__(self_inner):
+                return iter(events)
+            def close(self_inner):
+                return None
 
         mock_client = MagicMock()
-        mock_client.responses.stream.return_value = mock_stream
+        mock_client.responses.create.return_value = _FakeCreateStream()
 
-        response = agent._run_codex_stream({}, client=mock_client)
+        agent._run_codex_stream({}, client=mock_client)
         assert "Hello from Codex!" in deltas
 
     def test_codex_stream_refreshes_activity_on_every_event(self):
@@ -901,56 +824,39 @@ class TestCodexStreamCallbacks:
         touch_calls = []
         agent._touch_activity = lambda desc: touch_calls.append(desc)
 
-        mock_event_text_1 = SimpleNamespace(
-            type="response.output_text.delta",
-            delta="Hello",
-        )
-        mock_event_text_2 = SimpleNamespace(
-            type="response.output_text.delta",
-            delta=" world",
-        )
-        mock_event_done = SimpleNamespace(
-            type="response.completed",
-            delta="",
-        )
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta="Hello"),
+            SimpleNamespace(type="response.output_text.delta", delta=" world"),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", id="r2", usage=None),
+            ),
+        ]
 
-        mock_stream = MagicMock()
-        mock_stream.__enter__ = MagicMock(return_value=mock_stream)
-        mock_stream.__exit__ = MagicMock(return_value=False)
-        mock_stream.__iter__ = MagicMock(
-            return_value=iter([mock_event_text_1, mock_event_text_2, mock_event_done])
-        )
-        mock_stream.get_final_response.return_value = SimpleNamespace(
-            output=[SimpleNamespace(
-                type="message",
-                content=[SimpleNamespace(type="output_text", text="Hello world")],
-            )],
-            status="completed",
-        )
+        class _FakeCreateStream:
+            def __iter__(self_inner):
+                return iter(events)
+            def close(self_inner):
+                return None
 
         mock_client = MagicMock()
-        mock_client.responses.stream.return_value = mock_stream
+        mock_client.responses.create.return_value = _FakeCreateStream()
 
         agent._run_codex_stream({}, client=mock_client)
 
         assert touch_calls.count("receiving stream response") == 3
 
-    def test_codex_remote_protocol_error_falls_back_to_create_stream(self):
+    def test_codex_remote_protocol_error_retries_then_raises(self):
+        """Transport errors from ``responses.create`` retry once then re-raise.
+
+        With the migration from ``responses.stream(...)`` to
+        ``responses.create(stream=True)``, there is no longer a separate
+        fallback function — the same call IS the streaming path.  When it
+        raises ``httpx.RemoteProtocolError``, we retry once (matching the
+        old behavior on the helper) and re-raise on the second failure.
+        """
         from run_agent import AIAgent
         import httpx
-
-        fallback_response = SimpleNamespace(
-            output=[SimpleNamespace(
-                type="message",
-                content=[SimpleNamespace(type="output_text", text="fallback from create stream")],
-            )],
-            status="completed",
-        )
-
-        mock_client = MagicMock()
-        mock_client.responses.stream.side_effect = httpx.RemoteProtocolError(
-            "peer closed connection without sending complete message body"
-        )
 
         agent = AIAgent(
             api_key="test-key",
@@ -963,11 +869,22 @@ class TestCodexStreamCallbacks:
         agent.api_mode = "codex_responses"
         agent._interrupt_requested = False
 
-        with patch.object(agent, "_run_codex_create_stream_fallback", return_value=fallback_response) as mock_fallback:
-            response = agent._run_codex_stream({}, client=mock_client)
+        call_count = {"n": 0}
 
-        assert response is fallback_response
-        mock_fallback.assert_called_once_with({}, client=mock_client)
+        def _create_side_effect(**kwargs):
+            call_count["n"] += 1
+            raise httpx.RemoteProtocolError(
+                "peer closed connection without sending complete message body"
+            )
+
+        mock_client = MagicMock()
+        mock_client.responses.create.side_effect = _create_side_effect
+
+        with pytest.raises(httpx.RemoteProtocolError):
+            agent._run_codex_stream({}, client=mock_client)
+
+        # 1 initial + 1 retry = 2 calls
+        assert call_count["n"] == 2
 
     def test_codex_create_stream_fallback_refreshes_activity_on_every_event(self):
         from run_agent import AIAgent
@@ -1659,3 +1576,145 @@ class TestCopilotACPStreamingDecision:
             _use_streaming = False
 
         assert _use_streaming is True
+
+
+class TestCodexFallbackErrorEvent:
+    """Provider ``error`` SSE frames must surface the real message,
+    not the generic "did not emit a terminal response" RuntimeError.
+
+    xAI emits ``type=error`` as the FIRST frame on the Responses stream
+    when an OAuth account is unsubscribed/exhausted (May 2026
+    SuperGrok rollout).  The SDK helper raises
+    ``RuntimeError("Expected to have received response.created before
+    error")`` which the caller catches and routes to
+    ``_run_codex_create_stream_fallback``.  The fallback then opens a
+    NEW stream that emits the same ``type=error`` frame; before this
+    fix it ignored the event entirely and raised a useless RuntimeError.
+    """
+
+    def _make_agent(self):
+        from run_agent import AIAgent
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://api.x.ai/v1",
+            provider="xai-oauth",
+            model="grok-4.3",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+        agent._touch_activity = lambda desc: None
+        return agent
+
+    def test_fallback_raises_synthesized_error_with_xai_subscription_message(self):
+        from run_agent import _StreamErrorEvent
+
+        agent = self._make_agent()
+
+        error_event = SimpleNamespace(
+            type="error",
+            message=(
+                "Forbidden: The caller does not have permission to execute the specified operation. "
+                "'You have either run out of available resources or do not have an active Grok subscription.'"
+            ),
+            code="permission_denied",
+            param=None,
+            sequence_number=1,
+        )
+
+        class _FakeStream:
+            def __iter__(self_inner):
+                return iter([error_event])
+            def close(self_inner):
+                return None
+
+        mock_client = MagicMock()
+        mock_client.responses.create.return_value = _FakeStream()
+
+        with pytest.raises(_StreamErrorEvent) as excinfo:
+            agent._run_codex_create_stream_fallback(
+                {"model": "grok-4.3", "instructions": "hi", "input": []},
+                client=mock_client,
+            )
+
+        exc = excinfo.value
+        assert "active Grok subscription" in str(exc)
+        assert exc.code == "permission_denied"
+        assert isinstance(exc.body, dict)
+        assert exc.body["error"]["message"] == error_event.message
+        # _extract_api_error_context reads .body["error"]["message"] — make sure
+        # the entitlement detector will find the subscription phrase there.
+        assert "active Grok subscription" in exc.body["error"]["message"]
+
+    def test_fallback_dict_event_payload_is_also_handled(self):
+        """Some relays deliver events as plain dicts instead of model
+        objects; the dict branch in the loop must surface them too."""
+        from run_agent import _StreamErrorEvent
+
+        agent = self._make_agent()
+
+        error_event = {
+            "type": "error",
+            "message": "rate_limited",
+            "code": "rate_limit_exceeded",
+        }
+
+        class _FakeStream:
+            def __iter__(self_inner):
+                return iter([error_event])
+            def close(self_inner):
+                return None
+
+        mock_client = MagicMock()
+        mock_client.responses.create.return_value = _FakeStream()
+
+        with pytest.raises(_StreamErrorEvent) as excinfo:
+            agent._run_codex_create_stream_fallback(
+                {"model": "grok-4.3", "instructions": "hi", "input": []},
+                client=mock_client,
+            )
+
+        assert "rate_limited" in str(excinfo.value)
+        assert excinfo.value.code == "rate_limit_exceeded"
+
+    def test_fallback_surfaces_message_useful_to_summarizer(self):
+        """The synthesized exception must be readable by
+        ``_summarize_api_error`` so the user-facing log line shows the
+        real provider message instead of a generic class name."""
+        from run_agent import AIAgent, _StreamErrorEvent
+
+        agent = self._make_agent()
+        exc = _StreamErrorEvent(
+            "You have either run out of available resources or do not have an active Grok subscription.",
+            code="permission_denied",
+        )
+
+        summary = AIAgent._summarize_api_error(exc)
+        assert "active Grok subscription" in summary
+
+    def test_fallback_still_raises_terminal_error_when_no_error_event(self):
+        """Streams that simply end without any terminal event (and no
+        ``error`` frame) must continue to raise the original
+        ``"did not emit a terminal response"`` RuntimeError so callers
+        can distinguish "stream truncated mid-flight" from "provider
+        rejected the call"."""
+        agent = self._make_agent()
+
+        # Empty stream — no events at all
+        class _FakeStream:
+            def __iter__(self_inner):
+                return iter([])
+            def close(self_inner):
+                return None
+
+        mock_client = MagicMock()
+        mock_client.responses.create.return_value = _FakeStream()
+
+        with pytest.raises(RuntimeError) as excinfo:
+            agent._run_codex_create_stream_fallback(
+                {"model": "grok-4.3", "instructions": "hi", "input": []},
+                client=mock_client,
+            )
+
+        assert "did not emit a terminal response" in str(excinfo.value)

@@ -52,6 +52,106 @@ class TestIndentDifference:
         assert "bar" in new
 
 
+class TestIndentationPreservation:
+    """When a non-exact strategy matches, ``new_string`` should be re-indented
+    so it lands at the file's actual indent depth — not at whatever indent the
+    LLM happened to send in the tool args.  Without this fix the file gets a
+    silently-broken indent level that may even still parse but is logically
+    wrong."""
+
+    def test_unindented_input_reindented_to_match_file(self):
+        # File: 8-space-indented method body inside a class.
+        content = (
+            "class Calculator:\n"
+            "    def add(self, a, b):\n"
+            "        result = a + b\n"
+            "        return result\n"
+        )
+        # LLM sends zero-indent old/new — common bug from frontier models
+        # that "remember" code instead of reading it.
+        old = "result = a + b\nreturn result"
+        new = "result = a + b\nresult *= 2\nreturn result"
+        out, count, strategy, err = fuzzy_find_and_replace(content, old, new)
+        assert err is None and count == 1
+        assert strategy != "exact"  # must have gone through a fuzzy strategy
+        # Every replaced line should be at 8-space indent.
+        for marker in ("result = a + b", "result *= 2", "return result"):
+            line = next(line for line in out.split("\n") if marker in line)
+            indent = len(line) - len(line.lstrip())
+            assert indent == 8, f"Expected 8-space indent for {marker!r}, got {indent}: {line!r}"
+        # Resulting file must still be valid Python.
+        import ast
+        ast.parse(out)
+
+    def test_dedent_at_start_anchors_to_file_base(self):
+        # File: 2-space-indented function body.  LLM sends zero-indent
+        # old/new where new_string contains a dedent (the new structure
+        # adds a top-level class wrapper).  After re-indent, every line
+        # of new_string should be anchored to the file's 2-space base.
+        content = "  return 1\n  return 2\n"
+        old = "return 1\nreturn 2"  # zero-indent — forces line_trimmed
+        new = "class X:\n  return 99\n  return 100"
+        out, count, strategy, err = fuzzy_find_and_replace(content, old, new)
+        assert err is None and count == 1
+        assert strategy != "exact"
+        lines = out.split("\n")
+        # 'class X:' anchored to file's 2-space base.
+        assert lines[0] == "  class X:", repr(lines[0])
+        # Indented body lines lift to 4-space (file base + LLM's +2).
+        assert lines[1] == "    return 99", repr(lines[1])
+        assert lines[2] == "    return 100", repr(lines[2])
+
+    def test_exact_match_no_reindent(self):
+        # Exact strategy should be a pure passthrough — no shift logic
+        # should touch the result.
+        content = "    def foo():\n        return 1\n"
+        old = "    def foo():\n        return 1"
+        new = "    def foo():\n        return 2"
+        out, count, strategy, err = fuzzy_find_and_replace(content, old, new)
+        assert err is None and strategy == "exact"
+        assert out == "    def foo():\n        return 2\n"
+
+    def test_llm_zero_indent_shifts_to_file_two_space(self):
+        # LLM sent zero-indent old/new; file has 2-space indent.  The
+        # re-indent shifts the whole replacement so 'def x()' lands at
+        # 2-space and the body keeps its relative +2 from new_string.
+        content = "  def x():\n    return 1\n"
+        old = "def x():\n  return 1"
+        new = "def x():\n  return 99"
+        out, count, _, err = fuzzy_find_and_replace(content, old, new)
+        assert err is None and count == 1
+        lines = out.strip("\n").split("\n")
+        assert lines[0] == "  def x():"
+        assert lines[1] == "    return 99"
+
+    def test_indent_already_matches_passthrough(self):
+        # When old_string's base indent already equals file_region's base
+        # indent, _reindent_replacement returns new_string unchanged.
+        # Verify with whitespace_normalized strategy (collapsed spaces).
+        content = "  def  x(  ):\n    return 1\n"
+        old = "  def x():\n    return 1"  # same base indent (2), different inner whitespace
+        new = "  def x():\n    return 42"
+        out, count, strategy, err = fuzzy_find_and_replace(content, old, new)
+        assert err is None and count == 1
+        assert strategy != "exact"  # non-exact strategy matched
+        # Body retains its 4-space indent (passthrough — no shift).
+        assert "    return 42" in out
+
+    def test_blank_lines_left_alone(self):
+        # Blank lines in new_string should keep whatever whitespace they
+        # had — we never strip or pad them.
+        content = "    a = 1\n    b = 2\n"
+        old = "a = 1\nb = 2"
+        new = "a = 1\n\nb = 99"
+        out, count, _, err = fuzzy_find_and_replace(content, old, new)
+        assert err is None and count == 1
+        # blank line is preserved (empty), indented lines anchored.
+        lines = out.split("\n")
+        assert lines[0] == "    a = 1"
+        assert lines[1] == ""
+        assert lines[2] == "    b = 99"
+
+
 class TestReplaceAll:
     def test_multiple_matches_without_flag_errors(self):
         content = "aaa bbb aaa"
@@ -156,13 +256,13 @@ class TestEscapeDriftGuard:
     """
 
     def test_drift_blocked_apostrophe(self):
-        """File has ', old_string and new_string both have \\' ��� classic
+        """File has ', old_string and new_string both have \\' — classic
         tool-call drift. Guard must block with a helpful error instead of
         writing \\' literals into source code."""
         content = "x = \"hello there\"\n"
         # Simulate transport-corrupted old_string and new_string where an
         # apostrophe-like context got prefixed with a backslash. The content
-        # itself has no apostrophe, but both strings do ��� matching via
+        # itself has no apostrophe, but both strings do — matching via
         # whitespace/anchor strategies would otherwise succeed.
         old_string = "x = \"hello there\" # don\\'t edit\n"
         new_string = "x = \"hi there\" # don\\'t edit\n"
@@ -199,7 +299,7 @@ class TestEscapeDriftGuard:
         assert "\\'b\\'" in new
 
     def test_drift_allowed_on_exact_match(self):
-        """Exact matches bypass the drift guard entirely ��� if the file
+        """Exact matches bypass the drift guard entirely — if the file
         really contains the exact bytes old_string specified, it's not
         drift."""
         content = "hello \\'world\\'"
@@ -264,7 +364,7 @@ class TestFindClosestLines:
 
 
 class TestFormatNoMatchHint:
-    """Gating tests for format_no_match_hint ��� the shared helper that decides
+    """Gating tests for format_no_match_hint — the shared helper that decides
     whether a 'Did you mean?' snippet should be appended to an error.
     """
 
@@ -273,7 +373,7 @@ class TestFormatNoMatchHint:
         self.fmt = format_no_match_hint
 
     def test_fires_on_could_not_find_with_match(self):
-        """Classic no-match: similar content exists ��� hint fires."""
+        """Classic no-match: similar content exists → hint fires."""
         content = "def foo():\n    pass\ndef bar():\n    pass\n"
         result = self.fmt(
             "Could not find a match for old_string in the file",
@@ -283,7 +383,7 @@ class TestFormatNoMatchHint:
         assert "foo" in result or "bar" in result
 
     def test_silent_on_ambiguous_match_error(self):
-        """'Found N matches' is not a missing-match failure ��� no hint."""
+        """'Found N matches' is not a missing-match failure — no hint."""
         content = "aaa bbb aaa\n"
         result = self.fmt(
             "Found 2 matches for old_string. Provide more context to make it unique, or use replace_all=True.",
@@ -292,7 +392,7 @@ class TestFormatNoMatchHint:
         assert result == ""
 
     def test_silent_on_escape_drift_error(self):
-        """Escape-drift errors are intentional blocks ��� hint would mislead."""
+        """Escape-drift errors are intentional blocks — hint would mislead."""
         content = "x = 1\n"
         result = self.fmt(
             "Escape-drift detected: old_string and new_string contain the literal sequence '\\\\''...",
@@ -301,7 +401,7 @@ class TestFormatNoMatchHint:
         assert result == ""
 
     def test_silent_on_identical_strings(self):
-        """old_string == new_string ��� hint irrelevant."""
+        """old_string == new_string — hint irrelevant."""
         result = self.fmt(
             "old_string and new_string are identical",
             0, "foo", "foo bar\n",
@@ -309,7 +409,7 @@ class TestFormatNoMatchHint:
         assert result == ""
 
     def test_silent_when_match_count_nonzero(self):
-        """If match succeeded, we shouldn't be in the error path ��� defense in depth."""
+        """If match succeeded, we shouldn't be in the error path — defense in depth."""
         result = self.fmt(
             "Could not find a match for old_string in the file",
             1, "foo", "foo bar\n",
@@ -317,7 +417,7 @@ class TestFormatNoMatchHint:
         assert result == ""
 
     def test_silent_on_none_error(self):
-        """No error at all ��� no hint."""
+        """No error at all — no hint."""
         result = self.fmt(None, 0, "foo", "bar\n")
         assert result == ""
 
@@ -328,3 +428,119 @@ class TestFormatNoMatchHint:
             0, "totally_unique_xyzzy_qux", "abc\nxyz\n",
         )
         assert result == ""
+
+
+class TestEscapeNormalizedNewString:
+    """Regression tests for unescaping common sequences in new_string when
+    the matched region of the file contains real control characters.
+
+    Issue #33733: LLMs overwhelmingly represent tabs as the two-character
+    sequence ``\\t`` (backslash + t) in JSON tool-call arguments. When the
+    file already contains real tab bytes (0x09), writing new_string
+    verbatim leaves literal ``\\t`` characters and corrupts the file.
+
+    The fix unescapes ``\\t`` -> tab and ``\\r`` -> CR in new_string when
+    the matched file region actually contains those control characters,
+    regardless of which match strategy fired. ``\\n`` is excluded because
+    newlines serialize correctly through JSON.
+    """
+
+    def test_tab_in_new_string_unescaped_under_escape_normalized(self):
+        """File has real tab, model sends literal \\t in BOTH old and new.
+
+        Match strategy is ``escape_normalized``.
+        """
+        content = "def hello():\n\tprint(\"before\")\n"
+        old_string = "def hello():\n\\tprint(\"before\")\n"
+        new_string = "def hello():\n\\tprint(\"after\")\n"
+        new, count, strategy, err = fuzzy_find_and_replace(content, old_string, new_string)
+        assert err is None, f"Unexpected error: {err}"
+        assert count == 1
+        assert strategy == "escape_normalized"
+        assert "\tprint(\"after\")" in new
+        assert "\\t" not in new
+
+    def test_tab_in_new_string_unescaped_under_exact(self):
+        """File has real tab, old_string has real tab too (matches via
+        ``exact``), but new_string still arrives with literal ``\\t``.
+
+        This is the issue's headline reproduction — the previous fix that
+        gated on ``strategy_name == "escape_normalized"`` missed this case.
+        """
+        content = "def hello():\n\tprint(\"before\")\n"
+        old_string = "\tprint(\"before\")"           # real tab
+        new_string = "\\tprint(\"after\")"           # literal backslash + t
+        new, count, strategy, err = fuzzy_find_and_replace(content, old_string, new_string)
+        assert err is None, f"Unexpected error: {err}"
+        assert count == 1
+        assert strategy == "exact"
+        assert "\tprint(\"after\")" in new
+        assert "\\t" not in new
+
+    def test_carriage_return_in_new_string_unescaped(self):
+        """File has real CR, model sends literal \\r in new_string."""
+        content = "line1\r\nline2\r\n"
+        old_string = "line1\\r\\nline2\\r\\n"
+        new_string = "replaced\\r\\n"
+        new, count, strategy, err = fuzzy_find_and_replace(content, old_string, new_string)
+        assert err is None, f"Unexpected error: {err}"
+        assert count == 1
+        assert strategy == "escape_normalized"
+        assert "replaced\r" in new
+
+    def test_newline_in_new_string_NOT_unescaped(self):
+        """``\\n`` is intentionally left alone — newlines serialize correctly
+        through JSON, and unescaping would corrupt source-code escape
+        sequences far more often than help.
+        """
+        content = "line1\nline2\n"
+        old_string = "line1\nline2"
+        new_string = "alpha\\nbeta"                 # literal backslash + n
+        new, count, _, err = fuzzy_find_and_replace(content, old_string, new_string)
+        assert err is None, f"Unexpected error: {err}"
+        assert count == 1
+        # The literal two-character sequence ``\n`` must survive verbatim.
+        assert "alpha\\nbeta" in new
+        # And there should be no real newline added where ``\\n`` sat.
+        assert "alpha\nbeta" not in new
+
+    def test_mixed_tab_and_newline_only_tab_unescaped(self):
+        """When new_string contains both \\t and \\n, only \\t is converted."""
+        content = "def foo():\n\tpass\n"
+        old_string = "def foo():\n\tpass\n"
+        new_string = "def bar():\\n\\treturn 1\\n"
+        new, count, _, err = fuzzy_find_and_replace(content, old_string, new_string)
+        assert err is None, f"Unexpected error: {err}"
+        assert count == 1
+        # \t -> real tab
+        assert "\treturn 1" in new
+        assert "\\t" not in new
+        # \n preserved as literal backslash-n
+        assert "\\n" in new
+
+    def test_exact_match_preserves_literal_backslash_t_in_string_literal(self):
+        """If the matched region of the file does NOT contain a real tab,
+        new_string's literal ``\\t`` is preserved — the file genuinely uses
+        a backslash-t sequence (e.g. a Python source line ``sep = "\\t"``).
+        """
+        content = 'sep = "\\t"\n'                   # source contains backslash + t
+        old_string = 'sep = "\\t"\n'
+        new_string = 'sep = "\\tab"\n'              # still backslash + t literal
+        new, count, strategy, err = fuzzy_find_and_replace(content, old_string, new_string)
+        assert err is None, f"Unexpected error: {err}"
+        assert count == 1
+        assert strategy == "exact"
+        # File still has the literal two-char ``\t`` — no tab byte injected.
+        assert 'sep = "\\tab"' in new
+        assert "\t" not in new
+
+    def test_no_escape_sequences_passthrough(self):
+        """When new_string has no \\t or \\r, the helper is a no-op."""
+        content = "def foo():\n    return 1\n"
+        old_string = "def foo():\n    return 1\n"
+        new_string = "def foo():\n    return 2\n"
+        new, count, _, err = fuzzy_find_and_replace(content, old_string, new_string)
+        assert err is None
+        assert count == 1
+        assert "return 2" in new
+
