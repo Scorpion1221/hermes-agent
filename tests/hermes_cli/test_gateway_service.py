@@ -495,8 +495,9 @@ class TestLaunchdServiceRecovery:
         label = gateway_cli.get_launchd_label()
         domain = gateway_cli._launchd_domain()
         assert "--replace" in plist_path.read_text(encoding="utf-8")
-        assert calls[:2] == [
-            ["launchctl", "bootout", f"{domain}/{label}"],
+        assert calls[:3] == [
+            ["launchctl", "bootout", domain, str(plist_path)],
+            ["launchctl", "bootout", gateway_cli._launchd_gui_domain(), str(plist_path)],
             ["launchctl", "bootstrap", domain, str(plist_path)],
         ]
 
@@ -508,6 +509,7 @@ class TestLaunchdServiceRecovery:
         calls = []
         domain = gateway_cli._launchd_domain()
         target = f"{domain}/{label}"
+        monkeypatch.setattr(gateway_cli, "_launchd_candidate_domains", lambda: (domain,))
 
         def fake_run(cmd, check=False, **kwargs):
             if cmd and cmd[0] == "launchctl":
@@ -536,6 +538,7 @@ class TestLaunchdServiceRecovery:
         calls = []
         domain = gateway_cli._launchd_domain()
         target = f"{domain}/{label}"
+        monkeypatch.setattr(gateway_cli, "_launchd_candidate_domains", lambda: (domain,))
 
         def fake_run(cmd, check=False, **kwargs):
             if cmd and cmd[0] == "launchctl":
@@ -604,11 +607,12 @@ class TestLaunchdServiceRecovery:
         assert calls == [("self", 321)]
         assert "restart requested" in capsys.readouterr().out.lower()
 
-    def test_launchd_stop_uses_bootout_not_kill(self, monkeypatch):
+    def test_launchd_stop_uses_bootout_not_kill(self, tmp_path, monkeypatch):
         """launchd_stop must bootout the service so KeepAlive doesn't respawn it."""
         label = gateway_cli.get_launchd_label()
         domain = gateway_cli._launchd_domain()
-        target = f"{domain}/{label}"
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("plist\n", encoding="utf-8")
 
         calls = []
 
@@ -617,11 +621,15 @@ class TestLaunchdServiceRecovery:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
         monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kw: None)
 
         gateway_cli.launchd_stop()
 
-        assert calls == [["launchctl", "bootout", target]]
+        assert calls == [
+            ["launchctl", "bootout", domain, str(plist_path)],
+            ["launchctl", "bootout", gateway_cli._launchd_gui_domain(), str(plist_path)],
+        ]
 
     def test_launchd_stop_tolerates_already_unloaded(self, monkeypatch, capsys):
         """launchd_stop silently handles exit codes 3/113 (job not loaded)."""
@@ -684,6 +692,37 @@ class TestLaunchdServiceRecovery:
         # non-Aqua/background sessions on macOS 26+ (issue #23387).
         assert gateway_cli._launchd_domain() == f"user/{os.getuid()}"
 
+    def test_launchd_start_tries_gui_domain_before_rebootstrap(self, tmp_path, monkeypatch):
+        """A gui-loaded LaunchAgent should not degrade to detached when user/<uid> misses."""
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        label = gateway_cli.get_launchd_label()
+        user_domain = gateway_cli._launchd_domain()
+        gui_domain = gateway_cli._launchd_gui_domain()
+        user_target = f"{user_domain}/{label}"
+        gui_target = f"{gui_domain}/{label}"
+
+        calls = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            if cmd and cmd[0] == "launchctl":
+                calls.append(cmd)
+            if cmd == ["launchctl", "kickstart", user_target]:
+                raise gateway_cli.subprocess.CalledProcessError(
+                    113, cmd, stderr="Could not find service"
+                )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_start()
+
+        assert calls == [
+            ["launchctl", "kickstart", user_target],
+            ["launchctl", "kickstart", gui_target],
+        ]
+
     def test_launchctl_domain_unsupported_recognizes_macos26_codes(self):
         # Codes that persist after a fresh bootstrap → launchd truly unavailable.
         assert gateway_cli._launchctl_domain_unsupported(5) is True
@@ -701,6 +740,7 @@ class TestLaunchdServiceRecovery:
         calls = []
         domain = gateway_cli._launchd_domain()
         target = f"{domain}/{label}"
+        monkeypatch.setattr(gateway_cli, "_launchd_candidate_domains", lambda: (domain,))
 
         def fake_run(cmd, check=False, **kwargs):
             if cmd and cmd[0] == "launchctl":
@@ -728,6 +768,8 @@ class TestLaunchdServiceRecovery:
         plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
         label = gateway_cli.get_launchd_label()
         target = f"{gateway_cli._launchd_domain()}/{label}"
+        domain = gateway_cli._launchd_domain()
+        monkeypatch.setattr(gateway_cli, "_launchd_candidate_domains", lambda: (domain,))
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
         monkeypatch.setattr(gateway_cli, "refresh_launchd_plist_if_needed", lambda: False)
@@ -783,7 +825,9 @@ class TestLaunchdServiceRecovery:
 
     def test_launchd_restart_falls_back_to_detached_on_error_5(self, monkeypatch, capsys):
         """kickstart -k error 5 (domain unmanageable) should relaunch detached."""
-        target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
+        domain = gateway_cli._launchd_domain()
+        target = f"{domain}/{gateway_cli.get_launchd_label()}"
+        monkeypatch.setattr(gateway_cli, "_launchd_candidate_domains", lambda: (domain,))
 
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 5.0)
         monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
