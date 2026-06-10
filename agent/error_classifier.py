@@ -741,6 +741,24 @@ def _classify_by_status(
     """Classify based on HTTP status code with message-aware refinement."""
 
     if status_code == 401:
+        # Some gateways wrap an upstream 400 request-validation rejection
+        # in a 401 response (e.g. "HTTP 401: [openai/gpt-5.5] [400]:
+        # Unsupported parameter: 'max_tokens'"). That is a malformed
+        # request, not an auth failure — rotating credentials cannot fix
+        # it and the auth label misleads the logs. Unlike the 500/502
+        # branch below, match only the parameter-specific signals:
+        # genuine OpenAI 401 auth errors carry type=invalid_request_error
+        # in the body, so that pattern would misroute real key failures.
+        if (
+            any(p in error_msg for p in _REQUEST_VALIDATION_PATTERNS
+                if p != "invalid_request_error")
+            or error_code.lower() in {"unknown_parameter", "unsupported_parameter"}
+        ):
+            return result_fn(
+                FailoverReason.format_error,
+                retryable=False,
+                should_fallback=True,
+            )
         # Not retryable on its own — credential pool rotation and
         # provider-specific refresh (Codex, Anthropic, Nous) run before
         # the retryability check in run_agent.py.  If those succeed, the

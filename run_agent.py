@@ -1256,8 +1256,19 @@ class AIAgent:
         'max_completion_tokens' for gpt-5.x models served via the
         OpenAI-compatible endpoint. OpenRouter, local models, and older
         OpenAI models use 'max_tokens'.
+
+        gpt-5.x models reject 'max_tokens' regardless of which gateway
+        serves them, so OpenAI-compatible proxies that forward params
+        verbatim (e.g. custom providers routing to OpenAI) also need
+        'max_completion_tokens' — match on the model name, not just the
+        URL, including router aliases like "gpt-5.5-combos".
         """
         if self._is_direct_openai_url() or self._is_azure_openai_url() or self._is_github_copilot_url():
+            return {"max_completion_tokens": value}
+        model = (getattr(self, "model", "") or "").lower()
+        if "/" in model:
+            model = model.rsplit("/", 1)[-1]
+        if model.startswith("gpt-5"):
             return {"max_completion_tokens": value}
         return {"max_tokens": value}
 
