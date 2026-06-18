@@ -360,6 +360,40 @@ class TestStreamRunMediaStripping:
 
         assert consumer.already_sent
 
+    @pytest.mark.asyncio
+    async def test_finalize_streaming_message_gets_cleaned_text(self):
+        """CardKit-style finalization must not reintroduce raw MEDIA tags."""
+
+        class CardKitLikeAdapter:
+            MAX_MESSAGE_LENGTH = 4096
+            REQUIRES_EDIT_FINALIZE = False
+
+            def __init__(self):
+                self.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="msg_1"))
+                self.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+                self.finalize_calls = []
+                self.truncate_message = lambda text, limit, len_fn=len: [text]
+                self.message_len_fn = len
+
+            async def finalize_streaming_message(self, message_id, content):
+                self.finalize_calls.append((message_id, content))
+                return SimpleNamespace(success=True)
+
+        adapter = CardKitLikeAdapter()
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5)
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        consumer.on_delta("打包好了\n")
+        consumer.on_delta("MEDIA:/tmp/solvely-web-abtest-impact.skill")
+        consumer.finish()
+
+        await consumer.run()
+
+        assert adapter.finalize_calls
+        finalized_text = adapter.finalize_calls[-1][1]
+        assert "MEDIA:" not in finalized_text
+        assert "打包好了" in finalized_text
+
 
 # ── Segment break (tool boundary) tests ──────────────────────────────────
 

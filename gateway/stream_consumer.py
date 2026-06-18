@@ -630,9 +630,13 @@ class GatewayStreamConsumer:
                             self._final_response_sent = await self._send_or_edit(self._accumulated)
                             if self._final_response_sent:
                                 self._final_content_delivered = True
-                    if self._message_id and getattr(type(self.adapter), "finalize_streaming_message", None):
+                    finalize_cls_fn = getattr(type(self.adapter), "finalize_streaming_message", None)
+                    if self._message_id and finalize_cls_fn is not None:
                         try:
-                            await self.adapter.finalize_streaming_message(self._message_id, self._accumulated or "")
+                            await getattr(self.adapter, "finalize_streaming_message")(  # type: ignore[attr-defined]
+                                self._message_id,
+                                self._clean_for_display(self._accumulated or ""),
+                            )
                         except Exception as _fin_err:
                             logger.warning("finalize_streaming_message failed: %s", _fin_err)
                     return
