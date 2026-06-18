@@ -1191,14 +1191,21 @@ MEDIA_DELIVERY_EXTS: Tuple[str, ...] = (
     ".mp3", ".wav", ".ogg", ".opus", ".m4a", ".flac",
     # Documents (uploaded as file attachments)
     ".pdf", ".docx", ".doc", ".odt", ".rtf", ".txt", ".md", ".epub",
+    ".pages", ".numbers",
     # Spreadsheets / data
-    ".xlsx", ".xls", ".ods", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml",
+    ".xlsx", ".xls", ".ods", ".csv", ".tsv", ".json", ".jsonl", ".ndjson",
+    ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".log",
+    ".sqlite", ".sqlite3", ".db", ".parquet", ".feather", ".avro", ".orc",
     # Presentations
     ".pptx", ".ppt", ".odp", ".key",
-    # Archives
+    # Archives / installers / packaged artifacts
     ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".apk", ".ipa",
-    # Web / rendered output
-    ".html", ".htm",
+    ".dmg", ".pkg", ".deb", ".rpm", ".whl", ".egg", ".jar", ".war", ".skill",
+    # Source / scripts / notebooks / diffs
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".css", ".scss",
+    ".less", ".html", ".htm", ".vue", ".svelte", ".go", ".rs", ".java", ".kt",
+    ".swift", ".c", ".h", ".cpp", ".hpp", ".cs", ".php", ".rb", ".sh",
+    ".bash", ".zsh", ".fish", ".sql", ".ipynb", ".patch", ".diff",
 )
 
 # Regex alternation fragment of bare extensions (no leading dot), e.g.

@@ -136,6 +136,18 @@ caption
         assert tags == []
         assert voice is False
 
+    def test_skill_package_media_tag_is_extractable(self):
+        """Packaged .skill artifacts should deliver as native files, not raw text."""
+        from gateway.platforms.base import BasePlatformAdapter
+
+        media, cleaned = BasePlatformAdapter.extract_media(
+            "Here is the package:\nMEDIA:/tmp/solvely-config-deploy.skill"
+        )
+
+        assert media == [("/tmp/solvely-config-deploy.skill", False)]
+        assert "MEDIA:" not in cleaned
+        assert "solvely-config-deploy.skill" not in cleaned
+
     def test_gateway_auto_append_keeps_real_tts_media_tag(self):
         """TTS tool media tags are still auto-appended when the model omits them."""
         from gateway.run import _collect_auto_append_media_tags
@@ -213,6 +225,18 @@ caption
         assert len(tags) == 1, "Should extract media tag from current turn"
         assert "audio2.ogg" in tags[0]
         assert voice_directive is True
+
+    def test_base_adapter_extracts_skill_package_media_tag(self):
+        """Hermes .skill packages should be treated as deliverable attachments."""
+        from gateway.platforms.base import BasePlatformAdapter
+
+        media, cleaned = BasePlatformAdapter.extract_media(
+            "Sir，打包文件来了\n\nMEDIA:/tmp/solvely-config-deploy.skill"
+        )
+
+        assert media == [("/tmp/solvely-config-deploy.skill", False)]
+        assert "MEDIA:" not in cleaned
+        assert "打包文件来了" in cleaned
     
     def test_multiple_tts_calls_in_history_not_accumulated(self):
         """Multiple TTS calls in history should NOT accumulate in new responses."""
