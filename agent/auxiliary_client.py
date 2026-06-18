@@ -2537,6 +2537,7 @@ def _is_unsupported_parameter_error(exc: Exception, param: str) -> bool:
         return False
     return any(marker in err_lower for marker in (
         "unsupported parameter",
+        "unsupported value",
         "unsupported_parameter",
         "not supported",
         "does not support",
