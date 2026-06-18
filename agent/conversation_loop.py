@@ -71,6 +71,43 @@ logger = logging.getLogger(__name__)
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
 
+def _looks_like_unsupported_sampling_param_error(error_text: str) -> bool:
+    """Return True when a provider rejects temperature/top_p/top_k values.
+
+    Some OpenAI-compatible gateways wrap upstream 400 validation failures in a
+    401/AuthenticationError shell.  Classifying by status alone then aborts as
+    "bad credentials" before Hermes can recover.  Match the provider's own
+    message instead and retry without sampling parameters.
+    """
+    err = (error_text or "").lower()
+    if not err:
+        return False
+    sampling_params = ("temperature", "top_p", "top_k")
+    if not any(param in err for param in sampling_params):
+        return False
+    return any(marker in err for marker in (
+        "unsupported value",
+        "unsupported parameter",
+        "unsupported_parameter",
+        "does not support",
+        "not supported",
+        "unknown parameter",
+        "invalid parameter",
+    ))
+
+
+def _strip_sampling_params_from_api_kwargs(api_kwargs: Any) -> int:
+    """Remove sampling params from an OpenAI-style request dict in-place."""
+    if not isinstance(api_kwargs, dict):
+        return 0
+    removed = 0
+    for key in ("temperature", "top_p", "top_k"):
+        if key in api_kwargs:
+            api_kwargs.pop(key, None)
+            removed += 1
+    return removed
+
+
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
@@ -951,6 +988,9 @@ def run_conversation(
                         )
                 except Exception:
                     pass
+
+                if getattr(agent, "_omit_sampling_params", False):
+                    _strip_sampling_params_from_api_kwargs(api_kwargs)
 
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
@@ -1966,6 +2006,29 @@ def run_conversation(
                     "unknown variant image_url, expected text",
                 )
                 _err_lower = _err_body.lower()
+
+                if (
+                    agent.api_mode == "chat_completions"
+                    and not _retry.sampling_params_retry_attempted
+                    and _looks_like_unsupported_sampling_param_error(_err_body or str(api_error))
+                ):
+                    _retry.sampling_params_retry_attempted = True
+                    agent._omit_sampling_params = True
+                    removed = _strip_sampling_params_from_api_kwargs(api_kwargs)
+                    if isinstance(getattr(agent, "request_overrides", None), dict):
+                        for _sampling_key in ("temperature", "top_p", "top_k"):
+                            agent.request_overrides.pop(_sampling_key, None)
+                    agent._buffer_vprint(
+                        f"⚠️  Provider rejected sampling parameter(s) — "
+                        f"omitting temperature/top_p/top_k and retrying..."
+                    )
+                    logger.warning(
+                        "%sSampling-parameter recovery: stripped %d parameter(s) after provider rejection",
+                        agent.log_prefix,
+                        removed,
+                    )
+                    continue
+
                 _looks_like_image_rejection = any(
                     p in _err_lower for p in _IMAGE_REJECTION_PHRASES
                 )

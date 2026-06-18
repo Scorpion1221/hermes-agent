@@ -23,6 +23,7 @@ from agent.codex_responses_adapter import _normalize_codex_response
 import run_agent
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
+from agent.conversation_loop import _looks_like_unsupported_sampling_param_error
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
 
@@ -52,6 +53,16 @@ def test_is_destructive_command_treats_cp_as_mutating():
 
 def test_is_destructive_command_treats_install_as_mutating():
     assert run_agent._is_destructive_command("install template.env .env") is True
+
+
+def test_unsupported_sampling_param_error_detects_wrapped_401():
+    err = "HTTP 401: [openai/gpt-5.5] [400]: Unsupported value: 'temperature' does not support 0.3"
+    assert _looks_like_unsupported_sampling_param_error(err) is True
+
+
+def test_unsupported_sampling_param_error_does_not_match_plain_auth():
+    err = "HTTP 401: invalid API key"
+    assert _looks_like_unsupported_sampling_param_error(err) is False
 
 
 @pytest.fixture()
@@ -5062,6 +5073,22 @@ class TestMaxTokensParam:
         agent.base_url = "https://api.githubcopilot.com/chat/completions"
         result = agent._max_tokens_param(4096)
         assert result == {"max_completion_tokens": 4096}
+
+    def test_omit_sampling_params_strips_request_overrides(self, agent):
+        """Runtime sampling-param recovery removes temperature/top_p/top_k from chat requests."""
+        agent.provider = "custom"
+        agent.base_url = "https://9router.yqbqnn.com/v1"
+        agent.api_mode = "chat_completions"
+        agent.model = "gpt-5.5-combos"
+        agent.request_overrides = {"temperature": 0.3, "top_p": 0.9, "top_k": 40, "service_tier": "auto"}
+        agent._omit_sampling_params = True
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+        assert "temperature" not in kwargs
+        assert "top_p" not in kwargs
+        assert "top_k" not in kwargs
+        assert kwargs["service_tier"] == "auto"
 
 
 class TestGpt5ApiModeRouting:

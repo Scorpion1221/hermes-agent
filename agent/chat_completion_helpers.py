@@ -681,14 +681,25 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
 
     # Temperature: _fixed_temperature_for_model may return OMIT_TEMPERATURE
     # sentinel (temperature omitted entirely), a numeric override, or None.
+    # Some OpenAI-compatible gateways only reveal strict sampling contracts at
+    # runtime (e.g. gpt-5.5 rejecting temperature=0.3).  The conversation loop
+    # sets _omit_sampling_params after the first provider error; honor it here
+    # so retries and later turns are built without temperature/top_p/top_k.
+    _omit_sampling_params = bool(getattr(agent, "_omit_sampling_params", False))
     try:
         from agent.auxiliary_client import _fixed_temperature_for_model, OMIT_TEMPERATURE
         _ft = _fixed_temperature_for_model(agent.model, agent.base_url)
-        _omit_temp = _ft is OMIT_TEMPERATURE
+        _omit_temp = _omit_sampling_params or _ft is OMIT_TEMPERATURE
         _fixed_temp = _ft if not _omit_temp else None
     except Exception:
-        _omit_temp = False
+        _omit_temp = _omit_sampling_params
         _fixed_temp = None
+
+    _request_overrides = agent.request_overrides
+    if _omit_sampling_params and isinstance(_request_overrides, dict):
+        _request_overrides = dict(_request_overrides)
+        for _sampling_key in ("temperature", "top_p", "top_k"):
+            _request_overrides.pop(_sampling_key, None)
 
     # Provider preferences (OpenRouter-style)
     _prefs: Dict[str, Any] = {}
@@ -751,7 +762,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             ephemeral_max_output_tokens=_ephemeral_out,
             max_tokens_param_fn=agent._max_tokens_param,
             reasoning_config=agent.reasoning_config,
-            request_overrides=agent.request_overrides,
+            request_overrides=_request_overrides,
             session_id=getattr(agent, "session_id", None),
             provider_profile=_profile,
             ollama_num_ctx=agent._ollama_num_ctx,
@@ -783,7 +794,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param,
         reasoning_config=agent.reasoning_config,
-        request_overrides=agent.request_overrides,
+        request_overrides=_request_overrides,
         session_id=getattr(agent, "session_id", None),
         model_lower=(agent.model or "").lower(),
         is_openrouter=_is_or,
