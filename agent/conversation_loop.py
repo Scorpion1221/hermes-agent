@@ -108,6 +108,17 @@ def _strip_sampling_params_from_api_kwargs(api_kwargs: Any) -> int:
     return removed
 
 
+def _parse_reset_after_seconds(error_text: str) -> Optional[float]:
+    """Extract provider reset hints like ``reset after 27s`` from errors."""
+    m = re.search(r"\breset\s+after\s+(\d+(?:\.\d+)?)\s*s\b", error_text or "", re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return min(max(float(m.group(1)), 0.0), 120.0)
+    except (TypeError, ValueError):
+        return None
+
+
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
@@ -2022,11 +2033,30 @@ def run_conversation(
                         f"⚠️  Provider rejected sampling parameter(s) — "
                         f"omitting temperature/top_p/top_k and retrying..."
                     )
-                    logger.warning(
-                        "%sSampling-parameter recovery: stripped %d parameter(s) after provider rejection",
-                        agent.log_prefix,
-                        removed,
-                    )
+                    reset_after = _parse_reset_after_seconds(_err_body or str(api_error))
+                    if reset_after:
+                        wait_time = reset_after + 1.0
+                        agent._buffer_status(
+                            f"⏱️ Provider reset window after sampling-param rejection. "
+                            f"Waiting {wait_time:.1f}s before retrying without sampling params..."
+                        )
+                        logger.warning(
+                            "%sSampling-parameter recovery: stripped %d parameter(s); waiting %.1fs before retry",
+                            agent.log_prefix,
+                            removed,
+                            wait_time,
+                        )
+                        sleep_end = time.time() + wait_time
+                        while time.time() < sleep_end:
+                            if agent._interrupt_requested:
+                                break
+                            time.sleep(0.2)
+                    else:
+                        logger.warning(
+                            "%sSampling-parameter recovery: stripped %d parameter(s) after provider rejection",
+                            agent.log_prefix,
+                            removed,
+                        )
                     continue
 
                 _looks_like_image_rejection = any(

@@ -23,7 +23,10 @@ from agent.codex_responses_adapter import _normalize_codex_response
 import run_agent
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
-from agent.conversation_loop import _looks_like_unsupported_sampling_param_error
+from agent.conversation_loop import (
+    _looks_like_unsupported_sampling_param_error,
+    _parse_reset_after_seconds,
+)
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
 
@@ -63,6 +66,15 @@ def test_unsupported_sampling_param_error_detects_wrapped_401():
 def test_unsupported_sampling_param_error_does_not_match_plain_auth():
     err = "HTTP 401: invalid API key"
     assert _looks_like_unsupported_sampling_param_error(err) is False
+
+
+def test_parse_reset_after_seconds_from_provider_message():
+    err = "Unsupported value: 'temperature' does not support 0.3 with thi (reset after 27s)"
+    assert _parse_reset_after_seconds(err) == 27.0
+
+
+def test_parse_reset_after_seconds_missing_returns_none():
+    assert _parse_reset_after_seconds("HTTP 401: invalid API key") is None
 
 
 @pytest.fixture()
