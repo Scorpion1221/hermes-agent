@@ -43,14 +43,12 @@
 }
 
 /* ------------------------------------------------------------------ */
-/* Hermes Agent — Nous DS with the LENS_0 (Hermes teal) lens applied   */
-/* statically. Mirrors nousnet-web/(hermes-agent)/layout.tsx so the    */
-/* canonical Hermes palette is the default ��� teal canvas + cream      */
-/* accent ��� without relying on leva/gsap at runtime.                  */
+/* Hermes Agent — Nous DS with the LENS_0 (Hermes teal) palette applied
+   statically as the default dashboard theme. */
 /* ------------------------------------------------------------------ */
 
 :root {
-  /* LENS_0 ��� from design-language/src/ui/components/overlays/index.tsx.
+  /* LENS_0 — from design-language/src/ui/components/overlays/index.tsx.
      These are the defaults for the `default` (Hermes Teal) dashboard theme;
      ThemeProvider rewrites them as inline styles when a user switches themes. */
   --foreground: color-mix(in srgb, #ffffff 0%, transparent);
@@ -67,7 +65,7 @@
   --warm-glow: rgba(255, 189, 56, 0.35);
   --noise-opacity-mul: 1;
 
-  /* Typography tokens ��� rewritten by ThemeProvider. Defaults match the
+  /* Typography tokens — rewritten by ThemeProvider. Defaults match the
      system stack so themes that don't override look native. */
   --theme-font-sans: system-ui, -apple-system, "Segoe UI", Roboto,
     "Helvetica Neue", Arial, sans-serif;
@@ -233,7 +231,7 @@ code { font-size: 0.875rem; }
   mix-blend-mode: plus-lighter;
 }
 
-/* System UI-monospace stack ��� distinct from `font-courier` (Courier
+/* System UI-monospace stack — distinct from `font-courier` (Courier
    Prime), used for dense data readouts where the display font would
    break the grid. Routes through the theme's mono stack so themes
    with a different monospace (JetBrains Mono, IBM Plex Mono, etc.)
@@ -258,7 +256,7 @@ code { font-size: 0.875rem; }
 
 /* When a theme provides `assets.bg`, the backdrop's <div> renders it as
    a CSS background; the default filler <img> is hidden to prevent
-   double-compositing. Unset ��� initial ��� empty, so the :not() selector
+   double-compositing. Unset / initial / empty, so the :not() selector
    matches and the default image stays visible. */
 :root:not([style*="--theme-asset-bg:"]) .theme-default-filler {
   display: block;
