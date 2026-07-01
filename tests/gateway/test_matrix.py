@@ -1258,6 +1258,33 @@ class TestMatrixRequirements:
              patch("tools.lazy_deps.feature_missing", return_value=()):
             assert matrix_mod.check_matrix_requirements() is False
 
+    def test_check_requirements_encryption_true_installs_e2ee_deps(self, monkeypatch):
+        """E2EE deps are installed only after E2EE is explicitly requested."""
+        monkeypatch.setenv("MATRIX_ACCESS_TOKEN", "syt_test")
+        monkeypatch.setenv("MATRIX_HOMESERVER", "https://matrix.example.org")
+        monkeypatch.setenv("MATRIX_ENCRYPTION", "true")
+
+        import plugins.platforms.matrix.adapter as matrix_mod
+
+        def _missing(feature):
+            if feature == "platform.matrix":
+                return ()
+            if feature == "platform.matrix_e2ee":
+                return ("python-olm==3.2.16",)
+            return ()
+
+        installed = []
+
+        def _ensure(feature, **kwargs):
+            installed.append(feature)
+
+        with patch.object(matrix_mod, "_check_e2ee_deps", side_effect=[False, True]), \
+             patch("tools.lazy_deps.feature_missing", side_effect=_missing), \
+             patch("tools.lazy_deps.ensure", side_effect=_ensure):
+            assert matrix_mod.check_matrix_requirements() is True
+
+        assert installed == ["platform.matrix_e2ee"]
+
     def test_check_requirements_e2ee_optional_no_deps_ok(self, monkeypatch):
         """MATRIX_E2EE_MODE=optional should not block startup without python-olm."""
         monkeypatch.setenv("MATRIX_ACCESS_TOKEN", "syt_test")

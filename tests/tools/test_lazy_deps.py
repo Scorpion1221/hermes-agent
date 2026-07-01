@@ -326,6 +326,27 @@ class TestActiveFeatures:
         )
         assert "platform.slack" in ld.active_features()
 
+    def test_matrix_e2ee_not_active_when_not_requested(self, monkeypatch):
+        monkeypatch.delenv("MATRIX_E2EE_MODE", raising=False)
+        monkeypatch.delenv("MATRIX_ENCRYPTION", raising=False)
+        monkeypatch.setattr(
+            ld,
+            "_is_present",
+            lambda spec: ld._pkg_name_from_spec(spec) == "pycryptodome",
+        )
+
+        assert "platform.matrix_e2ee" not in ld.active_features()
+
+    def test_matrix_e2ee_active_when_requested(self, monkeypatch):
+        monkeypatch.setenv("MATRIX_ENCRYPTION", "true")
+        monkeypatch.setattr(
+            ld,
+            "_is_present",
+            lambda spec: ld._pkg_name_from_spec(spec) == "pycryptodome",
+        )
+
+        assert "platform.matrix_e2ee" in ld.active_features()
+
 
 class TestRefreshActiveFeatures:
     def test_no_active_features_returns_empty(self, monkeypatch):

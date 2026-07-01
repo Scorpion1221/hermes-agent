@@ -169,7 +169,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "aiohttp==3.14.1",  # CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
     ),
     "platform.matrix": (
-        "mautrix[encryption]==0.21.0",
+        "mautrix==0.21.0",
         "aiosqlite==0.22.1",
         "asyncpg==0.31.0",
         "aiohttp-socks==0.11.0",
@@ -177,6 +177,16 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         # aiohttp transitively, so a vulnerable already-installed aiohttp still
         # satisfies both — pin the patched floor here too, like platform.discord.
         "aiohttp==3.14.1",  # CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
+    ),
+    # Matrix end-to-end encryption is intentionally separate from the base
+    # adapter deps. ``mautrix[encryption]`` pulls python-olm, which has no
+    # modern macOS/Windows wheel and often fails from sdist. Only install this
+    # group when Matrix E2EE is actually requested.
+    "platform.matrix_e2ee": (
+        "base58==2.1.1",
+        "pycryptodome==3.23.0",
+        "python-olm==3.2.16",
+        "unpaddedbase64==2.1.0",
     ),
     "platform.dingtalk": (
         "dingtalk-stream==0.24.3",
@@ -829,6 +839,20 @@ def feature_install_command(feature: str) -> Optional[str]:
     return "uv pip install " + " ".join(repr(s) for s in specs)
 
 
+def _matrix_e2ee_requested() -> bool:
+    """Return True when Matrix E2EE deps are relevant for this runtime."""
+    explicit = os.environ.get("MATRIX_E2EE_MODE", "").strip().lower()
+    if explicit:
+        return explicit not in {"off", "false", "0", "no", "disabled", "disable"}
+    return os.environ.get("MATRIX_ENCRYPTION", "").strip().lower() in {
+        "true",
+        "1",
+        "yes",
+        "on",
+        "required",
+    }
+
+
 def active_features() -> list[str]:
     """Return the list of features the user has ever lazy-installed.
 
@@ -841,6 +865,8 @@ def active_features() -> list[str]:
     """
     active = []
     for feature, specs in LAZY_DEPS.items():
+        if feature == "platform.matrix_e2ee" and not _matrix_e2ee_requested():
+            continue
         if any(_is_present(s) for s in specs):
             active.append(feature)
     return active

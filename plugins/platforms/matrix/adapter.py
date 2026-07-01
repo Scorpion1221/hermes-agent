@@ -665,13 +665,15 @@ def _pre_sanitize_matrix_markdown(text: str) -> str:
 def check_matrix_requirements() -> bool:
     """Return True if the Matrix adapter can be used.
 
-    Lazy-installs the full ``platform.matrix`` feature group via
+    Lazy-installs the base ``platform.matrix`` feature group via
     ``tools.lazy_deps.ensure_and_bind`` whenever any of the declared
     packages (mautrix, Markdown, aiosqlite, asyncpg, aiohttp-socks) is
     missing — not just mautrix itself.  Previously this short-circuited on
     ``import mautrix``, which left the other four packages uninstalled
     forever and broke E2EE connect with ``No module named 'asyncpg'``
-    (#31116).  Rebinds module-level type globals on success.
+    (#31116). E2EE-only dependencies (python-olm and friends) are installed
+    separately only when E2EE is requested.  Rebinds module-level type
+    globals on success.
     """
     token = os.getenv("MATRIX_ACCESS_TOKEN", "")
     password = os.getenv("MATRIX_PASSWORD", "")
@@ -684,16 +686,16 @@ def check_matrix_requirements() -> bool:
         logger.warning("Matrix: MATRIX_HOMESERVER not set")
         return False
 
-    # Check whether any package in the platform.matrix feature group is
-    # missing.  ``feature_missing`` is cheap (per-spec importlib.metadata
-    # lookups) and correctly handles ``mautrix[encryption]`` by stripping
-    # the extras marker before checking the bare package.
+    # Check whether any package in the base platform.matrix feature group is
+    # missing. ``feature_missing`` is cheap (per-spec importlib.metadata
+    # lookups) and avoids importing mautrix just to test availability.
     try:
-        from tools.lazy_deps import feature_missing, ensure_and_bind
+        from tools.lazy_deps import ensure, feature_missing, ensure_and_bind
         missing = feature_missing("platform.matrix")
     except Exception as exc:  # pragma: no cover — defensive
         logger.debug("Matrix: lazy_deps lookup failed: %s", exc)
         missing = ()
+        ensure = None  # type: ignore[assignment]
         ensure_and_bind = None  # type: ignore[assignment]
 
     if missing or ensure_and_bind is None:
@@ -721,14 +723,28 @@ def check_matrix_requirements() -> bool:
         if not ensure_and_bind("platform.matrix", _import, globals(), prompt=False):
             logger.warning(
                 "Matrix: required packages not installed (%s). "
-                "Run: pip install 'mautrix[encryption]' asyncpg aiosqlite "
-                "Markdown aiohttp-socks",
+                "Run: pip install mautrix asyncpg aiosqlite aiohttp-socks",
                 ", ".join(missing) if missing else "platform.matrix",
             )
             return False
 
     e2ee_mode = _resolve_e2ee_mode()
-    if e2ee_mode == "required" and not _check_e2ee_deps():
+    e2ee_available = True
+    if e2ee_mode != "off":
+        e2ee_available = _check_e2ee_deps()
+        if not e2ee_available and ensure is not None:
+            try:
+                e2ee_missing = feature_missing("platform.matrix_e2ee")
+            except Exception:
+                e2ee_missing = ()
+            if e2ee_missing:
+                try:
+                    ensure("platform.matrix_e2ee", prompt=False)
+                except Exception as exc:
+                    logger.warning("Matrix: E2EE dependency install failed: %s", exc)
+                e2ee_available = _check_e2ee_deps()
+
+    if e2ee_mode == "required" and not e2ee_available:
         logger.error(
             "Matrix: E2EE is required but dependencies are missing. %s. "
             "Without this, encrypted rooms will not work. "
@@ -736,7 +752,7 @@ def check_matrix_requirements() -> bool:
             _E2EE_INSTALL_HINT,
         )
         return False
-    if e2ee_mode == "optional" and not _check_e2ee_deps():
+    if e2ee_mode == "optional" and not e2ee_available:
         logger.warning(
             "Matrix: E2EE optional but dependencies are missing. %s",
             _E2EE_INSTALL_HINT,
@@ -4407,18 +4423,31 @@ def interactive_setup() -> None:
         matrix_pkg = "mautrix[encryption]" if want_e2ee else "mautrix"
         try:
             from tools.lazy_deps import ensure as _lazy_ensure, feature_missing
-            _missing_before = feature_missing("platform.matrix")
-            if _missing_before:
-                print_info(f"Installing {matrix_pkg} (+ {len(_missing_before)} runtime deps)...")
+            base_missing = feature_missing("platform.matrix")
+            if base_missing:
+                print_info(f"Installing mautrix (+ {len(base_missing)} runtime deps)...")
                 try:
                     _lazy_ensure("platform.matrix", prompt=False)
-                    print_success(f"{matrix_pkg} installed")
+                    print_success("mautrix installed")
                 except Exception as exc:
                     print_warning(
                         "Install failed — run manually: pip install "
-                        "'mautrix[encryption]' asyncpg aiosqlite Markdown aiohttp-socks"
+                        "mautrix asyncpg aiosqlite aiohttp-socks"
                     )
                     print_info(f"  Error: {exc}")
+            if want_e2ee:
+                e2ee_missing = feature_missing("platform.matrix_e2ee")
+                if e2ee_missing:
+                    print_info(f"Installing Matrix E2EE deps (+ {len(e2ee_missing)} packages)...")
+                    try:
+                        _lazy_ensure("platform.matrix_e2ee", prompt=False)
+                        print_success("Matrix E2EE deps installed")
+                    except Exception as exc:
+                        print_warning(
+                            "E2EE install failed — run manually: pip install "
+                            "'mautrix[encryption]'"
+                        )
+                        print_info(f"  Error: {exc}")
         except ImportError:
             try:
                 __import__("mautrix")
@@ -4426,14 +4455,19 @@ def interactive_setup() -> None:
                 print_info(f"Installing {matrix_pkg}...")
                 import subprocess
                 uv_bin = shutil.which("uv")
+                fallback_specs = (
+                    [matrix_pkg, "asyncpg", "aiosqlite", "aiohttp-socks"]
+                    if want_e2ee else
+                    ["mautrix", "asyncpg", "aiosqlite", "aiohttp-socks"]
+                )
                 if uv_bin:
                     result = subprocess.run(
-                        [uv_bin, "pip", "install", "--python", _sys.executable, matrix_pkg],
+                        [uv_bin, "pip", "install", "--python", _sys.executable, *fallback_specs],
                         capture_output=True, text=True,
                     )
                 else:
                     result = subprocess.run(
-                        [_sys.executable, "-m", "pip", "install", matrix_pkg],
+                        [_sys.executable, "-m", "pip", "install", *fallback_specs],
                         capture_output=True, text=True,
                     )
                 if result.returncode == 0:
@@ -4441,7 +4475,7 @@ def interactive_setup() -> None:
                 else:
                     print_warning(
                         f"Install failed — run manually: pip install "
-                        f"'{matrix_pkg}' asyncpg aiosqlite Markdown aiohttp-socks"
+                        f"'{matrix_pkg}' asyncpg aiosqlite aiohttp-socks"
                     )
 
         print_info("🔒 Security: Restrict who can use your bot")
