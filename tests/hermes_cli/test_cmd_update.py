@@ -799,6 +799,55 @@ class TestCmdUpdateCheckBranchFlag:
         rev_list_cmds = [c for c in commands if "rev-list" in c]
         assert any("upstream/main" in c for c in rev_list_cmds), rev_list_cmds
 
+    @patch("hermes_cli.config.detect_install_method", return_value="git")
+    @patch("subprocess.run")
+    def test_check_without_branch_uses_fork_maintenance_branch(
+        self, mock_run, _mock_method, capsys
+    ):
+        """Fork checkouts should check the branch a plain update would pull.
+
+        Regression: ``hermes update --check`` defaulted to upstream/main even
+        though the fork-aware install path tracks origin/develop.
+        """
+
+        def side_effect(cmd, **kwargs):
+            joined = " ".join(str(c) for c in cmd)
+
+            if "remote get-url origin" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="git@github.com:Scorpion1221/hermes-agent.git\n", stderr=""
+                )
+
+            if "rev-parse" in joined and "--abbrev-ref" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="develop\n", stderr="")
+
+            if "fetch" in joined and "origin" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            if "rev-parse" in joined and "--verify" in joined:
+                assert "origin/develop" in joined
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            if "rev-parse" in joined and "--is-shallow-repository" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="false\n", stderr="")
+
+            if "rev-list" in joined:
+                assert "origin/develop" in joined
+                return subprocess.CompletedProcess(cmd, 0, stdout="0\n", stderr="")
+
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        mock_run.side_effect = side_effect
+        args = SimpleNamespace(check=True, branch=None)
+
+        cmd_update(args)
+
+        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        assert not any("fetch" in c and "upstream" in c for c in commands), commands
+        assert any("fetch" in c and "origin develop" in c for c in commands), commands
+        rev_list_cmds = [c for c in commands if "rev-list" in c]
+        assert any("origin/develop" in c for c in rev_list_cmds), rev_list_cmds
+
     @patch("hermes_cli.config.detect_install_method", return_value="pip")
     @patch("hermes_cli.banner.check_via_pypi", return_value=0)
     @patch("subprocess.run")

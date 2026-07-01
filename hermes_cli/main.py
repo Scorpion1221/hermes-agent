@@ -8414,6 +8414,46 @@ def _resolve_update_branch(args) -> str:
     return (getattr(args, "branch", None) or "main").strip() or "main"
 
 
+def _resolve_update_check_branch(args) -> str:
+    """Choose the branch for ``hermes update --check``.
+
+    The install path uses ``_select_update_branch`` so fork checkouts can track
+    their maintained branch (``develop`` for Scorpion1221) without requiring an
+    explicit ``--branch``. Keep the check path aligned with that policy;
+    otherwise ``hermes update --check`` can report updates on upstream/main that
+    a subsequent plain ``hermes update`` would not install.
+    """
+    explicit_branch = getattr(args, "branch", None)
+    if explicit_branch:
+        return _resolve_update_branch(args)
+
+    git_dir = PROJECT_ROOT / ".git"
+    if not git_dir.exists():
+        return _resolve_update_branch(args)
+
+    git_cmd = ["git"]
+    if sys.platform == "win32":
+        git_cmd = ["git", "-c", "windows.appendAtomically=false"]
+
+    try:
+        result = subprocess.run(
+            git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        current_branch = result.stdout.strip() if result.returncode == 0 else "HEAD"
+        origin_url = _get_origin_url(git_cmd, PROJECT_ROOT)
+        return _select_update_branch(
+            git_cmd,
+            PROJECT_ROOT,
+            current_branch or "HEAD",
+            _is_fork(origin_url),
+        )
+    except Exception:
+        return _resolve_update_branch(args)
+
+
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     """Implement ``hermes update --check``: fetch and report without installing.
 
@@ -9143,8 +9183,9 @@ def cmd_update(args):
 
     if getattr(args, "check", False):
         # --check honors --branch so the "any new commits?" answer matches
-        # what a subsequent `hermes update --branch=<x>` would actually pull.
-        branch = _resolve_update_branch(args)
+        # what a subsequent `hermes update` would actually pull (including
+        # fork-aware auto-selection when --branch is omitted).
+        branch = _resolve_update_check_branch(args)
         _cmd_update_check(
             branch=branch,
             branch_explicit=bool(getattr(args, "branch", None)),

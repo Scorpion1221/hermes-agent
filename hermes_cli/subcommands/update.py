@@ -55,7 +55,9 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         default=None,
         metavar="NAME",
         help=(
-            "Update against this branch instead of the default (main). "
+            "Update against this branch instead of the auto-selected default "
+            "(current maintenance branch; fork installs prefer develop, "
+            "official installs prefer main). "
             "If the local checkout is on a different branch, hermes will "
             "switch to the requested branch first (auto-stashing any "
             "uncommitted changes)."
