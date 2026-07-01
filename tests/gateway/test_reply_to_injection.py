@@ -160,6 +160,33 @@ async def test_no_prefix_when_reply_to_text_is_empty():
 
 
 @pytest.mark.asyncio
+async def test_run_agent_forwards_reply_context_to_inner(monkeypatch):
+    """Regression: _run_agent_inner reads reply_context; wrapper must pass it."""
+    runner = _make_runner()
+    source = _source()
+    seen = {}
+
+    async def fake_inner(message, context_prompt, history, source_arg, session_id, **kwargs):
+        seen.update(kwargs)
+        return {"final_response": "ok"}
+
+    monkeypatch.setattr(runner, "_run_agent_inner", fake_inner)
+
+    result = await runner._run_agent(
+        message="What's the best time to go?",
+        context_prompt="context",
+        history=[],
+        source=source,
+        session_id="session-1",
+        session_key="session-key",
+        reply_context="Japan is great for culture.",
+    )
+
+    assert result == {"final_response": "ok"}
+    assert seen["reply_context"] == "Japan is great for culture."
+
+
+@pytest.mark.asyncio
 async def test_reply_snippet_truncated_to_500_chars():
     runner = _make_runner()
     source = _source()
