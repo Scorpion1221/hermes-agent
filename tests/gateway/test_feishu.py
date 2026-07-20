@@ -197,6 +197,16 @@ class TestFeishuMessageNormalization(unittest.TestCase):
 
 
 class TestFeishuAdapterMessaging(unittest.TestCase):
+    @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
+    def test_websocket_sdk_accepts_channel_ua_tag(self):
+        """The shipped SDK must support the Channel signaling argument."""
+        import inspect
+
+        from lark_oapi.ws import Client as FeishuWSClient
+
+        signature = inspect.signature(FeishuWSClient)
+        self.assertIn("extra_ua_tags", signature.parameters)
+
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_app",
         "FEISHU_APP_SECRET": "secret_app",
@@ -437,6 +447,65 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertTrue(connected)
         self.assertEqual(sleeps, [1])
         self.assertEqual(fake_loop.calls, 2)
+
+    @patch.dict(os.environ, {
+        "FEISHU_APP_ID": "cli_app",
+        "FEISHU_APP_SECRET": "secret_app",
+    }, clear=True)
+    def test_connect_websocket_sets_channel_ua_tag(self):
+        """Verify that FeishuWSClient receives extra_ua_tags=["channel"].
+
+        Without this UA tag the Feishu server does not push group @mention
+        events over the WebSocket transport.  See
+        https://github.com/NousResearch/hermes-agent/issues/50656
+        """
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        ws_client = SimpleNamespace()
+
+        with (
+            patch("plugins.platforms.feishu.adapter.FEISHU_AVAILABLE", True),
+            patch("plugins.platforms.feishu.adapter.FEISHU_WEBSOCKET_AVAILABLE", True),
+            patch("plugins.platforms.feishu.adapter.lark",
+                  SimpleNamespace(LogLevel=SimpleNamespace(INFO="INFO", WARNING="WARNING"))),
+            patch("plugins.platforms.feishu.adapter.EventDispatcherHandler") as mock_handler_class,
+            patch("plugins.platforms.feishu.adapter.FeishuWSClient") as mock_ws_client,
+            patch("plugins.platforms.feishu.adapter._run_official_feishu_ws_client"),
+            patch("plugins.platforms.feishu.adapter.acquire_scoped_lock", return_value=(True, None)),
+            patch("plugins.platforms.feishu.adapter.release_scoped_lock"),
+            patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
+            patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
+        ):
+            _mock_event_dispatcher_builder(mock_handler_class)
+
+            loop = asyncio.new_event_loop()
+            future = loop.create_future()
+            future.set_result(None)
+
+            class _Loop:
+                def run_in_executor(self, *_args, **_kwargs):
+                    return future
+                def is_closed(self):
+                    return False
+
+            try:
+                with patch("plugins.platforms.feishu.adapter.asyncio.get_running_loop",
+                           return_value=_Loop()):
+                    connected = asyncio.run(adapter.connect())
+            finally:
+                loop.close()
+
+        self.assertTrue(connected)
+        # Verify the Channel SDK UA tag is present — this is the fix for
+        # group @mention message delivery over WebSocket.
+        mock_ws_client.assert_called_once()
+        call_kwargs = mock_ws_client.call_args.kwargs
+        self.assertIn("extra_ua_tags", call_kwargs,
+                      "FeishuWSClient must receive extra_ua_tags for group @mention delivery")
+        self.assertEqual(call_kwargs["extra_ua_tags"], ["channel"],
+                         "extra_ua_tags must be ['channel'] to enable group event routing")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_edit_message_updates_existing_feishu_message(self):
@@ -3171,6 +3240,85 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(msg_type, "interactive")
         card = json.loads(payload)
         self.assertEqual(card["body"]["elements"][0]["content"], content)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_uses_interactive_card_for_every_markdown_chunk(self):
+        """Every chunk stays on the fork's Card 2.0 markdown path."""
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = []
+
+        class _MessageAPI:
+            def create(self, request):
+                captured.append(request)
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id=f"om_chunk_{len(captured)}"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        first_chunk = "Here is a short intro that has no markdown markers at all."
+        second_chunk = "## Heading\nAnd then some **bold** text."
+
+        with patch.object(
+            adapter, "truncate_message", return_value=[first_chunk, second_chunk],
+        ), patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content=first_chunk + "\n" + second_chunk,
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(
+            [request.request_body.msg_type for request in captured],
+            ["interactive", "interactive"],
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_plain_text_message_uses_interactive_card(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = []
+
+        class _MessageAPI:
+            def create(self, request):
+                captured.append(request)
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_plain_card"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="just a plain sentence",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].request_body.msg_type, "interactive")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_uses_interactive_card_for_inline_markdown(self):
