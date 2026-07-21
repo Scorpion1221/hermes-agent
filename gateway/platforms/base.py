@@ -1501,6 +1501,8 @@ _MEDIA_UNCONDITIONAL_EXTS: Tuple[str, ...] = (
     ".xlsx", ".xls", ".ods", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml",
     ".pptx", ".ppt", ".odp", ".key",
     ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".apk", ".ipa",
+    # Fork contract: packaged Hermes skills are explicit deliverables.
+    ".skill",
     ".html", ".htm",
 )
 
