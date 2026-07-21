@@ -1,10 +1,8 @@
-"""Tests for Feishu adapter outbound markdown payload construction.
+"""Tests for the fork's Feishu Card 2.0 markdown payload construction.
 
 Reproduces the bug tracked in hermes-agent issue #52786:
-`_build_outbound_payload` was force-downgrading any message containing a
-markdown pipe table to ``msg_type=text``, so Feishu clients rendered the raw
-pipe-and-dash source instead of a table.  Empirically current Feishu clients
-render ``post``+``md`` tables natively, so the downgrade branch must be removed.
+All fork messages use a Card 2.0 ``markdown`` element.  Tables, plain text,
+and mixed markdown must stay on that one path without losing content.
 
 These tests guard the fix.  They invoke the real adapter via the project's
 plugin-loader helper so that no ``sys.path`` / ``sys.modules`` games are
@@ -32,38 +30,18 @@ def _call_build_outbound_payload(content: str) -> tuple[str, str]:
     return inst._build_outbound_payload(content)
 
 
-def _md_texts_from_post_payload(payload_str: str) -> list[str]:
-    """Pull every ``{tag:'md', text:'...'}`` element out of a Feishu post payload.
-
-    Real payload shape::
-
-        {"zh_cn": {"content": [[{"tag": "md", "text": "..."}], ...]}}
-
-    Helpers and tests need to introspect the ``md`` blocks regardless of
-    locale, so we walk the structure generically.
-    """
+def _markdown_texts_from_card(payload_str: str) -> list[str]:
+    """Return Card 2.0 markdown element contents."""
     payload = json.loads(payload_str)
-    if not isinstance(payload, dict):
-        return []
-    texts: list[str] = []
-    for lang_val in payload.values():
-        if not isinstance(lang_val, dict):
-            continue
-        content = lang_val.get("content", [])
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if isinstance(block, list):
-                candidates = block
-            else:
-                candidates = [block]
-            for el in candidates:
-                if isinstance(el, dict) and el.get("tag") == "md":
-                    texts.append(el.get("text", ""))
-    return texts
+    assert payload.get("schema") == "2.0"
+    return [
+        element.get("content", "")
+        for element in payload.get("body", {}).get("elements", [])
+        if isinstance(element, dict) and element.get("tag") == "markdown"
+    ]
 
 
-def test_markdown_table_uses_post_not_text():
+def test_markdown_table_uses_card_not_text():
     """Regression test for issue #52786 (and its older sibling #23938).
 
     A message whose only markdown is a table must take the ``post`` path,
@@ -75,32 +53,28 @@ def test_markdown_table_uses_post_not_text():
         "| 1     | 2     |"
     )
     msg_type, payload_str = _call_build_outbound_payload(content)
-    assert msg_type == "post", (
-        f"expected 'post' for a markdown table (issue #52786), got {msg_type!r}; "
-        "the table-downgrade branch in _build_outbound_payload has been re-introduced"
-    )
-    md_texts = _md_texts_from_post_payload(payload_str)
-    assert md_texts, f"post payload must include at least one md element; got {payload_str!r}"
+    assert msg_type == "interactive"
+    md_texts = _markdown_texts_from_card(payload_str)
+    assert md_texts, f"card payload must include a markdown element; got {payload_str!r}"
     joined = "".join(md_texts)
     assert "col A" in joined and "|" in joined, (
         "table text was lost or reformatted when switching from text to post"
     )
 
 
-def test_plain_text_without_markdown_still_uses_text():
-    """Negative control: a message with no markdown hints and no table must
-    still go to plain text.  Guards against accidentally promoting everything
-    to ``post``."""
-    msg_type, _ = _call_build_outbound_payload("just a plain sentence with no markup")
-    assert msg_type == "text"
+def test_plain_text_without_markdown_still_uses_card():
+    content = "just a plain sentence with no markup"
+    msg_type, payload = _call_build_outbound_payload(content)
+    assert msg_type == "interactive"
+    assert _markdown_texts_from_card(payload) == [content]
 
 
-def test_existing_markdown_heading_still_uses_post():
+def test_existing_markdown_heading_still_uses_card():
     """Sanity: the existing ``post`` path (heading / list / code / bold /
     link) must still work after the table downgrade is removed."""
     msg_type, payload_str = _call_build_outbound_payload("# hello world\n")
-    assert msg_type == "post"
-    md_texts = _md_texts_from_post_payload(payload_str)
+    assert msg_type == "interactive"
+    md_texts = _markdown_texts_from_card(payload_str)
     assert md_texts, f"expected at least one md element; got {payload_str!r}"
     assert any("hello world" in t for t in md_texts), (
         f"expected 'hello world' in md elements; got {md_texts!r}"
@@ -123,8 +97,8 @@ def test_table_combined_with_other_markdown_does_not_downgrade():
         "Let me know."
     )
     msg_type, payload_str = _call_build_outbound_payload(content)
-    assert msg_type == "post"
-    md_texts = _md_texts_from_post_payload(payload_str)
+    assert msg_type == "interactive"
+    md_texts = _markdown_texts_from_card(payload_str)
     joined = "\n".join(md_texts)
     assert "Here is the data" in joined, (
         "leading prose was lost when downgrading a mixed-table message"
