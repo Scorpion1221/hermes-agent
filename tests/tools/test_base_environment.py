@@ -150,17 +150,12 @@ class TestAtomicSnapshotWrite:
         assert f"export -p > {snap} " not in wrapped
         assert f"export -p > '{snap}'" not in wrapped
 
-    def test_temp_path_uses_bashpid_not_dollardollar(self):
-        """The temp name MUST use ``$BASHPID`` (the real subshell PID), not
-        ``$$``.  In ``&``-launched concurrent subshells ``$$`` stays the parent
-        shell's PID, so two writers would pick the same temp name, clobber each
-        other mid-write, and mv would publish a torn file — the corruption is
-        only narrowed, not closed.  This is the bug shared by every prior PR in
-        the #38249 cluster."""
+    def test_temp_path_uses_bashpid_with_legacy_bash_fallback(self):
+        """Use BASHPID when available and remain unique on macOS Bash 3.2."""
         env = _TestableEnv()
         env._snapshot_ready = True
         wrapped = env._wrap_command("echo hi", "/tmp")
-        assert "$BASHPID" in wrapped
+        assert "${BASHPID:-$$}.$RANDOM.$RANDOM" in wrapped
         # The bare $$ temp form must be gone.
         assert ".tmp.$$" not in wrapped
 
@@ -174,7 +169,10 @@ class TestAtomicSnapshotWrite:
         wrapped = env._wrap_command("echo hi", "/tmp")
         # The static path (with its space) is shlex-quoted as a single word, with
         # $BASHPID appended OUTSIDE the quotes so it still expands at runtime.
-        assert "'/tmp/has space/hermes-snap-x.sh.tmp.'$BASHPID" in wrapped
+        assert (
+            "'/tmp/has space/hermes-snap-x.sh.tmp.'"
+            "${BASHPID:-$$}.$RANDOM.$RANDOM" in wrapped
+        )
         # The space must never appear bare/unquoted in the temp token (that would
         # word-split into two args and break the redirect/mv).
         assert " space/hermes-snap-x.sh.tmp.$BASHPID" not in wrapped
@@ -207,7 +205,7 @@ class TestAtomicSnapshotWrite:
             pass
         boot = captured.get("cmd", "")
         assert ".tmp." in boot and "mv -f " in boot, boot
-        assert "$BASHPID" in boot
+        assert "${BASHPID:-$$}.$RANDOM.$RANDOM" in boot
         assert ".tmp.$$" not in boot
 
     def test_snapshot_writes_use_private_umask_after_user_command(self):
@@ -261,13 +259,14 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         import shlex
         snap = str(tmp_path / "hermes-snap-x.sh")
         _q = shlex.quote
-        _snap_tmp = _q(snap + ".tmp.") + "$BASHPID"
+        _snap_tmp_value = _q(snap + ".tmp.") + "${BASHPID:-$$}.$RANDOM.$RANDOM"
         # One writer iteration = the exact atomic sequence _wrap_command emits.
         writer = (
             "for i in $(seq 1 80); do "
             "export BIG_$i=$(head -c 600 /dev/zero | tr '\\0' x); "
-            f"{{ export -p > {_snap_tmp} && mv -f {_snap_tmp} {_q(snap)}; }} "
-            f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true; "
+            f"__snap_tmp={_snap_tmp_value}; "
+            f"{{ export -p > \"$__snap_tmp\" && mv -f \"$__snap_tmp\" {_q(snap)}; }} "
+            f"2>/dev/null || rm -f \"$__snap_tmp\" 2>/dev/null || true; "
             "done"
         )
         # Reader: repeatedly source the snapshot and check PATH never absorbs

@@ -492,12 +492,17 @@ class BaseEnvironment(ABC):
         # writers would pick the SAME temp name, clobber each other's temp
         # mid-write, and mv would then publish a torn file (the corruption is
         # only narrowed, not closed).  ``$BASHPID`` is the actual subshell PID
-        # and is genuinely unique per writer, which closes the race.  The
-        # static path is shell-quoted (Windows/Git-Bash drive letters, spaces)
-        # with ``$BASHPID`` left outside the quotes so it still expands.
-        _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # on Bash 4+, but macOS still ships Bash 3.2 where it is unset.  Fall
+        # back to ``$$`` plus two random components so background subshells do
+        # not collide there either.  The static path stays shell-quoted.
+        _snap_tmp_value = (
+            self._quote_shell_path(self._snapshot_path + ".tmp.")
+            + "${BASHPID:-$$}.$RANDOM.$RANDOM"
+        )
+        _snap_tmp = '"$__hermes_snap_tmp"'
         bootstrap = (
             f"umask 077\n"
+            f"__hermes_snap_tmp={_snap_tmp_value}\n"
             f"export -p > {_snap_tmp}\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
@@ -606,11 +611,13 @@ class BaseEnvironment(ABC):
         # Use atomic file replacement for env snapshot updates (issue #38249).
         # Assemble into a per-writer-unique temp file, then mv to atomically
         # replace the snapshot so concurrent source() calls never read a
-        # truncated/half-written file.  ``$BASHPID`` (not ``$$``) is the actual
-        # subshell PID — unique per concurrent ``&``-launched writer — so two
-        # writers never share a temp name and clobber each other before the mv.
-        # Static path shell-quoted (Windows/spaces); ``$BASHPID`` left to expand.
-        _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # truncated/half-written file.  Use BASHPID where available, with a
+        # Bash-3.2-safe ``$$`` + random fallback for macOS background jobs.
+        _snap_tmp_value = (
+            self._quote_shell_path(self._snapshot_path + ".tmp.")
+            + "${BASHPID:-$$}.$RANDOM.$RANDOM"
+        )
+        _snap_tmp = '"$__hermes_snap_tmp"'
 
         parts = []
 
@@ -621,6 +628,7 @@ class BaseEnvironment(ABC):
         # vars into every tool response (issue #15459).  Linux bash is
         # silent here, but the redirect is harmless.
         if self._snapshot_ready:
+            parts.append(f"__hermes_snap_tmp={_snap_tmp_value}")
             parts.append(
                 f"source {_quoted_snap} >/dev/null 2>&1 || true"
             )
