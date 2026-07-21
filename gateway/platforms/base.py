@@ -1486,12 +1486,30 @@ MEDIA_DELIVERY_EXTS: Tuple[str, ...] = (
     ".bash", ".zsh", ".fish", ".sql", ".ipynb", ".patch", ".diff",
 )
 
+# Explicit MEDIA tags historically accepted this narrower set without checking
+# the filesystem first; downstream delivery reported a missing file.  The fork
+# later widened ``MEDIA_DELIVERY_EXTS`` so bare local paths can attach source,
+# config, database, and package artifacts too.  Keep those added types on the
+# validated path introduced by #36060: they must exist and pass the media
+# delivery denylist instead of becoming unconditional merely because the broad
+# bare-path allowlist knows their extension.
+_MEDIA_UNCONDITIONAL_EXTS: Tuple[str, ...] = (
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".svg",
+    ".mp4", ".mov", ".avi", ".mkv", ".webm",
+    ".mp3", ".wav", ".ogg", ".opus", ".m4a", ".flac",
+    ".pdf", ".docx", ".doc", ".odt", ".rtf", ".txt", ".md", ".epub",
+    ".xlsx", ".xls", ".ods", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml",
+    ".pptx", ".ppt", ".odp", ".key",
+    ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".apk", ".ipa",
+    ".html", ".htm",
+)
+
 # Regex alternation fragment of bare extensions (no leading dot), e.g.
 # ``png|jpe?g|...``. ``jpe?g`` collapses jpg/jpeg into one branch. Sorted
 # longest-first so the alternation never matches a shorter ext as a prefix of
 # a longer one (e.g. ``.tar`` before ``.tar.gz`` components).
 _MEDIA_EXT_ALTERNATION = "|".join(
-    sorted((e.lstrip(".") for e in MEDIA_DELIVERY_EXTS), key=len, reverse=True)
+    sorted((e.lstrip(".") for e in _MEDIA_UNCONDITIONAL_EXTS), key=len, reverse=True)
 )
 
 # Anchored ``MEDIA:<path>`` cleanup pattern. Unlike the old loose
@@ -1540,14 +1558,14 @@ def _normalize_media_tag_path(raw: str) -> str:
 def _path_lacks_deliverable_extension(path: str) -> bool:
     """True when MEDIA_TAG_CLEANUP_RE's extension alternation does not cover
     ``path`` — either the basename has no extension at all (Caddyfile,
-    Makefile, …) or the extension is not in MEDIA_DELIVERY_EXTS (.py, .log,
-    .weirdext, …). Such paths route through the validated delivery pass
+    Makefile, …) or the extension is outside the historical unconditional
+    set (.py, .log, .weirdext, …). Such paths route through the validated delivery pass
     (``validate_media_delivery_path``) instead of the unconditional one, so
     every file type is deliverable (#36060) while nonexistent / denylisted
     paths stay visible in the text.
     """
     suffix = Path(path).suffix.lower()
-    return not suffix or suffix not in MEDIA_DELIVERY_EXTS
+    return not suffix or suffix not in _MEDIA_UNCONDITIONAL_EXTS
 
 
 def _strip_media_tag_directives(text: str) -> str:
