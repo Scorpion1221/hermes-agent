@@ -319,17 +319,10 @@ class TestEdgeCases:
         assert paths == []
         assert cleaned == ""
 
-    def test_no_media_extensions(self):
-        """Extensions outside the supported list should not be matched.
-
-        ``.py`` and ``.log`` are intentionally excluded because (a) most
-        source files are quoted in inline code or fenced blocks anyway,
-        and (b) auto-shipping arbitrary source files would be a
-        surprise.  Documents (.pdf, .docx), data (.csv, .json),
-        archives (.zip), and presentations (.pptx) ARE matched.
-        """
+    def test_source_and_log_extensions_are_deliverable(self):
+        """The fork's expanded artifact list includes source and log files."""
         paths, _ = _extract("See /tmp/script.py and /tmp/server.log here")
-        assert paths == []
+        assert paths == ["/tmp/script.py", "/tmp/server.log"]
 
     def test_path_with_spaces_not_matched(self):
         """Paths with spaces are intentionally not matched (avoids false positives)."""

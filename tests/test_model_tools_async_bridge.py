@@ -359,8 +359,18 @@ class TestVisionDispatchLoopSafety:
         from tools.registry import registry
 
         fake_response = _mock_vision_response()
+        from tools.image_source import ResolvedImage
 
         with (
+            patch(
+                "tools.image_source.resolve_image_source",
+                new_callable=AsyncMock,
+                return_value=ResolvedImage(
+                    data=b"\xff\xd8\xff" + b"\x00" * 16,
+                    mime="image/jpeg",
+                    origin="http",
+                ),
+            ),
             patch(
                 "tools.vision_tools.async_call_llm",
                 new_callable=AsyncMock,
@@ -404,8 +414,18 @@ class TestVisionDispatchLoopSafety:
         from tools.registry import registry
 
         fake_response = _mock_vision_response()
+        from tools.image_source import ResolvedImage
 
         with (
+            patch(
+                "tools.image_source.resolve_image_source",
+                new_callable=AsyncMock,
+                return_value=ResolvedImage(
+                    data=b"\xff\xd8\xff" + b"\x00" * 16,
+                    mime="image/jpeg",
+                    origin="http",
+                ),
+            ),
             patch(
                 "tools.vision_tools.async_call_llm",
                 new_callable=AsyncMock,

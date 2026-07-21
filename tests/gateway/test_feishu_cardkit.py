@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from gateway.platforms.feishu import _build_card_v2_payload
+from plugins.platforms.feishu.adapter import _build_card_v2_payload
 from gateway.platforms.feishu_inbound.cardkit import (
     STREAMING_ELEMENT_ID,
     CardKitState,

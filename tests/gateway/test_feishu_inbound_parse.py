@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 
-from gateway.platforms.feishu import normalize_feishu_message as legacy_normalize_feishu_message
+from plugins.platforms.feishu.adapter import normalize_feishu_message as legacy_normalize_feishu_message
 from gateway.platforms.feishu_inbound.lookup import build_resource_descriptors
 from gateway.platforms.feishu_inbound.parse import normalize_feishu_message
 

@@ -29,6 +29,19 @@ from agent.anthropic_adapter import (
 from agent.transports import get_transport
 
 
+@pytest.fixture(autouse=True)
+def _isolate_machine_anthropic_credentials(monkeypatch):
+    """Credential precedence tests opt into each source explicitly."""
+    monkeypatch.setattr(
+        "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
+        lambda: None,
+    )
+    empty_pool = SimpleNamespace(_available_entries=lambda **_kwargs: [])
+    monkeypatch.setattr(
+        "agent.credential_pool.load_pool", lambda _provider: empty_pool
+    )
+
+
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------

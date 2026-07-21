@@ -63,7 +63,7 @@ def test_feishu_pairing_matches_open_id_alias_when_primary_id_is_tenant_id(
 
 @pytest.mark.asyncio
 async def test_feishu_sender_profile_keeps_all_sender_ids_for_auth(monkeypatch):
-    from gateway.platforms.feishu import FeishuAdapter
+    from plugins.platforms.feishu.adapter import FeishuAdapter
 
     adapter = FeishuAdapter(PlatformConfig())
     monkeypatch.setattr(
@@ -140,7 +140,7 @@ async def test_feishu_process_inbound_group_message_marks_platform_auth_passed(
     monkeypatch,
 ):
     """A Feishu group message that made it past _admit carries the auth marker."""
-    from gateway.platforms.feishu import FeishuAdapter
+    from plugins.platforms.feishu.adapter import FeishuAdapter
 
     adapter = FeishuAdapter(
         PlatformConfig(

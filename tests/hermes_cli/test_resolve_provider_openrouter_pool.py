@@ -10,6 +10,7 @@ requests went out with no Authorization header — OpenRouter's
 These tests lock in that auto-detection consults the OpenRouter pool.
 """
 
+import os
 import uuid
 
 import pytest
@@ -28,6 +29,11 @@ def _clean_inference_env(monkeypatch):
         "HERMES_INFERENCE_PROVIDER",
     ):
         monkeypatch.delenv(key, raising=False)
+    # Auto-detection also checks Bedrock.  Never let a developer's real
+    # ~/.aws files turn the "no credentials" control into a positive match.
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", os.devnull)
+    monkeypatch.setenv("AWS_CONFIG_FILE", os.devnull)
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
 
 
 def _seed_openrouter_pool(token: str = "sk-or-FAKEKEY123") -> None:

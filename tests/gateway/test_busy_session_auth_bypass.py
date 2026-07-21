@@ -239,10 +239,10 @@ class TestBusySessionAuthBypass:
             runner, synth_event, sk
         )
 
-        # Must NOT be silently dropped by the auth gate
-        assert result is True  # handled, but via normal busy-message path
-        # The synth event should have been merged into pending (queue mode)
-        assert sk in adapter._pending_messages
+        # False deliberately hands the internal event back to the base adapter,
+        # which owns silent FIFO queueing.  An auth rejection would return True.
+        assert result is False
+        assert sk not in adapter._pending_messages
 
     @pytest.mark.asyncio
     async def test_unauthorized_user_cannot_steer_active_agent(self):

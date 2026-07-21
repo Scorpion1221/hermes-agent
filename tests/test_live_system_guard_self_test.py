@@ -28,6 +28,17 @@ import pytest
 FOREIGN_PID = 1
 
 
+@pytest.fixture(autouse=True)
+def _fake_systemctl_on_path(tmp_path, monkeypatch):
+    """Exercise guard parsing without requiring or touching host systemd."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    systemctl = fake_bin / "systemctl"
+    systemctl.write_text("#!/bin/sh\nexit 0\n")
+    systemctl.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
 # ──────────────────── kill primitives ─────────────────────────
 
 

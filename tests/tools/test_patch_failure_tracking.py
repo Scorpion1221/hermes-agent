@@ -14,6 +14,11 @@ import json
 import pytest
 
 
+def _payload(result: str) -> dict:
+    """Parse the JSON payload before the fork's model-facing hint tail."""
+    return json.loads(result.split("\n\n[Hint:", 1)[0])
+
+
 @pytest.fixture
 def hermes_home(monkeypatch, tmp_path):
     """Isolate HERMES_HOME and clear module-level caches afterward so the
@@ -68,7 +73,7 @@ class TestPatchFailureEscalation:
                 },
                 task_id="esc_t1",
             )
-            d = json.loads(result)
+            d = _payload(result)
             hint = d.get("_hint", "") or ""
             assert "failure #" not in hint, (
                 f"Escalating hint fired too early on attempt {_i + 1}: {hint!r}"
@@ -91,7 +96,7 @@ class TestPatchFailureEscalation:
                 },
                 task_id="esc_t2",
             )
-            d = json.loads(result)
+            d = _payload(result)
             last_hint = d.get("_hint", "") or ""
 
         assert "failure #3" in last_hint, repr(last_hint)
@@ -128,7 +133,7 @@ class TestPatchFailureEscalation:
             },
             task_id="esc_t3",
         )
-        d = json.loads(result)
+        d = _payload(result)
         assert not d.get("error"), d
 
         # Next failure should be back to "attempt 1" — generic hint only.
@@ -141,7 +146,7 @@ class TestPatchFailureEscalation:
             },
             task_id="esc_t3",
         )
-        d = json.loads(result)
+        d = _payload(result)
         hint = d.get("_hint", "") or ""
         assert "failure #" not in hint, (
             f"Counter should have been reset after success: {hint!r}"
@@ -179,7 +184,7 @@ class TestPatchFailureEscalation:
             },
             task_id="esc_t4",
         )
-        d = json.loads(result)
+        d = _payload(result)
         hint = d.get("_hint", "") or ""
         assert "failure #" not in hint, (
             f"b.py's hint inherited a.py's count: {hint!r}"
@@ -215,7 +220,7 @@ class TestPatchFailureEscalation:
             },
             task_id="task_B",
         )
-        d = json.loads(result)
+        d = _payload(result)
         hint = d.get("_hint", "") or ""
         assert "failure #" not in hint, (
             f"task_B's hint cross-contaminated from task_A: {hint!r}"

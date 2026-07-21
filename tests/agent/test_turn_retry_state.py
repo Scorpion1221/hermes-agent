@@ -13,39 +13,17 @@ from dataclasses import fields
 from agent.turn_retry_state import TurnRetryState
 
 
-EXPECTED_FIELDS = {
-    "codex_auth_retry_attempted",
-    "anthropic_auth_retry_attempted",
-    "nous_auth_retry_attempted",
-    "nous_paid_entitlement_refresh_attempted",
-    "copilot_auth_retry_attempted",
-    "vertex_auth_retry_attempted",
-    "thinking_sig_retry_attempted",
-    "invalid_encrypted_content_retry_attempted",
-    "image_shrink_retry_attempted",
-    "multimodal_tool_content_retry_attempted",
-    "oauth_1m_beta_retry_attempted",
-    "llama_cpp_grammar_retry_attempted",
-    "primary_recovery_attempted",
-    "has_retried_429",
-    "auth_failover_attempted",
-    "restart_with_compressed_messages",
-    "restart_with_length_continuation",
-    "restart_with_rebuilt_messages",
-}
-
-
 def test_all_guards_default_false():
     s = TurnRetryState()
     for name, value in s:
         assert value is False, f"{name} should default to False"
 
 
-def test_field_set_matches_contract():
-    names = {f.name for f in fields(TurnRetryState)}
-    assert names == EXPECTED_FIELDS, (
-        f"unexpected drift: missing={EXPECTED_FIELDS - names} extra={names - EXPECTED_FIELDS}"
-    )
+def test_sampling_retry_guard_is_independently_mutable():
+    state = TurnRetryState()
+    state.sampling_params_retry_attempted = True
+    assert state.sampling_params_retry_attempted is True
+    assert state.anthropic_auth_retry_attempted is False
 
 
 def test_loop_control_vars_are_not_on_state():

@@ -84,7 +84,7 @@ def test_build_drive_comment_prompt_includes_quote_chain_and_ids():
 @pytest.mark.asyncio
 async def test_feishu_send_routes_comment_target_through_drive_api(monkeypatch):
     from gateway.config import PlatformConfig
-    from gateway.platforms.feishu import FeishuAdapter
+    from plugins.platforms.feishu.adapter import FeishuAdapter
 
     adapter = FeishuAdapter(PlatformConfig())
     calls = []
@@ -104,7 +104,7 @@ async def test_feishu_send_routes_comment_target_through_drive_api(monkeypatch):
 @pytest.mark.asyncio
 async def test_drive_comment_webhook_dispatches_synthetic_message(monkeypatch):
     from gateway.config import PlatformConfig
-    from gateway.platforms.feishu import FeishuAdapter
+    from plugins.platforms.feishu.adapter import FeishuAdapter
 
     adapter = FeishuAdapter(PlatformConfig())
     adapter._resolve_sender_profile = AsyncMock(return_value={'user_id': 'ou_sender', 'user_name': 'Alice', 'user_id_alt': 'on_sender'})
@@ -117,7 +117,7 @@ async def test_drive_comment_webhook_dispatches_synthetic_message(monkeypatch):
         reply_chain_context='',
         is_whole_comment=False,
     )
-    with patch('gateway.platforms.feishu.resolve_drive_comment_event_turn', AsyncMock(return_value=turn)):
+    with patch('plugins.platforms.feishu.adapter.resolve_drive_comment_event_turn', AsyncMock(return_value=turn)):
         payload = SimpleNamespace(
             event=SimpleNamespace(
                 comment_id='comment_1',

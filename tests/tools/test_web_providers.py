@@ -622,3 +622,12 @@ class TestDisabledPluginDiagnostic:
         finally:
             restore()
 
+
+@pytest.fixture(autouse=True)
+def _public_test_urls(monkeypatch):
+    from tools import web_tools
+
+    async def _safe(_url):
+        return True
+
+    monkeypatch.setattr(web_tools, "async_is_safe_url", _safe)
