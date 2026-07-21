@@ -65,10 +65,14 @@ def test_stash_local_changes_if_needed_returns_specific_stash_commit(monkeypatch
             return SimpleNamespace(stdout=" M hermes_cli/main.py\n?? notes.txt\n", returncode=0)
         if cmd[-2:] == ["ls-files", "--unmerged"]:
             return SimpleNamespace(stdout="", returncode=0)
+        if cmd[-4:] == ["rev-parse", "--verify", "-q", "refs/stash"]:
+            return SimpleNamespace(stdout="old123\n", returncode=0)
         if cmd[1:4] == ["stash", "push", "--include-untracked"]:
             return SimpleNamespace(stdout="Saved working directory\n", returncode=0)
         if cmd[-3:] == ["rev-parse", "--verify", "refs/stash"]:
             return SimpleNamespace(stdout="abc123\n", returncode=0)
+        if cmd[1:4] == ["stash", "show", "--name-only"]:
+            return SimpleNamespace(stdout="hermes_cli/main.py\nnotes.txt\n", returncode=0)
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
@@ -77,8 +81,74 @@ def test_stash_local_changes_if_needed_returns_specific_stash_commit(monkeypatch
 
     assert stash_ref == "abc123"
     assert calls[1][0][-2:] == ["ls-files", "--unmerged"]
-    assert calls[2][0][1:4] == ["stash", "push", "--include-untracked"]
-    assert calls[3][0][-3:] == ["rev-parse", "--verify", "refs/stash"]
+    assert calls[3][0][1:4] == ["stash", "push", "--include-untracked"]
+    assert calls[4][0][-3:] == ["rev-parse", "--verify", "refs/stash"]
+
+
+def test_stash_local_changes_if_needed_drops_empty_stash(monkeypatch, tmp_path, capsys):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return SimpleNamespace(stdout="?? nested-repo/\n", returncode=0)
+        if cmd[-2:] == ["ls-files", "--unmerged"]:
+            return SimpleNamespace(stdout="", returncode=0)
+        if cmd[-4:] == ["rev-parse", "--verify", "-q", "refs/stash"]:
+            return SimpleNamespace(stdout="old123\n", returncode=0)
+        if cmd[1:4] == ["stash", "push", "--include-untracked"]:
+            return SimpleNamespace(stdout="Saved working directory\n", returncode=0)
+        if cmd[-3:] == ["rev-parse", "--verify", "refs/stash"]:
+            return SimpleNamespace(stdout="empty123\n", returncode=0)
+        if cmd[1:4] == ["stash", "show", "--name-only"]:
+            return SimpleNamespace(stdout="", returncode=0)
+        if cmd[1:3] == ["stash", "list"]:
+            return SimpleNamespace(stdout="stash@{0} empty123\nstash@{1} old123\n", returncode=0)
+        if cmd[1:3] == ["stash", "drop"]:
+            return SimpleNamespace(stdout="Dropped stash@{0}\n", stderr="", returncode=0)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
+
+    assert stash_ref is None
+    assert [cmd for cmd, _ in calls if cmd[1:3] == ["stash", "drop"]] == [
+        ["git", "stash", "drop", "stash@{0}"]
+    ]
+    assert "No stashable local changes" in capsys.readouterr().out
+
+
+def test_stash_local_changes_if_needed_ignores_nested_repo(tmp_path, capsys):
+    """A nested untracked Git repo must not create a restore prompt/stash."""
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    def git(*args, cwd=tmp_path):
+        return subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, text=True, check=True
+        )
+
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "tracked.txt").write_text("base\n")
+    git("add", "tracked.txt")
+    git("commit", "-qm", "init")
+
+    nested = tmp_path / "nested-repo"
+    nested.mkdir()
+    git("init", "-q", cwd=nested)
+
+    stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
+
+    assert stash_ref is None
+    assert git("status", "--porcelain").stdout.strip() == "?? nested-repo/"
+    assert git("stash", "list").stdout == ""
+    assert "No stashable local changes" in capsys.readouterr().out
 
 
 def test_resolve_stash_selector_returns_matching_entry(monkeypatch, tmp_path):
@@ -310,6 +380,8 @@ def test_stash_local_changes_if_needed_raises_when_stash_ref_missing(monkeypatch
             return SimpleNamespace(stdout=" M hermes_cli/main.py\n", returncode=0)
         if cmd[-2:] == ["ls-files", "--unmerged"]:
             return SimpleNamespace(stdout="", returncode=0)
+        if cmd[-4:] == ["rev-parse", "--verify", "-q", "refs/stash"]:
+            return SimpleNamespace(stdout="", returncode=1)
         if cmd[1:4] == ["stash", "push", "--include-untracked"]:
             return SimpleNamespace(stdout="Saved working directory\n", returncode=0)
         if cmd[-3:] == ["rev-parse", "--verify", "refs/stash"]:

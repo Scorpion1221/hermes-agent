@@ -6711,6 +6711,12 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
     stash_name = datetime.now(timezone.utc).strftime(
         "hermes-update-autostash-%Y%m%d-%H%M%S"
     )
+    previous_stash = subprocess.run(
+        git_cmd + ["rev-parse", "--verify", "-q", "refs/stash"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     print("→ Local changes detected — stashing before update...")
     subprocess.run(
         git_cmd + ["stash", "push", "--include-untracked", "-m", stash_name],
@@ -6724,6 +6730,31 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
         text=True,
         check=True,
     ).stdout.strip()
+
+    # An untracked nested repository appears in `git status`, but `git stash`
+    # refuses to capture it ("Ignoring path ..."). Git may still create an
+    # empty stash commit, which used to trigger a misleading restore prompt.
+    # Only return a stash when this invocation created one with real content.
+    if stash_ref == previous_stash:
+        return None
+    stash_contents = subprocess.run(
+        git_cmd
+        + ["stash", "show", "--name-only", "--include-untracked", stash_ref],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if stash_contents.returncode == 0 and not stash_contents.stdout.strip():
+        stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
+        if stash_selector is not None:
+            subprocess.run(
+                git_cmd + ["stash", "drop", stash_selector],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+            )
+        print("  ✓ No stashable local changes; continuing without restore.")
+        return None
     return stash_ref
 
 
