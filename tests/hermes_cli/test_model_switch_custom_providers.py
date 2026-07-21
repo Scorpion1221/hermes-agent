@@ -23,6 +23,21 @@ _MOCK_VALIDATION = {
 def _disable_live_custom_provider_model_probe(monkeypatch):
     """Keep custom-provider picker fixtures independent of local model servers."""
     monkeypatch.setattr("hermes_cli.models.fetch_api_models", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        "hermes_cli.models.get_curated_nous_model_ids", lambda: []
+    )
+    monkeypatch.setattr("hermes_cli.models.fetch_ollama_cloud_models", lambda: [])
+    monkeypatch.setattr(
+        "hermes_cli.model_switch._credential_pool_is_usable",
+        lambda *_a, **_kw: False,
+    )
+    monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda *_a, **_kw: {})
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_hermes_oauth_credentials", lambda: None
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+    )
 
 
 def test_list_authenticated_providers_includes_custom_providers(monkeypatch):
@@ -1646,6 +1661,13 @@ def test_excluded_providers_hides_builtin_row(monkeypatch):
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
     monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setattr(
+        "hermes_cli.model_switch._credential_pool_is_usable",
+        lambda provider, **_kwargs: provider == "openrouter",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.cached_provider_model_ids", lambda _provider: ["test-model"]
+    )
 
     baseline = list_authenticated_providers(
         current_provider="openrouter",
