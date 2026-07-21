@@ -22,6 +22,7 @@ POWERSHELL = next(
     (candidate for candidate in ("pwsh", "powershell") if shutil.which(candidate)),
     None,
 )
+TEST_BRANCH = "develop"
 
 
 def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -42,23 +43,23 @@ def _make_conflicted_managed_checkout(tmp_path: Path) -> Path:
     (seed / "tracked.txt").write_text("base\n", encoding="utf-8")
     _git(seed, "add", "tracked.txt")
     _git(seed, "commit", "-m", "base")
-    _git(seed, "branch", "-M", "main")
+    _git(seed, "branch", "-M", TEST_BRANCH)
 
     remote = tmp_path / "origin.git"
     _git(tmp_path, "init", "--bare", str(remote))
     _git(seed, "remote", "add", "origin", str(remote))
-    _git(seed, "push", "-u", "origin", "main")
+    _git(seed, "push", "-u", "origin", TEST_BRANCH)
 
     managed = tmp_path / "hermes-agent"
-    _git(tmp_path, "clone", "--branch", "main", str(remote), str(managed))
+    _git(tmp_path, "clone", "--branch", TEST_BRANCH, str(remote), str(managed))
 
     (managed / "tracked.txt").write_text("local edit\n", encoding="utf-8")
 
     upstream = tmp_path / "upstream"
-    _git(tmp_path, "clone", "--branch", "main", str(remote), str(upstream))
+    _git(tmp_path, "clone", "--branch", TEST_BRANCH, str(remote), str(upstream))
     (upstream / "tracked.txt").write_text("upstream edit\n", encoding="utf-8")
     _git(upstream, "commit", "-am", "upstream")
-    _git(upstream, "push", "origin", "main")
+    _git(upstream, "push", "origin", TEST_BRANCH)
 
     return managed
 
@@ -155,24 +156,24 @@ def test_install_sh_repository_stage_clean_apply_drops_stash(
     (seed / "tracked.txt").write_text("base\n", encoding="utf-8")
     _git(seed, "add", "tracked.txt")
     _git(seed, "commit", "-m", "base")
-    _git(seed, "branch", "-M", "main")
+    _git(seed, "branch", "-M", TEST_BRANCH)
 
     remote = tmp_path / "origin.git"
     _git(tmp_path, "init", "--bare", str(remote))
     _git(seed, "remote", "add", "origin", str(remote))
-    _git(seed, "push", "-u", "origin", "main")
+    _git(seed, "push", "-u", "origin", TEST_BRANCH)
 
     managed = tmp_path / "hermes-agent"
-    _git(tmp_path, "clone", "--branch", "main", str(remote), str(managed))
+    _git(tmp_path, "clone", "--branch", TEST_BRANCH, str(remote), str(managed))
 
     # Local edit on a file upstream will NOT touch — no conflict on apply.
     (managed / "local-only.txt").write_text("local edit\n", encoding="utf-8")
 
     upstream = tmp_path / "upstream"
-    _git(tmp_path, "clone", "--branch", "main", str(remote), str(upstream))
+    _git(tmp_path, "clone", "--branch", TEST_BRANCH, str(remote), str(upstream))
     (upstream / "tracked.txt").write_text("upstream edit\n", encoding="utf-8")
     _git(upstream, "commit", "-am", "upstream")
-    _git(upstream, "push", "origin", "main")
+    _git(upstream, "push", "origin", TEST_BRANCH)
 
     env = os.environ | {
         "HERMES_HOME": str(tmp_path / "hermes-home"),
