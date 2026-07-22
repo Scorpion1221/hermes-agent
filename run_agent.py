@@ -2955,6 +2955,16 @@ class AIAgent:
             self._pending_steer = None
         return text
 
+    def _notify_steer_consumed(self) -> None:
+        """Notify the host after steer text enters model-visible context."""
+        callback = getattr(self, "steer_consumed_callback", None)
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            logger.debug("steer_consumed_callback error", exc_info=True)
+
     def _record_file_mutation_result(
         self,
         tool_name: str,

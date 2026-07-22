@@ -725,6 +725,25 @@ class StreamingRefineAgent:
         }
 
 
+class SteerBoundaryAgent:
+    def __init__(self, **kwargs):
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.stream_delta_callback("Before steer")
+        # gateway.run assigns this per-turn callback after construction. In
+        # production AIAgent fires it only once steer text enters tool context.
+        self.steer_consumed_callback()
+        self.stream_delta_callback("After steer")
+        return {
+            "final_response": "Before steerAfter steer",
+            "response_previewed": True,
+            "messages": [],
+            "api_calls": 2,
+        }
+
+
 class QueuedCommentaryAgent:
     calls = 0
 
@@ -1013,6 +1032,37 @@ async def test_run_agent_marks_visible_cardkit_stream_for_delivery_ledger(
 
     assert result.get("already_sent") is True
     assert result.get("_cardkit_stream_visible") is True
+
+
+@pytest.mark.asyncio
+async def test_cardkit_steer_consumption_finalizes_old_card_before_new_output(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SteerBoundaryAgent,
+        session_id="sess-cardkit-steer-boundary",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True},
+        },
+        platform=Platform.FEISHU,
+        chat_id="oc_cardkit",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=CardKitProgressCaptureAdapter,
+    )
+
+    assert result.get("already_sent") is True
+    assert [call["content"] for call in adapter.sent] == [
+        "Before steer",
+        "After steer",
+    ]
+    assert adapter.finalized == [
+        ("progress-1", "Before steer"),
+        ("progress-1", "After steer"),
+    ]
 
 
 @pytest.mark.asyncio

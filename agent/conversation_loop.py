@@ -865,6 +865,8 @@ def run_conversation(
                         _si,
                     )
                     break
+            if _injected:
+                agent._notify_steer_consumed()
             if not _injected:
                 # No tool message to inject into — put it back so
                 # the post-tool-execution drain picks it up later.

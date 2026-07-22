@@ -3384,6 +3384,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
             messages[target_idx]["content"] = f"{existing_content}{marker}"
     else:
         messages[target_idx]["content"] = existing_content + marker
+    agent._notify_steer_consumed()
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars): %s",
         len(steer_text),

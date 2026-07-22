@@ -73,6 +73,20 @@ class TestSteerDrain:
 
 
 class TestSteerInjection:
+    def test_notifies_host_only_after_steer_enters_tool_context(self):
+        agent = _bare_agent()
+        consumed = []
+        agent.steer_consumed_callback = lambda: consumed.append(True)
+
+        agent.steer("use the updated requirement")
+        assert consumed == []
+
+        messages = [{"role": "tool", "content": "output", "tool_call_id": "1"}]
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+
+        assert consumed == [True]
+        assert "use the updated requirement" in messages[0]["content"]
+
     def test_appends_to_last_tool_result(self):
         agent = _bare_agent()
         agent.steer("please also check auth.log")
@@ -156,6 +170,20 @@ class TestSteerInjection:
         # Messages untouched
         assert messages[-1]["content"] == "y"
         # And the steer is back in pending so the fallback can grab it
+        assert agent._pending_steer == "ping"
+
+    def test_restashed_steer_does_not_notify_host(self):
+        agent = _bare_agent()
+        consumed = []
+        agent.steer_consumed_callback = lambda: consumed.append(True)
+        agent.steer("ping")
+
+        agent._apply_pending_steer_to_tool_results(
+            [{"role": "assistant", "content": "no tool result"}],
+            num_tool_msgs=1,
+        )
+
+        assert consumed == []
         assert agent._pending_steer == "ping"
 
 

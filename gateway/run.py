@@ -20520,6 +20520,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.tool_start_callback = (
                 voice_ack_callback if _voice_ack_guild[0] is not None else None
             )
+
+            def _steer_consumed_callback_sync() -> None:
+                # /steer is accepted while the current tool/API call is still
+                # running. Split CardKit only once the steer has actually been
+                # injected into model-visible context, immediately before the
+                # resumed output starts. This preserves the old card until the
+                # semantic boundary and makes subsequent deltas open a new one.
+                if _stream_consumer is None or not _stream_consumer.cardkit_mode:
+                    return
+                boundary_done = _stream_consumer.on_user_input_boundary()
+                if not boundary_done.wait(timeout=15):
+                    logger.warning(
+                        "Timed out finalizing Feishu CardKit after /steer consumption"
+                    )
+
+            agent.steer_consumed_callback = _steer_consumed_callback_sync
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None

@@ -596,6 +596,10 @@ def init_agent(
     # existing tool message rather than inserting a new user turn).
     agent._pending_steer: Optional[str] = None
     agent._pending_steer_lock = threading.Lock()
+    # Optional platform callback fired only after pending steer text has been
+    # injected into model-visible tool context. Gateways use this consumption
+    # point (rather than steer() receipt) to split user-visible stream segments.
+    agent.steer_consumed_callback = None
 
     # Concurrent-tool worker thread tracking.  `_execute_tool_calls_concurrent`
     # runs each tool on its own ThreadPoolExecutor worker — those worker
