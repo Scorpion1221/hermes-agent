@@ -4493,6 +4493,15 @@ def _wait_for_gateway_exit(
 
 
 def launchd_restart():
+    # Match the systemd restart path: reconcile the installed service
+    # definition before asking the existing job to restart.  Otherwise a
+    # launcher moved to a different virtualenv can keep restarting the stale
+    # interpreter recorded in the plist forever.
+    if refresh_launchd_plist_if_needed():
+        print("✓ Service definition updated and service restarted")
+        _clear_launchd_unsupported_marker()
+        return
+
     label = get_launchd_label()
     drain_timeout = _get_restart_drain_timeout()
     from gateway.status import get_running_pid

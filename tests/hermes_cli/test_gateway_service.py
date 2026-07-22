@@ -871,6 +871,7 @@ class TestLaunchdServiceRecovery:
         calls = []
         target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
 
+        monkeypatch.setattr(gateway_cli, "refresh_launchd_plist_if_needed", lambda: False)
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
         monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
         monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda timeout, force_after=None: True)
@@ -902,6 +903,7 @@ class TestLaunchdServiceRecovery:
     def test_launchd_restart_self_requests_graceful_restart_without_kickstart(self, monkeypatch, capsys):
         calls = []
 
+        monkeypatch.setattr(gateway_cli, "refresh_launchd_plist_if_needed", lambda: False)
         monkeypatch.setattr(
             "gateway.status.get_running_pid",
             lambda: 321,
@@ -921,6 +923,27 @@ class TestLaunchdServiceRecovery:
 
         assert calls == [("self", 321)]
         assert "restart requested" in capsys.readouterr().out.lower()
+
+    def test_launchd_restart_refreshes_stale_service_before_signaling_old_process(
+        self, monkeypatch, capsys
+    ):
+        calls = []
+        monkeypatch.setattr(
+            gateway_cli,
+            "refresh_launchd_plist_if_needed",
+            lambda: calls.append("refresh") or True,
+        )
+        monkeypatch.setattr(
+            "gateway.status.get_running_pid",
+            lambda: (_ for _ in ()).throw(
+                AssertionError("stale service process must not be signaled")
+            ),
+        )
+
+        gateway_cli.launchd_restart()
+
+        assert calls == ["refresh"]
+        assert "service definition updated and service restarted" in capsys.readouterr().out.lower()
 
     def test_launchd_stop_uses_bootout_not_kill(self, tmp_path, monkeypatch):
         """launchd_stop must bootout the service so KeepAlive doesn't respawn it."""
@@ -1176,6 +1199,7 @@ class TestLaunchdServiceRecovery:
         target = f"{domain}/{gateway_cli.get_launchd_label()}"
         monkeypatch.setattr(gateway_cli, "_launchd_candidate_domains", lambda: (domain,))
 
+        monkeypatch.setattr(gateway_cli, "refresh_launchd_plist_if_needed", lambda: False)
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 5.0)
         monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
         monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda timeout, force_after=None: True)
@@ -1212,6 +1236,7 @@ class TestLaunchdServiceRecovery:
         monkeypatch.setattr(gateway_cli, "_launchd_candidate_domains", lambda: (domain,))
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "refresh_launchd_plist_if_needed", lambda: False)
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 5.0)
         monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
         monkeypatch.setattr(
