@@ -20,6 +20,7 @@ import inspect
 import logging
 import queue
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -45,6 +46,12 @@ _DONE = object()
 # Sentinel to signal a tool boundary — finalize current message and start a
 # new one so that subsequent text appears below tool progress messages.
 _NEW_SEGMENT = object()
+
+# Sentinel for a blocking user-input boundary (for example ``clarify``).
+# Unlike ordinary tool boundaries, this MUST close native streaming cards and
+# reset the active message so work resumed after the user's reply appears in a
+# fresh bubble below the prompt.
+_USER_INPUT_BOUNDARY = object()
 
 # Queue marker for a completed assistant commentary message emitted between
 # API/tool iterations (for example: "I'll inspect the repo first.").
@@ -277,6 +284,11 @@ class GatewayStreamConsumer:
         the subsequent cosmetic edit (cursor removal) failed."""
         return self._final_content_delivered
 
+    @property
+    def cardkit_mode(self) -> bool:
+        """Whether this consumer is using Feishu's native CardKit stream."""
+        return self._cardkit_mode
+
     async def _notify_before_finalize(self) -> None:
         """Run the pre-finalize hook exactly once, swallowing hook errors."""
         if self._before_finalize_notified:
@@ -336,6 +348,18 @@ class GatewayStreamConsumer:
     def on_segment_break(self) -> None:
         """Finalize the current stream segment and start a fresh message."""
         self._queue.put(_NEW_SEGMENT)
+
+    def on_user_input_boundary(self) -> threading.Event:
+        """Close the current stream before a blocking user prompt.
+
+        Returns an event that is set after the async consumer has flushed and
+        finalized the current platform message.  Gateway callbacks run on an
+        agent worker thread, so they can wait for this acknowledgement before
+        sending the clarify prompt without blocking the asyncio event loop.
+        """
+        completed = threading.Event()
+        self._queue.put((_USER_INPUT_BOUNDARY, completed))
+        return completed
 
     def on_commentary(self, text: str) -> None:
         """Queue a completed interim assistant commentary message."""
@@ -565,6 +589,48 @@ class GatewayStreamConsumer:
             self._accumulated += self._strip_orphan_close_tags(self._think_buffer)
             self._think_buffer = ""
 
+    async def _finalize_user_input_boundary(self) -> None:
+        """Flush, close, and detach the active message at a user prompt."""
+        current_update_visible = True
+        if self._accumulated:
+            current_update_visible = await self._send_or_edit(
+                self._accumulated,
+                finalize=True,
+                is_turn_final=False,
+            )
+            self._last_edit_time = time.monotonic()
+
+        finalize_cls_fn = getattr(type(self.adapter), "finalize_streaming_message", None)
+        if (
+            self._message_id
+            and self._message_id != "__no_edit__"
+            and finalize_cls_fn is not None
+        ):
+            try:
+                final_text = self._clean_for_display(
+                    self._accumulated or self._last_sent_text or ""
+                )
+                await getattr(self.adapter, "finalize_streaming_message")(
+                    self._message_id,
+                    final_text,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "finalize_streaming_message at user-input boundary failed: %s",
+                    exc,
+                )
+
+        if (
+            self._accumulated
+            and not current_update_visible
+            and self._message_id
+            and self._message_id != "__no_edit__"
+            and not self._cardkit_mode
+        ):
+            await self._flush_segment_tail_on_edit_failure()
+
+        self._reset_segment_state(preserve_no_edit=True)
+
     async def run(self) -> None:
         """Async task that drains the queue and edits the platform message."""
         # Platform message length limit — leave room for cursor + formatting.
@@ -608,6 +674,7 @@ class GatewayStreamConsumer:
                 # Drain all available items from the queue
                 got_done = False
                 got_segment_break = False
+                user_input_boundary_done = None
                 commentary_text = None
                 while True:
                     try:
@@ -618,12 +685,27 @@ class GatewayStreamConsumer:
                         if item is _NEW_SEGMENT:
                             got_segment_break = True
                             break
+                        if (
+                            isinstance(item, tuple)
+                            and len(item) == 2
+                            and item[0] is _USER_INPUT_BOUNDARY
+                        ):
+                            user_input_boundary_done = item[1]
+                            break
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
                             commentary_text = item[1]
                             break
                         self._filter_and_accumulate(item)
                     except queue.Empty:
                         break
+
+                if user_input_boundary_done is not None:
+                    try:
+                        await self._finalize_user_input_boundary()
+                    finally:
+                        user_input_boundary_done.set()
+                    await asyncio.sleep(0.05)
+                    continue
 
                 # Flush any held-back partial-tag buffer on stream end
                 # so trailing text that was waiting for a potential open

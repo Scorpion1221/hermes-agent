@@ -618,6 +618,69 @@ class TestSegmentBreakOnToolBoundary:
 
         assert consumer.already_sent
 
+
+class TestUserInputBoundary:
+    """A blocking user prompt must split native streaming cards.
+
+    Normal tool boundaries intentionally stay inside one Feishu CardKit card,
+    but a clarify prompt pauses the run until a later user message.  Content
+    produced after that reply belongs in a fresh card below the prompt, not in
+    the old pre-question card.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cardkit_user_input_boundary_finalizes_then_starts_new_card(self):
+        class CardKitAdapter:
+            MAX_MESSAGE_LENGTH = 8192
+
+            def __init__(self):
+                self.sent = []
+                self.edits = []
+                self.finalized = []
+
+            async def send(self, **kwargs):
+                self.sent.append(kwargs)
+                return SimpleNamespace(
+                    success=True,
+                    message_id=f"msg_{len(self.sent)}",
+                )
+
+            async def edit_message(self, **kwargs):
+                self.edits.append(kwargs)
+                return SimpleNamespace(success=True, message_id=kwargs["message_id"])
+
+            async def finalize_streaming_message(self, message_id, content):
+                self.finalized.append((message_id, content))
+
+            @staticmethod
+            def truncate_message(content, _limit, **_kwargs):
+                return [content]
+
+        adapter = CardKitAdapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(edit_interval=999, buffer_threshold=999),
+            metadata={"streaming": True},
+        )
+
+        consumer.on_delta("Before clarify")
+        boundary_done = consumer.on_user_input_boundary()
+        consumer.on_delta("After reply")
+        consumer.finish()
+
+        await consumer.run()
+
+        assert boundary_done.is_set()
+        assert [call["content"] for call in adapter.sent] == [
+            "Before clarify",
+            "After reply",
+        ]
+        assert adapter.finalized == [
+            ("msg_1", "Before clarify"),
+            ("msg_2", "After reply"),
+        ]
+
     @pytest.mark.asyncio
     async def test_edit_failure_sends_only_unsent_tail_at_finish(self):
         """If an edit fails mid-stream, send only the missing tail once at finish."""

@@ -19335,6 +19335,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if event_type not in {"tool.started",}:
                 return
 
+            # CardKit renders the clarify prompt as its own interactive card.
+            # Do not enqueue a duplicate progress line: it lives on a separate
+            # queue and could otherwise cross the user-input boundary that
+            # seals the current streaming card.
+            if _cardkit_tool_progress and tool_name == "clarify":
+                return
+
             # Suppress tool-progress bubbles once the user has sent `stop`.
             # When the LLM response carries N parallel tool calls, the agent
             # fires N "tool.started" events back-to-back before checking for
@@ -20647,6 +20654,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _status_adapter.pause_typing_for_chat(_status_chat_id)
                 except Exception:
                     pass
+
+                # Feishu CardKit intentionally keeps ordinary tool progress in
+                # one live card. Clarify is different: it pauses the run until
+                # a later user message, so seal the pre-question card before
+                # sending the prompt. When the answer resumes the agent, the
+                # stream consumer has no active message id and creates a fresh
+                # card below the prompt instead of editing the old one above it.
+                if _stream_consumer is not None and _stream_consumer.cardkit_mode:
+                    boundary_done = _stream_consumer.on_user_input_boundary()
+                    if not boundary_done.wait(timeout=15):
+                        logger.warning(
+                            "Timed out finalizing Feishu CardKit before clarify prompt"
+                        )
 
                 send_ok = False
                 fut = safe_schedule_threadsafe(
