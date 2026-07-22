@@ -172,6 +172,12 @@ class GatewayStreamConsumer:
         # must never delete an earlier finalized preamble/commentary message.
         self._segment_preview_message_ids: "set[str]" = set()
         self._already_sent = False
+        # Sticky evidence that progressive content reached the platform at
+        # least once. Fallback recovery may reset ``_already_sent`` so the
+        # base gateway retries the full final response; this flag survives so
+        # CardKit does not replay that already-visible response after a later
+        # gateway restart.
+        self._has_visible_delivery = False
         self._edit_supported = True  # Disabled when progressive edits are no longer usable
         self._last_edit_time = 0.0
         self._last_sent_text = ""   # Track last-sent text to skip redundant edits
@@ -288,6 +294,11 @@ class GatewayStreamConsumer:
     def cardkit_mode(self) -> bool:
         """Whether this consumer is using Feishu's native CardKit stream."""
         return self._cardkit_mode
+
+    @property
+    def has_visible_delivery(self) -> bool:
+        """Whether any progressive content was accepted by the platform."""
+        return self._has_visible_delivery
 
     async def _notify_before_finalize(self) -> None:
         """Run the pre-finalize hook exactly once, swallowing hook errors."""
@@ -1071,6 +1082,7 @@ class GatewayStreamConsumer:
                 self._message_id = str(result.message_id)
                 self._track_preview_ids_from_result(result)
                 self._already_sent = True
+                self._has_visible_delivery = True
                 self._last_sent_text = text
                 # Fresh content bubble — close off any stale tool bubble
                 # above so the next tool starts a new bubble below.
@@ -1911,6 +1923,7 @@ class GatewayStreamConsumer:
                     )
                     if result.success:
                         self._already_sent = True
+                        self._has_visible_delivery = True
                         # Record any continuation fragments an oversized edit
                         # split off, so fresh-final can clean them all up.
                         self._track_preview_ids_from_result(result)
@@ -2077,6 +2090,7 @@ class GatewayStreamConsumer:
                     else:
                         self._edit_supported = False
                     self._already_sent = True
+                    self._has_visible_delivery = True
                     self._last_sent_text = text
                     if not result.message_id:
                         self._fallback_prefix = self._visible_prefix()

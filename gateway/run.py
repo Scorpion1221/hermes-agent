@@ -12980,6 +12980,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
             )
 
+            # The base adapter owns the durable final-response ledger, while
+            # the stream consumer lives inside _run_agent. Bridge the one bit
+            # the ledger needs: once Feishu CardKit showed progressive text,
+            # a failed full fallback must not be replayed hours later after an
+            # unrelated gateway restart (for example /update).
+            if agent_result.get("_cardkit_stream_visible"):
+                setattr(event, "_hermes_cardkit_stream_visible", True)
+
             # Stop persistent typing indicator now that the agent is done.
             # Slack AI status is scoped to a thread/workspace, so preserve the
             # same routing metadata used by the response delivery path.
@@ -22233,6 +22241,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # final answer.  Suppressing delivery here leaves the user staring
         # at silence.  (#10xxx — "agent stops after web search")
         _sc = stream_consumer_holder[0]
+        if isinstance(response, dict):
+            response["_cardkit_stream_visible"] = bool(
+                _sc
+                and getattr(_sc, "cardkit_mode", False)
+                and getattr(_sc, "has_visible_delivery", False)
+            )
         if isinstance(response, dict) and not response.get("failed"):
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"

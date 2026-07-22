@@ -115,6 +115,48 @@ class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id=message_id)
 
 
+class CardKitProgressCaptureAdapter(MetadataEditProgressCaptureAdapter):
+    def __init__(self, platform=Platform.FEISHU):
+        super().__init__(platform=platform)
+        self._use_cardkit_streaming = True
+        self.finalized = []
+
+    async def finalize_streaming_message(self, message_id, content):
+        self.finalized.append((message_id, content))
+
+
+class FailingFinalCardKitAdapter(CardKitProgressCaptureAdapter):
+    """Shows a preview, then rejects both finalization and fallback send."""
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        if len(self.sent) == 1:
+            return SendResult(success=True, message_id="card-preview")
+        return SendResult(success=False, error="temporary network failure")
+
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize=False, metadata=None
+    ):
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "metadata": metadata,
+            }
+        )
+        if finalize:
+            return SendResult(success=False, error="temporary network failure")
+        return SendResult(success=True, message_id=message_id)
+
+
 class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
     SUPPORTS_MESSAGE_EDITING = False
 
@@ -947,6 +989,58 @@ async def test_run_agent_streaming_does_not_enable_completed_interim_commentary(
 
     assert result.get("already_sent") is True
     assert not any(call["content"] == "I'll inspect the repo first." for call in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_marks_visible_cardkit_stream_for_delivery_ledger(
+    monkeypatch, tmp_path
+):
+    _, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryAgent,
+        session_id="sess-cardkit-ledger",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True},
+        },
+        platform=Platform.FEISHU,
+        chat_id="oc_cardkit",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=CardKitProgressCaptureAdapter,
+    )
+
+    assert result.get("already_sent") is True
+    assert result.get("_cardkit_stream_visible") is True
+
+
+@pytest.mark.asyncio
+async def test_cardkit_visible_marker_survives_failed_final_fallback(
+    monkeypatch, tmp_path
+):
+    _, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StreamingRefineAgent,
+        session_id="sess-cardkit-ledger-fallback",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {
+                "enabled": True,
+                "edit_interval": 0.01,
+                "buffer_threshold": 1,
+            },
+        },
+        platform=Platform.FEISHU,
+        chat_id="oc_cardkit",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=FailingFinalCardKitAdapter,
+    )
+
+    assert result.get("already_sent") is not True
+    assert result.get("_cardkit_stream_visible") is True
 
 
 @pytest.mark.asyncio

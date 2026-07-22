@@ -5233,11 +5233,21 @@ class BasePlatformAdapter(ABC):
                     # output (#58818). Best-effort at every step — ledger
                     # trouble must never block or delay the actual send.
                     # Slash-command and ephemeral replies are cheap to
-                    # regenerate and are not recorded.
+                    # regenerate and are not recorded. A Feishu CardKit
+                    # fallback is also excluded once progressive content was
+                    # visible: replaying the whole fallback after a later
+                    # restart would duplicate an old card the user already
+                    # read (the immediate retry below still runs normally).
                     _obligation_id = None
-                    if not is_ephemeral_response and not str(
-                        event.text or ""
-                    ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
+                    if (
+                        not is_ephemeral_response
+                        and not getattr(
+                            event, "_hermes_cardkit_stream_visible", False
+                        )
+                        and not str(event.text or "").lstrip().startswith(
+                            ("/", self.typed_command_prefix or "!")
+                        )
+                    ):
                         try:
                             from gateway.delivery_ledger import (
                                 compute_obligation_id,

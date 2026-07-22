@@ -97,6 +97,20 @@ class TestProducerHook:
         assert rows[0][1] == "failed"
 
     @pytest.mark.asyncio
+    async def test_cardkit_fallback_after_visible_stream_is_not_replayed_later(self):
+        """A failed final fallback must not turn visible CardKit text into a stale replay."""
+        adapter = _Adapter()
+        adapter.send = AsyncMock(
+            return_value=SendResult(success=False, error="temporary network failure")
+        )
+        event = _event()
+        event._hermes_cardkit_stream_visible = True
+
+        await _run(adapter, event)
+
+        assert _rows() == []
+
+    @pytest.mark.asyncio
     async def test_slash_command_not_recorded(self):
         adapter = _Adapter()
         await _run(adapter, _event(text="/status"))
