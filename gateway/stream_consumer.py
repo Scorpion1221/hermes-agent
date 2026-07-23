@@ -949,11 +949,11 @@ class GatewayStreamConsumer:
                     streaming_message_finalized = False
                     if self._message_id and finalize_cls_fn is not None:
                         try:
-                            await getattr(self.adapter, "finalize_streaming_message")(  # type: ignore[attr-defined]
+                            finalize_result = await getattr(self.adapter, "finalize_streaming_message")(  # type: ignore[attr-defined]
                                 self._message_id,
                                 self._clean_for_display(self._accumulated or ""),
                             )
-                            streaming_message_finalized = True
+                            streaming_message_finalized = finalize_result is not False
                         except Exception as _fin_err:
                             logger.warning("finalize_streaming_message failed: %s", _fin_err)
                     complete_cls_fn = getattr(

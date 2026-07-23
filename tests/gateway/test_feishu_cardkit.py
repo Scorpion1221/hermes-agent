@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from plugins.platforms.feishu.adapter import _build_card_v2_payload
+from gateway.config import PlatformConfig
+from plugins.platforms.feishu.adapter import FeishuAdapter, _build_card_v2_payload
 from gateway.platforms.feishu_inbound.cardkit import (
     STREAMING_ELEMENT_ID,
     CardKitState,
@@ -234,6 +236,118 @@ async def test_set_card_streaming_mode_toggle():
     ok = await set_card_streaming_mode(client, card_id="ck_1", enabled=False, sequence=10)
     assert ok is True
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_finalize_closes_stream_before_replacing_final_card():
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client = object()
+    state = CardKitState(
+        card_id="ck_1",
+        message_id="om_1",
+        sequence=7,
+        started_at=time.time() - 2.2,
+    )
+    adapter._streaming_cards["om_1"] = state
+    calls = []
+
+    async def close_stream(_client, **kwargs):
+        calls.append(("close", kwargs))
+        return True
+
+    async def update_final_card(_client, **kwargs):
+        calls.append(("update", kwargs))
+        return True
+
+    with (
+        patch(
+            "plugins.platforms.feishu.adapter.set_card_streaming_mode",
+            side_effect=close_stream,
+        ),
+        patch(
+            "plugins.platforms.feishu.adapter.cardkit_update_card",
+            side_effect=update_final_card,
+        ),
+    ):
+        finalized = await adapter.finalize_streaming_message("om_1", "done")
+
+    assert finalized is True
+    assert [name for name, _kwargs in calls] == ["close", "update"]
+    assert calls[0][1]["sequence"] == 8
+    assert calls[1][1]["sequence"] == 9
+    footer = calls[1][1]["card_body"]["body"]["elements"][-1]["content"]
+    assert footer.startswith("已完成 · 耗时 2.")
+    assert "om_1" not in adapter._streaming_cards
+
+
+@pytest.mark.asyncio
+async def test_finalize_failure_is_reported_and_state_is_retained():
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client = object()
+    state = CardKitState(
+        card_id="ck_1",
+        message_id="om_1",
+        sequence=3,
+        started_at=time.time(),
+    )
+    adapter._streaming_cards["om_1"] = state
+
+    with (
+        patch(
+            "plugins.platforms.feishu.adapter.set_card_streaming_mode",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "plugins.platforms.feishu.adapter.cardkit_update_card",
+            new=AsyncMock(return_value=False),
+        ),
+        pytest.raises(RuntimeError, match="final card update failed"),
+    ):
+        await adapter.finalize_streaming_message("om_1", "done")
+
+    assert adapter._streaming_cards["om_1"] is state
+
+
+@pytest.mark.asyncio
+async def test_stop_all_closes_stream_before_replacing_stopped_card():
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client = object()
+    state = CardKitState(
+        card_id="ck_1",
+        message_id="om_1",
+        sequence=4,
+        started_at=time.time() - 1.0,
+        last_content="partial",
+    )
+    adapter._streaming_cards["om_1"] = state
+    calls = []
+
+    async def close_stream(_client, **kwargs):
+        calls.append(("close", kwargs))
+        return True
+
+    async def update_stopped_card(_client, **kwargs):
+        calls.append(("update", kwargs))
+        return True
+
+    with (
+        patch(
+            "plugins.platforms.feishu.adapter.set_card_streaming_mode",
+            side_effect=close_stream,
+        ),
+        patch(
+            "plugins.platforms.feishu.adapter.cardkit_update_card",
+            side_effect=update_stopped_card,
+        ),
+    ):
+        await adapter.stop_all_streaming_cards()
+
+    assert [name for name, _kwargs in calls] == ["close", "update"]
+    assert calls[0][1]["sequence"] == 5
+    assert calls[1][1]["sequence"] == 6
+    footer = calls[1][1]["card_body"]["body"]["elements"][-1]["content"]
+    assert footer.startswith("已停止 · 耗时 1.")
+    assert state.stopped is True
 
 
 def test_cardkit_state_defaults():

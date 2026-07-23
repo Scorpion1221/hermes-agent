@@ -2317,25 +2317,40 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="CardKit stream failed")
         return SendResult(success=True, message_id=state.message_id)
 
-    async def finalize_streaming_message(self, message_id: str, final_text: str = "", *, stopped: bool = False) -> None:
-        state = self._streaming_cards.pop(message_id, None)
+    async def finalize_streaming_message(self, message_id: str, final_text: str = "", *, stopped: bool = False) -> bool:
+        state = self._streaming_cards.get(message_id)
         if not state:
-            return
+            return False
         if state.stopped:
-            return
+            return False
         elapsed = time.time() - state.started_at if state.started_at else 0.0
         logger.info("[Feishu] Finalizing streaming card %s (seq=%d, elapsed=%.1fs, stopped=%s)", state.card_id, state.sequence, elapsed, stopped)
         state.sequence += 1
+        streaming_closed = await set_card_streaming_mode(
+            self._client, card_id=state.card_id, enabled=False, sequence=state.sequence,
+        )
+        logger.info(
+            "[Feishu] Streaming mode disabled for %s: %s",
+            state.card_id,
+            streaming_closed,
+        )
+        if not streaming_closed:
+            raise RuntimeError(f"CardKit streaming close failed for {state.card_id}")
         if final_text:
-            await cardkit_update_card(
+            state.sequence += 1
+            final_card_updated = await cardkit_update_card(
                 self._client, card_id=state.card_id,
                 card_body=build_final_card_body(final_text, elapsed_seconds=elapsed, stopped=stopped), sequence=state.sequence,
             )
-            state.sequence += 1
-        ok = await set_card_streaming_mode(
-            self._client, card_id=state.card_id, enabled=False, sequence=state.sequence,
-        )
-        logger.info("[Feishu] Streaming mode disabled for %s: %s", state.card_id, ok)
+            logger.info(
+                "[Feishu] Final card updated for %s: %s",
+                state.card_id,
+                final_card_updated,
+            )
+            if not final_card_updated:
+                raise RuntimeError(f"CardKit final card update failed for {state.card_id}")
+        self._streaming_cards.pop(message_id, None)
+        return True
 
     async def stop_all_streaming_cards(self) -> None:
         to_stop = list(self._streaming_cards.items())
@@ -2344,15 +2359,21 @@ class FeishuAdapter(BasePlatformAdapter):
             elapsed = time.time() - state.started_at if state.started_at else 0.0
             content = state.last_content or ""
             state.sequence += 1
-            await cardkit_update_card(
+            streaming_closed = await set_card_streaming_mode(
+                self._client, card_id=state.card_id, enabled=False, sequence=state.sequence,
+            )
+            state.sequence += 1
+            final_card_updated = await cardkit_update_card(
                 self._client, card_id=state.card_id,
                 card_body=build_final_card_body(content, elapsed_seconds=elapsed, stopped=True), sequence=state.sequence,
             )
-            state.sequence += 1
-            await set_card_streaming_mode(
-                self._client, card_id=state.card_id, enabled=False, sequence=state.sequence,
+            logger.info(
+                "[Feishu] Force-stopped streaming card %s (content=%d chars, closed=%s, updated=%s)",
+                state.card_id,
+                len(content),
+                streaming_closed,
+                final_card_updated,
             )
-            logger.info("[Feishu] Force-stopped streaming card %s (content=%d chars)", state.card_id, len(content))
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,

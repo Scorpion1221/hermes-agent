@@ -452,6 +452,43 @@ class TestStreamRunMediaStripping:
 
         assert adapter.complete_calls == []
 
+    @pytest.mark.asyncio
+    async def test_finalize_noop_does_not_mark_stream_complete(self):
+        class NoopCardKitAdapter:
+            MAX_MESSAGE_LENGTH = 4096
+
+            def __init__(self):
+                self.send = AsyncMock(
+                    return_value=SimpleNamespace(success=True, message_id="msg_1")
+                )
+                self.edit_message = AsyncMock(
+                    return_value=SimpleNamespace(success=True)
+                )
+                self.complete_calls = []
+
+            async def finalize_streaming_message(self, _message_id, _content):
+                return False
+
+            async def on_streaming_message_complete(self, message_id):
+                self.complete_calls.append(message_id)
+
+            @staticmethod
+            def truncate_message(content, _limit, **_kwargs):
+                return [content]
+
+        adapter = NoopCardKitAdapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5),
+        )
+        consumer.on_delta("Final answer")
+        consumer.finish()
+
+        await consumer.run()
+
+        assert adapter.complete_calls == []
+
 
 class TestBeforeFinalizeHook:
     """Verify the optional pre-finalize hook fires at the right time."""
