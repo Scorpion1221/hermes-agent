@@ -125,6 +125,10 @@ class CardKitProgressCaptureAdapter(MetadataEditProgressCaptureAdapter):
         self.finalized.append((message_id, content))
 
 
+class CodeBlockCardKitProgressCaptureAdapter(CardKitProgressCaptureAdapter):
+    supports_code_blocks = True
+
+
 class FailingFinalCardKitAdapter(CardKitProgressCaptureAdapter):
     """Shows a preview, then rejects both finalization and fallback send."""
 
@@ -1713,6 +1717,45 @@ async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path
     assert "node --version" not in all_content
     # No truncated quoted preview for the terminal command.
     assert 'terminal: "' not in all_content
+
+
+@pytest.mark.asyncio
+async def test_feishu_cardkit_terminal_progress_uses_compact_quoted_line(
+    monkeypatch, tmp_path
+):
+    """CardKit streams tool progress inside a Markdown blockquote.
+
+    Nesting a terminal fence in that quote puts the opening fence inside the
+    quote and the closing fence outside it, so Feishu renders literal fences
+    and oversized, fragmented command blocks. Keep CardKit progress compact;
+    normal assistant Bash fences and other platform progress are unaffected.
+    """
+    import tools.terminal_tool  # noqa: F401 - register terminal emoji
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TerminalCommandAgent,
+        session_id="sess-feishu-cardkit-terminal-progress",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_preview_length": 100,
+                "interim_assistant_messages": False,
+            },
+            "streaming": {"enabled": True},
+        },
+        platform=Platform.FEISHU,
+        chat_id="oc_cardkit",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=CodeBlockCardKitProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    rendered = "\n".join(call["content"] for call in adapter.sent + adapter.edits)
+    assert "```" not in rendered
+    assert '> 💻 terminal: "set -euo pipefail ..."' in rendered
 
 
 @pytest.mark.asyncio

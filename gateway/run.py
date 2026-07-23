@@ -19390,26 +19390,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # non-terminal preview path already applies (#42634).
             _code_block_full = None
             _code_block_short = None
+            _cardkit_terminal_line = None
             try:
                 _progress_adapter = self._adapter_for_source(source)
             except Exception:
                 _progress_adapter = None
             if (
-                getattr(_progress_adapter, "supports_code_blocks", False)
-                and tool_name == "terminal"
+                tool_name == "terminal"
                 and isinstance(args, dict)
                 and isinstance(args.get("command"), str)
                 and args["command"].strip()
             ):
                 from agent.display import get_tool_preview_max_len
                 _cmd_full = args["command"].rstrip()
-                # Consecutive terminal calls: drop the repeated
-                # "💻 terminal" header so back-to-back commands render as
-                # adjacent code blocks under a single header.
-                _block_header = (
-                    "" if last_was_terminal_block[0] else f"{emoji} {tool_name}\n"
-                )
-                _code_block_full = f"{_block_header}```\n{_cmd_full}\n```"
                 # Single-line, capped preview for non-verbose modes.
                 _pl = get_tool_preview_max_len()
                 _cap = _pl if _pl > 0 else 40
@@ -19420,7 +19413,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _cmd_short = _cmd_short[:_cap - 3] + "..."
                 elif _multiline:
                     _cmd_short = _cmd_short + " ..."
-                _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
+                if _cardkit_tool_progress:
+                    # CardKit streams progress inside a Markdown blockquote.
+                    # A nested fence crosses quote boundaries and Feishu then
+                    # renders literal ``` markers and fragmented command
+                    # blocks. Keep this path on the compact legacy line.
+                    _cardkit_terminal_line = (
+                        f'{emoji} {tool_name}: "{_cmd_short}"'
+                    )
+                elif getattr(_progress_adapter, "supports_code_blocks", False):
+                    # Consecutive terminal calls: drop the repeated
+                    # "💻 terminal" header so back-to-back commands render as
+                    # adjacent code blocks under a single header.
+                    _block_header = (
+                        "" if last_was_terminal_block[0] else f"{emoji} {tool_name}\n"
+                    )
+                    _code_block_full = f"{_block_header}```\n{_cmd_full}\n```"
+                    _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
 
             # Verbose mode: show detailed arguments, respects tool_preview_length
             if progress_mode == "verbose":
@@ -19451,7 +19460,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # compact — unlike CLI spinners, these persist as permanent messages).
             # Terminal commands on markdown platforms get a single-line capped
             # fenced block (built above) instead of the truncated preview.
-            if _code_block_short is not None:
+            if _cardkit_terminal_line is not None:
+                msg = _cardkit_terminal_line
+                last_was_terminal_block[0] = False
+            elif _code_block_short is not None:
                 msg = _code_block_short
                 last_was_terminal_block[0] = True
             elif preview:
