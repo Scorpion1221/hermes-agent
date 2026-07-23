@@ -388,12 +388,16 @@ class TestStreamRunMediaStripping:
                 self.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="msg_1"))
                 self.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
                 self.finalize_calls = []
+                self.complete_calls = []
                 self.truncate_message = lambda text, limit, len_fn=len: [text]
                 self.message_len_fn = len
 
             async def finalize_streaming_message(self, message_id, content):
                 self.finalize_calls.append((message_id, content))
                 return SimpleNamespace(success=True)
+
+            async def on_streaming_message_complete(self, message_id):
+                self.complete_calls.append(message_id)
 
         adapter = CardKitLikeAdapter()
         config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5)
@@ -409,6 +413,44 @@ class TestStreamRunMediaStripping:
         finalized_text = adapter.finalize_calls[-1][1]
         assert "MEDIA:" not in finalized_text
         assert "打包好了" in finalized_text
+        assert adapter.complete_calls == ["msg_1"]
+
+    @pytest.mark.asyncio
+    async def test_finalize_failure_does_not_mark_stream_complete(self):
+        class FailingCardKitAdapter:
+            MAX_MESSAGE_LENGTH = 4096
+
+            def __init__(self):
+                self.send = AsyncMock(
+                    return_value=SimpleNamespace(success=True, message_id="msg_1")
+                )
+                self.edit_message = AsyncMock(
+                    return_value=SimpleNamespace(success=True)
+                )
+                self.complete_calls = []
+
+            async def finalize_streaming_message(self, _message_id, _content):
+                raise RuntimeError("finalize failed")
+
+            async def on_streaming_message_complete(self, message_id):
+                self.complete_calls.append(message_id)
+
+            @staticmethod
+            def truncate_message(content, _limit, **_kwargs):
+                return [content]
+
+        adapter = FailingCardKitAdapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5),
+        )
+        consumer.on_delta("Final answer")
+        consumer.finish()
+
+        await consumer.run()
+
+        assert adapter.complete_calls == []
 
 
 class TestBeforeFinalizeHook:
@@ -637,6 +679,7 @@ class TestUserInputBoundary:
                 self.sent = []
                 self.edits = []
                 self.finalized = []
+                self.completed = []
 
             async def send(self, **kwargs):
                 self.sent.append(kwargs)
@@ -651,6 +694,9 @@ class TestUserInputBoundary:
 
             async def finalize_streaming_message(self, message_id, content):
                 self.finalized.append((message_id, content))
+
+            async def on_streaming_message_complete(self, message_id):
+                self.completed.append(message_id)
 
             @staticmethod
             def truncate_message(content, _limit, **_kwargs):
@@ -680,6 +726,7 @@ class TestUserInputBoundary:
             ("msg_1", "Before clarify"),
             ("msg_2", "After reply"),
         ]
+        assert adapter.completed == ["msg_2"]
 
     @pytest.mark.asyncio
     async def test_edit_failure_sends_only_unsent_tail_at_finish(self):

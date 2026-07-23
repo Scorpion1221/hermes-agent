@@ -4558,6 +4558,22 @@ class TestProcessingReactions(unittest.TestCase):
         self.assertEqual(tracker.create_calls, [])
         self.assertEqual(tracker.delete_calls, [])
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_streaming_message_completion_adds_done_to_outgoing_card(self):
+        adapter, tracker = self._build_adapter()
+        with self._patch_to_thread():
+            self._run(adapter.on_streaming_message_complete("om_card"))
+        self.assertEqual(tracker.create_calls, ["DONE"])
+        self.assertEqual(tracker.delete_calls, [])
+
+    @patch.dict(os.environ, {"FEISHU_REACTIONS": "false"}, clear=True)
+    def test_streaming_message_completion_respects_reaction_toggle(self):
+        adapter, tracker = self._build_adapter()
+        with self._patch_to_thread():
+            self._run(adapter.on_streaming_message_complete("om_card"))
+        self.assertEqual(tracker.create_calls, [])
+        self.assertEqual(tracker.delete_calls, [])
+
     # ------------------------- delete failure: don't stack badges -----------
     @patch.dict(os.environ, {}, clear=True)
     def test_delete_failure_on_failure_outcome_skips_cross_mark(self):

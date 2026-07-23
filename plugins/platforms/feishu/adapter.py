@@ -333,10 +333,11 @@ _FEISHU_QUOTE_CHAIN_MAX_DEPTH = max(
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
 
 # Feishu reactions render as prominent badges, unlike Discord/Telegram's
-# small footer emoji — a success badge on every message would add noise, so
-# we only mark start (Typing) and failure (CrossMark); the reply itself is
-# the success signal.
+# small footer emoji. Inbound messages only get Typing/failure state; a DONE
+# badge is reserved for the final outgoing CardKit card so long streams have
+# an unambiguous completion signal without marking clarify/steer boundaries.
 _FEISHU_REACTION_IN_PROGRESS = "Typing"
+_FEISHU_REACTION_STREAM_COMPLETE = "DONE"
 _FEISHU_REACTION_FAILURE = "CrossMark"
 # Bound on the (message_id → reaction_id) handle cache. Happy-path entries
 # drain on completion; the cap is a safeguard against unbounded growth from
@@ -3621,6 +3622,12 @@ class FeishuAdapter(BasePlatformAdapter):
 
         if outcome is ProcessingOutcome.FAILURE:
             await self._add_reaction(message_id, _FEISHU_REACTION_FAILURE)
+
+    async def on_streaming_message_complete(self, message_id: str) -> None:
+        """Mark the final outgoing CardKit card as complete."""
+        if not self._reactions_enabled():
+            return
+        await self._add_reaction(message_id, _FEISHU_REACTION_STREAM_COMPLETE)
 
     # =========================================================================
     # Webhook server and security

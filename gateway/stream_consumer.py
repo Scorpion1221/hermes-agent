@@ -946,14 +946,33 @@ class GatewayStreamConsumer:
                             if self._final_response_sent:
                                 self._final_content_delivered = True
                     finalize_cls_fn = getattr(type(self.adapter), "finalize_streaming_message", None)
+                    streaming_message_finalized = False
                     if self._message_id and finalize_cls_fn is not None:
                         try:
                             await getattr(self.adapter, "finalize_streaming_message")(  # type: ignore[attr-defined]
                                 self._message_id,
                                 self._clean_for_display(self._accumulated or ""),
                             )
+                            streaming_message_finalized = True
                         except Exception as _fin_err:
                             logger.warning("finalize_streaming_message failed: %s", _fin_err)
+                    complete_cls_fn = getattr(
+                        type(self.adapter), "on_streaming_message_complete", None
+                    )
+                    if (
+                        streaming_message_finalized
+                        and self._message_id
+                        and complete_cls_fn is not None
+                    ):
+                        try:
+                            await getattr(self.adapter, "on_streaming_message_complete")(  # type: ignore[attr-defined]
+                                self._message_id,
+                            )
+                        except Exception as _complete_err:
+                            logger.warning(
+                                "on_streaming_message_complete failed: %s",
+                                _complete_err,
+                            )
                     return
 
                 if commentary_text is not None:
