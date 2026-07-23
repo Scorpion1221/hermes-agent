@@ -16,6 +16,11 @@ _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,}).*$")
 _MARKDOWN_ATX_HEADING_RE = re.compile(
     r"^(?P<indent>[ ]{0,3})(?P<marks>#{1,6})(?P<rest>(?:[ \t]+.*)?)$"
 )
+_CARDKIT_LIST_STRONG_BOUNDARY_RE = re.compile(
+    r"^[ ]{0,3}(?:[-+*]|1[.)])[ \t]+"
+    r"\*\*(?!\*)[^`\\*\r\n]*?[^`\\*\s\r\n]\*\*"
+    r"(?=[^\W])"
+)
 
 
 def _ns(**kwargs: Any) -> SimpleNamespace:
@@ -45,19 +50,32 @@ def _split_line_ending(line: str) -> tuple[str, str]:
     return line, ""
 
 
+def _space_cardkit_list_strong_boundary(line: str) -> str:
+    """Separate a leading list-label ``**`` from an attached word.
+
+    CardKit leaves ``- **Label:**body`` as plain text.  Keep this compatibility
+    rule deliberately narrow so prose, URLs, and copyable commands stay exact.
+    """
+    match = _CARDKIT_LIST_STRONG_BOUNDARY_RE.match(line)
+    if not match:
+        return line
+    return f"{line[:match.end()]} {line[match.end():]}"
+
+
 def render_markdown_for_card(content: str) -> str:
     """Render raw assistant Markdown for Feishu Card readability.
 
     Feishu Card 2.0 renders top-level Markdown headings very large. Hermes
     messages usually live inside an already-framed card, so render Markdown
     headings two levels lower (# -> ###, ## -> ####, capped at ######).
-    Fenced code blocks are left untouched.
+    It also leaves a leading list label such as ``**Label:**body`` as literal
+    text, so separate that verified boundary. Fenced blocks stay untouched.
 
     Keep this as a render-only boundary: callers should pass raw assistant
     text/session state and must not store this returned card-specific Markdown
     back into conversation or streaming state.
     """
-    if not content or "#" not in content:
+    if not content or ("#" not in content and "**" not in content):
         return content
 
     lines: list[str] = []
@@ -67,7 +85,10 @@ def render_markdown_for_card(content: str) -> str:
         line, ending = _split_line_ending(raw_line)
         if fence_char:
             lines.append(raw_line)
-            if re.match(rf"^[ ]{{0,3}}{re.escape(fence_char)}{{{fence_len},}}[ \t]*$", line):
+            if re.match(
+                rf"^[ ]{{0,3}}{re.escape(fence_char)}{{{fence_len},}}[ \t]*$",
+                line,
+            ):
                 fence_char = ""
                 fence_len = 0
             continue
@@ -92,7 +113,7 @@ def render_markdown_for_card(content: str) -> str:
             lines.append(line + ending)
             continue
 
-        lines.append(raw_line)
+        lines.append(_space_cardkit_list_strong_boundary(line) + ending)
 
     return "".join(lines)
 

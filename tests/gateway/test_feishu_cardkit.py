@@ -35,8 +35,13 @@ def test_build_final_card_body_disables_streaming():
 
 
 def test_build_final_card_body_downshifts_markdown_headings():
-    body = build_final_card_body("# H1\n## H2\n### H3\n#### H4")
-    assert body["body"]["elements"][0]["content"] == "### H1\n#### H2\n##### H3\n###### H4"
+    body = build_final_card_body(
+        "# H1\n## H2\n### H3\n#### H4\n- **A｜先止血：**将外层 timeout 对齐"
+    )
+    assert body["body"]["elements"][0]["content"] == (
+        "### H1\n#### H2\n##### H3\n###### H4\n"
+        "- **A｜先止血：** 将外层 timeout 对齐"
+    )
 
 
 def test_render_markdown_for_card_downshifts_markdown_headings():
@@ -44,9 +49,77 @@ def test_render_markdown_for_card_downshifts_markdown_headings():
     assert rendered == "### H1\n#### H2\n##### H3\n###### H4"
 
 
+def test_render_markdown_for_card_spaces_cardkit_strong_boundary():
+    rendered = render_markdown_for_card(
+        "- **A｜先止血：**将外层 timeout 对齐\n"
+        "1. **B｜再优化：**取消前置 gate\n"
+        "- **已有空格：** 保持不变\n"
+        "- **正常加粗**，继续说明\n"
+        "[docs](https://example.com/a**b**c)\n"
+        "x**2**nd\n"
+        "    - **copyable:**command\n"
+        "2. **paragraph-continuation:**body\n"
+        "1234567890. **not-a-list:**body\n"
+        "- **Use `foo**bar`：**body\n"
+        "- **literal\\**body"
+    )
+    assert rendered == (
+        "- **A｜先止血：** 将外层 timeout 对齐\n"
+        "1. **B｜再优化：** 取消前置 gate\n"
+        "- **已有空格：** 保持不变\n"
+        "- **正常加粗**，继续说明\n"
+        "[docs](https://example.com/a**b**c)\n"
+        "x**2**nd\n"
+        "    - **copyable:**command\n"
+        "2. **paragraph-continuation:**body\n"
+        "1234567890. **not-a-list:**body\n"
+        "- **Use `foo**bar`：**body\n"
+        "- **literal\\**body"
+    )
+
+
+def test_cardkit_strong_boundary_fix_ignores_fenced_code_blocks():
+    rendered = render_markdown_for_card(
+        "```md\n- **A｜先止血：**将外层 timeout 对齐\n```\n"
+        "- **A｜先止血：**将外层 timeout 对齐"
+    )
+    assert rendered == (
+        "```md\n- **A｜先止血：**将外层 timeout 对齐\n```\n"
+        "- **A｜先止血：** 将外层 timeout 对齐"
+    )
+
+
+def test_cardkit_strong_boundary_fix_does_not_extend_unmatched_code_span():
+    rendered = render_markdown_for_card(
+        "`unmatched code span\n\n- **A｜先止血：**将外层 timeout 对齐"
+    )
+    assert rendered == (
+        "`unmatched code span\n\n- **A｜先止血：** 将外层 timeout 对齐"
+    )
+
+
+def test_unmatched_code_span_does_not_steal_later_markdown_block():
+    rendered = render_markdown_for_card(
+        "`typo\n\n"
+        "# Heading\n\n"
+        "- **A｜先止血：**将外层 timeout 对齐\n\n"
+        "Later `code` here."
+    )
+    assert rendered == (
+        "`typo\n\n"
+        "### Heading\n\n"
+        "- **A｜先止血：** 将外层 timeout 对齐\n\n"
+        "Later `code` here."
+    )
+
+
 def test_build_card_v2_payload_downshifts_markdown_headings_before_send():
-    payload = json.loads(_build_card_v2_payload("# H1\n## H2\nplain"))
-    assert payload["body"]["elements"][0]["content"] == "### H1\n#### H2\nplain"
+    payload = json.loads(
+        _build_card_v2_payload("# H1\n## H2\n- **A｜先止血：**将外层 timeout 对齐")
+    )
+    assert payload["body"]["elements"][0]["content"] == (
+        "### H1\n#### H2\n- **A｜先止血：** 将外层 timeout 对齐"
+    )
 
 
 def test_card_heading_downshift_ignores_fenced_code_blocks():
@@ -98,10 +171,13 @@ async def test_stream_card_element_returns_true_on_success():
     )
     ok = await stream_card_element(
         client, card_id="ck_1", element_id=STREAMING_ELEMENT_ID,
-        content="# H1\n## H2", sequence=1,
+        content="# H1\n## H2\n- **A｜先止血：**将外层 timeout 对齐",
+        sequence=1,
     )
     assert ok is True
-    assert calls[0].request_body.content == "### H1\n#### H2"
+    assert calls[0].request_body.content == (
+        "### H1\n#### H2\n- **A｜先止血：** 将外层 timeout 对齐"
+    )
 
 
 @pytest.mark.asyncio
