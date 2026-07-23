@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -16,9 +17,12 @@ _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,}).*$")
 _MARKDOWN_ATX_HEADING_RE = re.compile(
     r"^(?P<indent>[ ]{0,3})(?P<marks>#{1,6})(?P<rest>(?:[ \t]+.*)?)$"
 )
-_CARDKIT_LIST_STRONG_BOUNDARY_RE = re.compile(
-    r"^[ ]{0,3}(?:[-+*]|1[.)])[ \t]+"
-    r"\*\*(?!\*)[^`\\*\r\n]*?[^`\\*\s\r\n]\*\*"
+_MARKDOWN_INLINE_CODE_RE = re.compile(
+    r"(?<!\\)(?P<fence>`+)(?!`)[^\r\n]*?(?P=fence)(?!`)"
+)
+_CARDKIT_STRONG_BOUNDARY_RE = re.compile(
+    r"(?<![*\\])\*\*(?!\*)"
+    r"(?P<label>[^`\\*\r\n]*?)(?P<last>[^`\\*\s\r\n])\*\*"
     r"(?=[^\W])"
 )
 
@@ -50,16 +54,42 @@ def _split_line_ending(line: str) -> tuple[str, str]:
     return line, ""
 
 
-def _space_cardkit_list_strong_boundary(line: str) -> str:
-    """Separate a leading list-label ``**`` from an attached word.
+def _inside_url_token(line: str, position: int) -> bool:
+    token_start = position
+    while token_start > 0 and not line[token_start - 1].isspace():
+        token_start -= 1
+    token_prefix = line[token_start:position].lower()
+    return "://" in token_prefix or token_prefix.startswith("www.")
 
-    CardKit leaves ``- **Label:**body`` as plain text.  Keep this compatibility
-    rule deliberately narrow so prose, URLs, and copyable commands stay exact.
+
+def _space_cardkit_strong_boundaries(line: str) -> str:
+    """Separate punctuation-ended ``**`` spans from an attached word.
+
+    CommonMark and CardKit leave ``**Label:**body`` literal because the closing
+    delimiter is preceded by punctuation and followed by a word.  Only repair
+    that delimiter shape, outside inline/indented code and URL tokens.
     """
-    match = _CARDKIT_LIST_STRONG_BOUNDARY_RE.match(line)
-    if not match:
+    if line.startswith(("    ", "\t")):
         return line
-    return f"{line[:match.end()]} {line[match.end():]}"
+
+    code_spans = [match.span() for match in _MARKDOWN_INLINE_CODE_RE.finditer(line)]
+    pieces: list[str] = []
+    cursor = 0
+    for match in _CARDKIT_STRONG_BOUNDARY_RE.finditer(line):
+        if not unicodedata.category(match.group("last")).startswith("P"):
+            continue
+        if any(start <= match.start() < end for start, end in code_spans):
+            continue
+        if _inside_url_token(line, match.start()):
+            continue
+        pieces.append(line[cursor:match.end()])
+        pieces.append(" ")
+        cursor = match.end()
+
+    if not pieces:
+        return line
+    pieces.append(line[cursor:])
+    return "".join(pieces)
 
 
 def render_markdown_for_card(content: str) -> str:
@@ -68,8 +98,8 @@ def render_markdown_for_card(content: str) -> str:
     Feishu Card 2.0 renders top-level Markdown headings very large. Hermes
     messages usually live inside an already-framed card, so render Markdown
     headings two levels lower (# -> ###, ## -> ####, capped at ######).
-    It also leaves a leading list label such as ``**Label:**body`` as literal
-    text, so separate that verified boundary. Fenced blocks stay untouched.
+    It also leaves punctuation-ended strong spans such as ``**Label:**body`` as
+    literal text, so separate that verified boundary. Code stays untouched.
 
     Keep this as a render-only boundary: callers should pass raw assistant
     text/session state and must not store this returned card-specific Markdown
@@ -110,10 +140,8 @@ def render_markdown_for_card(content: str) -> str:
                 f"{'#' * new_level}"
                 f"{heading_match.group('rest')}"
             )
-            lines.append(line + ending)
-            continue
 
-        lines.append(_space_cardkit_list_strong_boundary(line) + ending)
+        lines.append(_space_cardkit_strong_boundaries(line) + ending)
 
     return "".join(lines)
 
