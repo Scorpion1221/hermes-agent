@@ -1587,6 +1587,11 @@ class FeishuAdapter(BasePlatformAdapter):
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
 
     MAX_MESSAGE_LENGTH = 8000
+    # CardKit's native streaming markdown element accepts substantially more
+    # content than a regular Feishu message.  Keep the stream consumer from
+    # applying the legacy 8k message split (and adding "(1/2)" page markers)
+    # before CardKit's own per-element rollover boundary.
+    CARDKIT_MAX_ELEMENT_CHARS = 30_000
     # Max distinct chat IDs retained in _chat_locks before LRU eviction kicks in.
     CHAT_LOCK_MAX_SIZE: int = 1000
     # Threshold for detecting Feishu client-side message splits.
@@ -2153,6 +2158,12 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    def streaming_overflow_limit(self) -> Optional[int]:
+        """Use CardKit's native markdown-element cap for streaming replies."""
+        if self._use_cardkit_streaming:
+            return self.CARDKIT_MAX_ELEMENT_CHARS
+        return None
 
     async def _send_drive_comment_message(self, *, chat_id: str, content: str) -> SendResult:
         target = parse_feishu_comment_target(chat_id)

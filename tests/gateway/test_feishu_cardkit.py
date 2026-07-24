@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from gateway.config import PlatformConfig
-from plugins.platforms.feishu.adapter import FeishuAdapter, _build_card_v2_payload
+from gateway.platforms.base import SendResult
 from gateway.platforms.feishu_inbound.cardkit import (
     STREAMING_ELEMENT_ID,
     CardKitState,
@@ -21,6 +21,8 @@ from gateway.platforms.feishu_inbound.cardkit import (
     stream_card_element,
     update_card,
 )
+from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+from plugins.platforms.feishu.adapter import FeishuAdapter, _build_card_v2_payload
 
 
 def test_build_streaming_card_body_has_streaming_mode_and_element_id():
@@ -355,3 +357,48 @@ def test_cardkit_state_defaults():
     assert state.sequence == 1
     assert state.element_id == STREAMING_ELEMENT_ID
     assert state.failed is False
+
+
+def test_cardkit_streaming_uses_native_element_limit():
+    adapter = FeishuAdapter(
+        PlatformConfig(extra={"streaming_transport": "cardkit"})
+    )
+    assert adapter.streaming_overflow_limit() == 30_000
+
+    regular_adapter = FeishuAdapter(PlatformConfig())
+    assert regular_adapter.streaming_overflow_limit() is None
+
+
+@pytest.mark.asyncio
+async def test_cardkit_reply_over_legacy_message_limit_stays_in_one_card():
+    adapter = FeishuAdapter(
+        PlatformConfig(extra={"streaming_transport": "cardkit"})
+    )
+    adapter.send = AsyncMock(
+        return_value=SendResult(success=True, message_id="om_1")
+    )
+    adapter.edit_message = AsyncMock(
+        return_value=SendResult(success=True, message_id="om_1")
+    )
+    adapter.finalize_streaming_message = AsyncMock(return_value=True)
+    adapter.on_streaming_message_complete = AsyncMock()
+
+    consumer = GatewayStreamConsumer(
+        adapter,
+        "oc_chat",
+        StreamConsumerConfig(edit_interval=999, buffer_threshold=999),
+        metadata={"streaming": True},
+    )
+    long_report = "# Dogfooding report\n\n" + ("report line\n" * 1_000)
+    assert 8_000 < len(long_report) < 30_000
+
+    consumer.on_delta(long_report)
+    consumer.finish()
+    await consumer.run()
+
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args.kwargs["content"] == long_report
+    adapter.finalize_streaming_message.assert_awaited_once_with(
+        "om_1", long_report
+    )
+    adapter.on_streaming_message_complete.assert_awaited_once_with("om_1")
