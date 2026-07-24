@@ -895,7 +895,14 @@ class GatewayStreamConsumer:
                     # full response again.
                     if self._accumulated:
                         if self._fallback_final_send:
-                            await self._send_fallback_final(self._accumulated)
+                            # CardKit's authoritative finalize call replaces the
+                            # card body with the complete response. Try that
+                            # before falling back to a regular platform message;
+                            # otherwise a transient final stream-tick failure can
+                            # create a duplicate plain card immediately before a
+                            # successful final CardKit replacement.
+                            if not self._cardkit_mode:
+                                await self._send_fallback_final(self._accumulated)
                         elif self._final_response_sent:
                             # A finalize=True tick above already delivered the
                             # final answer via the adapter's fresh-final path
@@ -947,26 +954,48 @@ class GatewayStreamConsumer:
                                 self._final_content_delivered = True
                     finalize_cls_fn = getattr(type(self.adapter), "finalize_streaming_message", None)
                     streaming_message_finalized = False
-                    if self._message_id and finalize_cls_fn is not None:
+                    final_content_committed = False
+                    streaming_message_id = self._message_id
+                    final_stream_text = self._clean_for_display(self._accumulated or "")
+                    if streaming_message_id and finalize_cls_fn is not None:
                         try:
                             finalize_result = await getattr(self.adapter, "finalize_streaming_message")(  # type: ignore[attr-defined]
-                                self._message_id,
-                                self._clean_for_display(self._accumulated or ""),
+                                streaming_message_id,
+                                final_stream_text,
                             )
                             streaming_message_finalized = finalize_result is not False
+                            # Feishu returns the literal True only after CardKit
+                            # has accepted the final full-card replacement. That
+                            # is stronger delivery evidence than the failed
+                            # incremental edit which led us here.
+                            final_content_committed = (
+                                self._cardkit_mode
+                                and finalize_result is True
+                                and bool(final_stream_text.strip())
+                            )
                         except Exception as _fin_err:
                             logger.warning("finalize_streaming_message failed: %s", _fin_err)
+                    if final_content_committed:
+                        self._already_sent = True
+                        self._final_response_sent = True
+                        self._final_content_delivered = True
+                        self._fallback_final_send = False
+                    elif self._cardkit_mode and self._fallback_final_send:
+                        # The native final replacement did not commit the full
+                        # answer. Preserve the existing recovery behavior, but
+                        # only now that CardKit had the first chance to finish.
+                        await self._send_fallback_final(self._accumulated)
                     complete_cls_fn = getattr(
                         type(self.adapter), "on_streaming_message_complete", None
                     )
                     if (
                         streaming_message_finalized
-                        and self._message_id
+                        and streaming_message_id
                         and complete_cls_fn is not None
                     ):
                         try:
                             await getattr(self.adapter, "on_streaming_message_complete")(  # type: ignore[attr-defined]
-                                self._message_id,
+                                streaming_message_id,
                             )
                         except Exception as _complete_err:
                             logger.warning(

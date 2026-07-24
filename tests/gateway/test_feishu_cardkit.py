@@ -402,3 +402,46 @@ async def test_cardkit_reply_over_legacy_message_limit_stays_in_one_card():
         "om_1", long_report
     )
     adapter.on_streaming_message_complete.assert_awaited_once_with("om_1")
+
+
+@pytest.mark.asyncio
+async def test_successful_cardkit_finalize_suppresses_generic_fallback_after_edit_failure():
+    """A final CardKit replace is authoritative even if the last stream tick failed."""
+    adapter = FeishuAdapter(
+        PlatformConfig(extra={"streaming_transport": "cardkit"})
+    )
+    adapter.send = AsyncMock(
+        return_value=SendResult(success=True, message_id="duplicate")
+    )
+    adapter.edit_message = AsyncMock(
+        return_value=SendResult(success=False, error="CardKit stream failed")
+    )
+    adapter.finalize_streaming_message = AsyncMock(return_value=True)
+    adapter.on_streaming_message_complete = AsyncMock()
+
+    consumer = GatewayStreamConsumer(
+        adapter,
+        "oc_chat",
+        StreamConsumerConfig(edit_interval=999, buffer_threshold=999),
+        metadata={"streaming": True},
+    )
+    # Reproduce a stream whose preview is already visible. The last incremental
+    # update fails, but Feishu's final card replacement still succeeds with the
+    # complete response.
+    consumer._message_id = "om_1"
+    consumer._already_sent = True
+    consumer._has_visible_delivery = True
+    consumer._last_sent_text = "partial"
+    final_report = "partial final dogfooding report"
+    consumer.on_delta(final_report)
+    consumer.finish()
+
+    await consumer.run()
+
+    adapter.finalize_streaming_message.assert_awaited_once_with(
+        "om_1", final_report
+    )
+    adapter.send.assert_not_awaited()
+    assert consumer.final_response_sent is True
+    assert consumer.final_content_delivered is True
+    adapter.on_streaming_message_complete.assert_awaited_once_with("om_1")
