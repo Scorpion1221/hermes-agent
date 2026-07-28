@@ -900,6 +900,7 @@ class TestAdapterBehavior(unittest.TestCase):
             sender=SimpleNamespace(sender_type="app", id=msg_sender_id, id_type="app_id"),
             chat_id="oc_chat",
             chat_type="group",
+            thread_id="omt_topic",
         )
         response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(items=[msg]))
         adapter._client = SimpleNamespace(
@@ -912,6 +913,7 @@ class TestAdapterBehavior(unittest.TestCase):
         adapter._resolve_sender_profile = AsyncMock(
             return_value={"user_id": "u_human", "user_name": "Human", "user_id_alt": None}
         )
+        adapter._fetch_quoted_context = AsyncMock()
         adapter.get_chat_info = AsyncMock(return_value={"name": "Test Chat"})
         return adapter
 
@@ -934,18 +936,52 @@ class TestAdapterBehavior(unittest.TestCase):
 
     @patch.dict(os.environ, {}, clear=True)
     def test_reaction_on_our_own_bot_message_is_routed(self):
+        from gateway.platforms.feishu_inbound import FeishuQuotedContext
+
         adapter = self._build_reaction_adapter(msg_sender_id="cli_self_app")
+        adapter._fetch_message_items = AsyncMock(
+            return_value=[
+                {
+                    "sender": {"sender_type": "app", "id": "cli_self_app", "id_type": "app_id"},
+                    "chat_id": "oc_chat",
+                    "chat_type": "group",
+                    "thread_id": "omt_topic",
+                }
+            ]
+        )
+        quoted_context = FeishuQuotedContext(
+            message_id="om_self_msg",
+            kind="card",
+            text="Please confirm the 3-month subscription",
+            media_urls=("/tmp/confirmation.png",),
+            media_types=("image/png",),
+        )
+        adapter._fetch_quoted_context.return_value = quoted_context
 
         event = SimpleNamespace(
             message_id="om_self_msg",
             user_id=SimpleNamespace(open_id="ou_human", user_id=None, union_id=None),
-            reaction_type=SimpleNamespace(emoji_type="THUMBSUP"),
+            reaction_type=SimpleNamespace(emoji_type="YES"),
+            action_time="1785210000000",
         )
         data = SimpleNamespace(event=event)
         asyncio.run(
             adapter._handle_reaction_event("im.message.reaction.created_v1", data)
         )
         adapter._handle_message_with_guards.assert_awaited_once()
+        routed_event = adapter._handle_message_with_guards.await_args.args[0]
+        self.assertEqual(routed_event.text, "reaction:added:YES")
+        self.assertEqual(
+            routed_event.message_id,
+            "reaction:om_self_msg:added:YES:u_human:1785210000000",
+        )
+        self.assertEqual(routed_event.reply_to_message_id, "om_self_msg")
+        self.assertEqual(routed_event.reply_to_text, "Please confirm the 3-month subscription")
+        self.assertEqual(routed_event.reply_to_media_urls, ["/tmp/confirmation.png"])
+        self.assertEqual(routed_event.reply_to_media_types, ["image/png"])
+        self.assertIs(routed_event.quoted_context, quoted_context)
+        self.assertTrue(routed_event.reply_to_is_own_message)
+        self.assertEqual(routed_event.source.thread_id, "omt_topic")
 
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
     def test_group_message_requires_mentions_even_when_policy_open(self):

@@ -3371,7 +3371,7 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("Failed to resolve Feishu update prompt: %s", exc)
 
     async def _handle_reaction_event(self, event_type: str, data: Any) -> None:
-        """Fetch the reacted-to message; if it was sent by this bot, emit a synthetic text event."""
+        """Fetch the reacted-to message; if it was sent by this bot, emit a synthetic reply event."""
         if not self._client:
             return
         event = getattr(data, "event", None)
@@ -3381,21 +3381,24 @@ class FeishuAdapter(BasePlatformAdapter):
 
         # Fetch the target message to verify it was sent by us and to obtain chat context.
         try:
-            request = self._build_get_message_request(message_id)
-            response = await self._run_blocking(self._client.im.v1.message.get, request)
-            if not response or not getattr(response, "success", lambda: False)():
-                return
-            items = getattr(getattr(response, "data", None), "items", None) or []
+            items = await self._fetch_message_items(message_id)
             msg = items[0] if items else None
             if not msg:
                 return
             # GET im/v1/messages returns sender.id=app_id for bot messages —
             # peer bots and us share sender_type="app" but differ on app_id.
-            sender = getattr(msg, "sender", None)
-            if str(getattr(sender, "id", "") or "") != self._app_id:
+            sender = msg.get("sender") if isinstance(msg, dict) else getattr(msg, "sender", None)
+            sender_id = sender.get("id", "") if isinstance(sender, dict) else getattr(sender, "id", "")
+            if str(sender_id or "") != self._app_id:
                 return  # only route reactions on this bot's own messages
-            chat_id = str(getattr(msg, "chat_id", "") or "")
-            chat_type_raw = str(getattr(msg, "chat_type", "p2p") or "p2p")
+            chat_id = str((msg.get("chat_id", "") if isinstance(msg, dict) else getattr(msg, "chat_id", "")) or "")
+            chat_type_raw = str(
+                (msg.get("chat_type", "p2p") if isinstance(msg, dict) else getattr(msg, "chat_type", "p2p"))
+                or "p2p"
+            )
+            thread_id = str(
+                (msg.get("thread_id", "") if isinstance(msg, dict) else getattr(msg, "thread_id", "")) or ""
+            )
             if not chat_id:
                 return
         except Exception:
@@ -3409,6 +3412,7 @@ class FeishuAdapter(BasePlatformAdapter):
         synthetic_text = f"reaction:{action}:{emoji_type}"
 
         sender_profile = await self._resolve_sender_profile(user_id_obj)
+        quoted_context = await self._fetch_quoted_context(message_id)
         chat_info = await self.get_chat_info(chat_id)
         source = self.build_source(
             chat_id=chat_id,
@@ -3416,17 +3420,28 @@ class FeishuAdapter(BasePlatformAdapter):
             chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=chat_type_raw),
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
-            thread_id=None,
+            thread_id=thread_id or None,
             user_id_alt=sender_profile["user_id_alt"],
             auth_user_ids=sender_profile.get("auth_user_ids"),
+        )
+        action_time = str(getattr(event, "action_time", "") or "")
+        reaction_event_id = (
+            f"reaction:{message_id}:{action}:{emoji_type}:{sender_profile['user_id']}:"
+            f"{action_time or uuid.uuid4().hex}"
         )
         synthetic_event = MessageEvent(
             text=synthetic_text,
             message_type=MessageType.TEXT,
             source=source,
             raw_message=data,
-            message_id=message_id,
-            channel_prompt=self._resolve_channel_prompt(chat_id),
+            message_id=reaction_event_id,
+            reply_to_message_id=message_id,
+            reply_to_text=quoted_context.display_text if quoted_context else None,
+            reply_to_media_urls=list(quoted_context.media_urls) if quoted_context else [],
+            reply_to_media_types=list(quoted_context.media_types) if quoted_context else [],
+            quoted_context=quoted_context,
+            reply_to_is_own_message=True,
+            channel_prompt=self._resolve_channel_prompt(chat_id, thread_id or None),
             timestamp=datetime.now(),
         )
         logger.info("[Feishu] Routing reaction %s:%s on bot message %s as synthetic event", action, emoji_type, message_id)
