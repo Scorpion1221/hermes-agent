@@ -18,5 +18,10 @@ def test_uninstall_reinstall_hint_points_to_fork_develop():
 
 
 def test_update_reinstall_hint_points_to_fork_develop():
-    text = Path("hermes_cli/main.py").read_text()
-    assert "raw.githubusercontent.com/Scorpion1221/hermes-agent/develop/scripts/install.sh" in text
+    from hermes_cli.main import FORK_INSTALL_URL
+
+    assert (
+        FORK_INSTALL_URL
+        == "https://raw.githubusercontent.com/Scorpion1221/hermes-agent/"
+        "develop/scripts/install.sh"
+    )

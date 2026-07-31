@@ -25,19 +25,20 @@ def _patch_managed_uv(request):
 
     # resolve_uv delegates to shutil.which("uv") so that test patches
     # on shutil.which flow through naturally.
-    def _fake_resolve_uv():
+    def _fake_resolve_uv(**kwargs):
         return shutil.which("uv")
 
-    def _fake_ensure_uv():
+    def _fake_ensure_uv(**kwargs):
         return shutil.which("uv")
 
-    def _fake_update_managed_uv():
+    def _fake_update_managed_uv(**kwargs):
         return None  # never actually self-update in tests
 
     with patch("hermes_cli.managed_uv.resolve_uv", side_effect=_fake_resolve_uv), \
          patch("hermes_cli.managed_uv.ensure_uv", side_effect=_fake_ensure_uv), \
          patch("hermes_cli.managed_uv.update_managed_uv", side_effect=_fake_update_managed_uv):
         yield
+
 
 def test_stash_local_changes_if_needed_returns_none_when_tree_clean(monkeypatch, tmp_path):
     calls = []
@@ -273,9 +274,35 @@ def test_restore_stashed_changes_keeps_going_when_stash_entry_cannot_be_resolved
     restored = hermes_main._restore_stashed_changes(["git"], tmp_path, "abc123", prompt_user=False)
 
     assert restored is True
-    assert calls[0] == (["git", "stash", "apply", "abc123"], {"cwd": tmp_path, "capture_output": True, "text": True})
-    assert calls[1] == (["git", "diff", "--name-only", "--diff-filter=U"], {"cwd": tmp_path, "capture_output": True, "text": True})
-    assert calls[2] == (["git", "stash", "list", "--format=%gd %H"], {"cwd": tmp_path, "capture_output": True, "text": True, "check": True})
+    assert calls[0][0] == ["git", "stash", "apply", "abc123"]
+    assert calls[0][1] == {
+        "cwd": tmp_path,
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    assert calls[1] == (
+        ["git", "diff", "--name-only", "--diff-filter=U"],
+        {
+            "cwd": tmp_path,
+            "capture_output": True,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+        },
+    )
+    assert calls[2] == (
+        ["git", "stash", "list", "--format=%gd %H"],
+        {
+            "cwd": tmp_path,
+            "capture_output": True,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "check": True,
+        },
+    )
     out = capsys.readouterr().out
     assert "couldn't find the stash entry to drop" in out
     assert "stash was left in place" in out
@@ -465,43 +492,39 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_config, "get_missing_config_fields", lambda: [])
     monkeypatch.setattr(hermes_config, "check_config_version", lambda: (5, 5))
     monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
-    monkeypatch.setattr(hermes_main, "_refresh_active_lazy_features", lambda: None)
+    monkeypatch.setattr(hermes_main, "_upgrade_pip_before_lazy_refresh", lambda *a, **kw: None)
+    monkeypatch.setattr(hermes_main, "_refresh_active_lazy_features", lambda *a, **kw: True)
 
 
-def test_cmd_update_retries_optional_extras_individually_when_all_fails(monkeypatch, tmp_path, capsys):
-    """When .[all] fails, update should keep base deps and retry extras individually."""
+def test_cmd_update_retries_optional_extras_individually_when_all_fails(
+    monkeypatch, tmp_path, capsys
+):
+    """A broken optional extra must not block base deps or healthy extras."""
     _setup_update_mocks(monkeypatch, tmp_path)
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr(
+        "shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
     monkeypatch.setattr(hermes_main, "_is_termux_env", lambda env=None: False)
-    monkeypatch.setattr(hermes_main, "_load_installable_optional_extras", lambda group="all": ["matrix", "mcp"])
-
+    monkeypatch.setattr(
+        hermes_main,
+        "_load_installable_optional_extras",
+        lambda group="all": ["matrix", "mcp"],
+    )
     recorded = []
 
     def fake_run(cmd, **kwargs):
         recorded.append(cmd)
-        if cmd == ["git", "fetch", "origin", "main"]:
-            return SimpleNamespace(stdout="", stderr="", returncode=0)
         if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
             return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
         if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
             return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
-        if cmd == ["git", "pull", "--ff-only", "origin", "main"]:
-            return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
         if cmd == ["/usr/bin/uv", "pip", "install", "-e", ".[all]"]:
             raise CalledProcessError(returncode=1, cmd=cmd)
-        if cmd == ["/usr/bin/uv", "pip", "install", "-e", "."]:
-            return SimpleNamespace(returncode=0)
         if cmd == ["/usr/bin/uv", "pip", "install", "-e", ".[matrix]"]:
             raise CalledProcessError(returncode=1, cmd=cmd)
-        if cmd == ["/usr/bin/uv", "pip", "install", "-e", ".[mcp]"]:
-            return SimpleNamespace(returncode=0)
-        # Catch-all must include stdout/stderr so consumers that parse
-        # output (e.g. the dashboard-restart `ps -A` scan added in the
-        # updater) don't crash on AttributeError.
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
-
     hermes_main.cmd_update(SimpleNamespace())
 
     install_cmds = [c for c in recorded if "pip" in c and "install" in c]
@@ -511,7 +534,6 @@ def test_cmd_update_retries_optional_extras_individually_when_all_fails(monkeypa
         ["/usr/bin/uv", "pip", "install", "-e", ".[matrix]"],
         ["/usr/bin/uv", "pip", "install", "-e", ".[mcp]"],
     ]
-
     out = capsys.readouterr().out
     assert "retrying extras individually" in out
     assert "Reinstalled optional extras individually: mcp" in out
@@ -519,36 +541,31 @@ def test_cmd_update_retries_optional_extras_individually_when_all_fails(monkeypa
 
 
 def test_cmd_update_succeeds_with_extras(monkeypatch, tmp_path):
-    """When .[all] succeeds, no fallback should be attempted."""
+    """A successful aggregate extras install needs no fallback."""
     _setup_update_mocks(monkeypatch, tmp_path)
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr(
+        "shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
     monkeypatch.setattr(hermes_main, "_is_termux_env", lambda env=None: False)
-
     recorded = []
 
     def fake_run(cmd, **kwargs):
         recorded.append(cmd)
-        if cmd == ["git", "fetch", "origin", "main"]:
-            return SimpleNamespace(stdout="", stderr="", returncode=0)
         if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
             return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
         if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
             return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
-        if cmd == ["git", "pull", "--ff-only", "origin", "main"]:
-            return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
-
     hermes_main.cmd_update(SimpleNamespace())
-
     install_cmds = [c for c in recorded if "pip" in c and "install" in c]
     assert len(install_cmds) == 1
     assert ".[all]" in install_cmds[0]
 
 
 def test_install_with_optional_fallback_honors_custom_group(monkeypatch):
-    """Termux update path should target .[termux-all] when requested."""
+    """Termux update path must target its own optional dependency group."""
     calls = []
     monkeypatch.setattr(
         hermes_main,
@@ -560,15 +577,13 @@ def test_install_with_optional_fallback_honors_custom_group(monkeypatch):
         calls.append(cmd)
         if cmd[-1] == ".[termux-all]":
             raise CalledProcessError(returncode=1, cmd=cmd)
-        return None
 
-    monkeypatch.setattr(hermes_main, "_run_install_with_heartbeat", fake_run_with_heartbeat)
-
-    hermes_main._install_python_dependencies_with_optional_fallback(
-        ["/usr/bin/uv", "pip"],
-        group="termux-all",
+    monkeypatch.setattr(
+        hermes_main, "_run_install_with_heartbeat", fake_run_with_heartbeat
     )
-
+    hermes_main._install_python_dependencies_with_optional_fallback(
+        ["/usr/bin/uv", "pip"], group="termux-all"
+    )
     assert calls == [
         ["/usr/bin/uv", "pip", "install", "-e", ".[termux-all]"],
         ["/usr/bin/uv", "pip", "install", "-e", "."],
@@ -577,22 +592,57 @@ def test_install_with_optional_fallback_honors_custom_group(monkeypatch):
     ]
 
 
-def test_install_heartbeat_prints_when_dependency_install_is_silent(monkeypatch, capsys):
+def test_install_heartbeat_prints_when_dependency_install_is_silent(
+    monkeypatch, capsys
+):
     """Long quiet installs should emit periodic heartbeat lines."""
-
     def fake_run(cmd, **kwargs):
         hermes_main._time.sleep(1.2)
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
-
     hermes_main._run_install_with_heartbeat(
-        ["uv", "pip", "install", "-e", "."],
-        heartbeat_interval_seconds=1,
+        ["uv", "pip", "install", "-e", "."], heartbeat_interval_seconds=1
+    )
+    assert "still installing dependencies" in capsys.readouterr().out
+
+
+
+
+def test_refresh_active_memory_provider_dependencies_reinstalls_active_provider(monkeypatch):
+    """#53272/#70636: update must re-run the active provider's dep install."""
+    recorded = []
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"memory": {"provider": "mem0"}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.memory_setup._install_dependencies",
+        lambda provider_name, force=False: recorded.append((provider_name, force)),
     )
 
-    out = capsys.readouterr().out
-    assert "still installing dependencies" in out
+    hermes_main._refresh_active_memory_provider_dependencies()
+
+    assert recorded == [("mem0", True)]
+
+
+
+
+def test_reload_updated_runtime_modules_restores_new_hermes_constants_symbol(monkeypatch):
+    """A pre-pull module object missing a new helper is repaired by reload."""
+    import hermes_constants
+
+    monkeypatch.delattr(hermes_constants, "apply_subprocess_home_env", raising=False)
+    assert not hasattr(hermes_constants, "apply_subprocess_home_env")
+
+    hermes_main._reload_updated_runtime_modules()
+
+    assert callable(hermes_constants.apply_subprocess_home_env)
+
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -640,36 +690,32 @@ def _make_update_side_effect(
     return side_effect, recorded
 
 
-def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path, capsys):
-    """When --ff-only fails (diverged history), update resets to origin/{branch}."""
+def test_cmd_update_falls_back_to_reset_when_ff_only_fails(
+    monkeypatch, tmp_path, capsys
+):
+    """Diverged managed history is repaired from the selected remote branch."""
     _setup_update_mocks(monkeypatch, tmp_path)
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
-
+    monkeypatch.setattr(
+        "shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
     side_effect, recorded = _make_update_side_effect(ff_only_fails=True)
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
-
     hermes_main.cmd_update(SimpleNamespace())
-
     reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
-    assert len(reset_calls) == 1
-    assert reset_calls[0] == ["git", "reset", "--hard", "origin/main"]
-
-    out = capsys.readouterr().out
-    assert "Fast-forward not possible" in out
+    assert reset_calls == [["git", "reset", "--hard", "origin/main"]]
+    assert "Fast-forward not possible" in capsys.readouterr().out
 
 
 def test_cmd_update_no_reset_when_ff_only_succeeds(monkeypatch, tmp_path):
-    """When --ff-only succeeds, no reset is attempted."""
+    """A normal fast-forward must never discard the checkout."""
     _setup_update_mocks(monkeypatch, tmp_path)
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
-
+    monkeypatch.setattr(
+        "shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
     side_effect, recorded = _make_update_side_effect()
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
-
     hermes_main.cmd_update(SimpleNamespace())
-
-    reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
-    assert len(reset_calls) == 0
+    assert not [c for c in recorded if "reset" in c and "--hard" in c]
 
 
 # ---------------------------------------------------------------------------
@@ -770,38 +816,35 @@ def test_cmd_update_fetch_is_scoped_to_target_branch(monkeypatch, tmp_path):
 # Fetch failure — friendly error messages
 # ---------------------------------------------------------------------------
 
-def test_cmd_update_network_error_shows_friendly_message(monkeypatch, tmp_path, capsys):
-    """Network failures during fetch show a user-friendly message."""
+def test_cmd_update_network_error_shows_friendly_message(
+    monkeypatch, tmp_path, capsys
+):
     _setup_update_mocks(monkeypatch, tmp_path)
-
     side_effect, _ = _make_update_side_effect(
         fetch_fails=True,
-        fetch_stderr="fatal: unable to access 'https://...': Could not resolve host: github.com",
+        fetch_stderr=(
+            "fatal: unable to access 'https://...': "
+            "Could not resolve host: github.com"
+        ),
     )
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
-
     with pytest.raises(SystemExit, match="1"):
         hermes_main.cmd_update(SimpleNamespace())
-
-    out = capsys.readouterr().out
-    assert "Network error" in out
+    assert "Network error" in capsys.readouterr().out
 
 
-def test_cmd_update_auth_error_shows_friendly_message(monkeypatch, tmp_path, capsys):
-    """Auth failures during fetch show a user-friendly message."""
+def test_cmd_update_auth_error_shows_friendly_message(
+    monkeypatch, tmp_path, capsys
+):
     _setup_update_mocks(monkeypatch, tmp_path)
-
     side_effect, _ = _make_update_side_effect(
         fetch_fails=True,
         fetch_stderr="fatal: Authentication failed for 'https://...'",
     )
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
-
     with pytest.raises(SystemExit, match="1"):
         hermes_main.cmd_update(SimpleNamespace())
-
-    out = capsys.readouterr().out
-    assert "Authentication failed" in out
+    assert "Authentication failed" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
@@ -872,50 +915,50 @@ def _setup_setting_test(monkeypatch, tmp_path, mode):
 
 
 def test_non_interactive_discard_throws_changes_away(monkeypatch, tmp_path):
-    """Gateway/chat-app update with discard mode drops the stash, never restores."""
-    restore_calls, discard_calls, _ = _setup_setting_test(monkeypatch, tmp_path, "discard")
-
+    restore_calls, discard_calls, _ = _setup_setting_test(
+        monkeypatch, tmp_path, "discard"
+    )
     hermes_main.cmd_update(SimpleNamespace(gateway=True))
-
     assert len(discard_calls) == 1
-    assert len(restore_calls) == 0
+    assert not restore_calls
 
 
 def test_non_interactive_stash_restores_changes(monkeypatch, tmp_path):
-    """Gateway/chat-app update with the default stash mode restores, never discards."""
-    restore_calls, discard_calls, _ = _setup_setting_test(monkeypatch, tmp_path, "stash")
-
+    restore_calls, discard_calls, _ = _setup_setting_test(
+        monkeypatch, tmp_path, "stash"
+    )
     hermes_main.cmd_update(SimpleNamespace(gateway=True))
-
     assert len(restore_calls) == 1
-    assert len(discard_calls) == 0
+    assert not discard_calls
 
 
 def test_interactive_update_ignores_discard_setting(monkeypatch, tmp_path):
-    """An interactive (TTY) terminal update always restores — the discard
-    setting only governs non-interactive updates."""
-    restore_calls, discard_calls, _ = _setup_setting_test(monkeypatch, tmp_path, "discard")
-    # Force an interactive TTY so _non_interactive_update is False even though
-    # the config says discard.
+    restore_calls, discard_calls, _ = _setup_setting_test(
+        monkeypatch, tmp_path, "discard"
+    )
     monkeypatch.setattr(hermes_main.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(hermes_main.sys.stdout, "isatty", lambda: True)
-
-    hermes_main.cmd_update(SimpleNamespace())  # no gateway, no --yes
-
+    hermes_main.cmd_update(SimpleNamespace())
     assert len(restore_calls) == 1
-    assert len(discard_calls) == 0
+    assert not discard_calls
 
 
-def test_non_interactive_defaults_to_stash_when_setting_absent(monkeypatch, tmp_path):
-    """A config with no update section falls back to stash (safe default)."""
-    restore_calls, discard_calls, _ = _setup_setting_test(monkeypatch, tmp_path, "stash")
-    # Override load_config to return a config with NO update section at all.
-    monkeypatch.setattr(hermes_config, "load_config", lambda *a, **kw: {"model": {}})
-
+def test_non_interactive_defaults_to_stash_when_setting_absent(
+    monkeypatch, tmp_path
+):
+    restore_calls, discard_calls, _ = _setup_setting_test(
+        monkeypatch, tmp_path, "stash"
+    )
+    monkeypatch.setattr(
+        hermes_config, "load_config", lambda *a, **kw: {"model": {}}
+    )
     hermes_main.cmd_update(SimpleNamespace(gateway=True))
-
     assert len(restore_calls) == 1
-    assert len(discard_calls) == 0
+    assert not discard_calls
+
+
+
+
 
 
 def test_bootstrap_marker_not_autostashed_by_update(tmp_path):
@@ -963,3 +1006,62 @@ def test_bootstrap_marker_not_autostashed_by_update(tmp_path):
         ["git", "status", "--porcelain"], cwd=tmp_path, capture_output=True, text=True
     ).stdout
     assert ".hermes-bootstrap-complete" not in status
+
+
+# ---------------------------------------------------------------------------
+# Permission-denied autostash class: undeletable untracked files (root-owned
+# packaging/ etc.) must not abort the update when the stash entry was created.
+# ---------------------------------------------------------------------------
+
+
+
+
+
+
+def test_update_autostash_survives_undeletable_untracked_dir(tmp_path):
+    """Behavioral E2E of the whole permission-denied class with real git:
+    root-owned-style undeletable untracked dir → stash succeeds, update-style
+    reset works, restore round-trips, nothing lost. (#70127 follow-up)"""
+    import os
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+    if os.name == "nt":
+        pytest.skip("POSIX permission semantics")
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory write bits")
+
+    def git(*args, check=True):
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=check
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "tracked.txt").write_text("v1\n")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+
+    (tmp_path / "tracked.txt").write_text("v2 local change\n")
+    pkg = tmp_path / "packaging" / "homebrew"
+    pkg.mkdir(parents=True)
+    (pkg / "hermes-agent.rb").write_text("formula\n")
+    os.chmod(pkg, 0o555)  # undeletable contents, like a root-owned dir
+    try:
+        stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
+        assert stash_ref
+
+        # The tracked change is stashed; simulate the updater's checkout window.
+        assert (tmp_path / "tracked.txt").read_text() == "v1\n"
+
+        restored = hermes_main._restore_stashed_changes(
+            ["git"], tmp_path, stash_ref, prompt_user=False
+        )
+        assert restored is True
+        assert (tmp_path / "tracked.txt").read_text() == "v2 local change\n"
+        assert (pkg / "hermes-agent.rb").read_text() == "formula\n"
+    finally:
+        os.chmod(pkg, 0o755)

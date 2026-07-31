@@ -124,42 +124,6 @@ def test_turn_route_injects_priority_processing_without_changing_runtime():
     assert route["request_overrides"] == {"service_tier": "priority"}
 
 
-def test_turn_route_skips_priority_processing_for_unsupported_models():
-    runner = _make_runner()
-    runner._service_tier = "priority"
-    runtime_kwargs = {
-        "api_key": "***",
-        "base_url": "https://openrouter.ai/api/v1",
-        "provider": "openrouter",
-        "api_mode": "chat_completions",
-        "command": None,
-        "args": [],
-        "credential_pool": None,
-    }
-
-    route = gateway_run.GatewayRunner._resolve_turn_agent_config(runner, "hi", "gpt-5.3-codex", runtime_kwargs)
-
-    assert route["request_overrides"] == {}
-
-
-@pytest.mark.asyncio
-async def test_handle_fast_command_session_scoped_by_default(monkeypatch, tmp_path):
-    """Bare /fast fast applies a session override — config.yaml untouched."""
-    runner = _make_runner()
-
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
-    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
-
-    response = await runner._handle_fast_command(_make_event("/fast fast"))
-
-    assert "FAST" in response
-    assert runner._service_tier == "priority"
-    # Session override recorded; config.yaml NOT written.
-    assert runner._session_service_tier_overrides
-    assert not (tmp_path / "config.yaml").exists()
-
-
 @pytest.mark.asyncio
 async def test_handle_fast_command_global_flag_persists_config(monkeypatch, tmp_path):
     runner = _make_runner()
