@@ -140,6 +140,9 @@ echo "▶ pre-compiling bytecode cache"
 "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
+# ``urllib.request.getproxies()`` consults macOS System Settings even under
+# ``env -i``. Keep local HTTP fixtures and SSRF tests hermetic instead of
+# silently routing them through a developer-machine proxy.
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
@@ -149,6 +152,8 @@ exec env -i \
   LC_ALL=C.UTF-8 \
   PYTHONHASHSEED=0 \
   PYTHONUTF8=1 \
+  NO_PROXY='*' \
+  no_proxy='*' \
   ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
   ${HERMES_E2E_BROWSER:+HERMES_E2E_BROWSER="$HERMES_E2E_BROWSER"} \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \

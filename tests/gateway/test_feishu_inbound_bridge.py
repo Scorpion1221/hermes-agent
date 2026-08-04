@@ -294,8 +294,8 @@ def test_coerce_command_message_type_only_promotes_leading_slash_text(text, mess
             ["/tmp/voice.m4a"],
             ["audio/m4a"],
             "Transcript: hello world",
-            "Transcript: hello world",
-            MessageType.AUDIO,
+            "",
+            MessageType.VOICE,
         ),
         (
             "image",

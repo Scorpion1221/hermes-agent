@@ -36,7 +36,8 @@ def _extract_http_client(client_kwargs: dict):
 
 def test_get_proxy_from_env_prefers_https_then_http_then_all(monkeypatch):
     for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
-                "https_proxy", "http_proxy", "all_proxy"):
+                "https_proxy", "http_proxy", "all_proxy",
+                "NO_PROXY", "no_proxy"):
         monkeypatch.delenv(key, raising=False)
     assert _get_proxy_from_env() is None
 
@@ -69,7 +70,8 @@ def test_create_openai_client_routes_via_proxy_when_env_set(mock_openai, monkeyp
     the proxy entirely.
     """
     for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
-                "https_proxy", "http_proxy", "all_proxy"):
+                "https_proxy", "http_proxy", "all_proxy",
+                "NO_PROXY", "no_proxy"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
 
@@ -128,8 +130,6 @@ def test_create_openai_client_no_proxy_when_env_unset(mock_openai, monkeypatch):
         "pools were %r" % (pool_types,)
     )
     http_client.close()
-
-
 
 
 

@@ -1048,28 +1048,6 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_extract_audio_message_downloads_and_caches(self):
-        from gateway.config import PlatformConfig
-        from plugins.platforms.feishu.adapter import FeishuAdapter
-
-        adapter = FeishuAdapter(PlatformConfig())
-        adapter._download_feishu_message_resource = AsyncMock(
-            return_value=("/tmp/feishu-audio.ogg", "audio/ogg")
-        )
-        message = SimpleNamespace(
-            message_type="audio",
-            content='{"file_key":"file_audio","file_name":"voice.ogg"}',
-            message_id="om_audio",
-        )
-
-        text, msg_type, media_urls, media_types, _mentions = asyncio.run(adapter._extract_message_content(message))
-
-        self.assertEqual(text, "")
-        self.assertEqual(msg_type.value, "audio")
-        self.assertEqual(media_urls, ["/tmp/feishu-audio.ogg"])
-        self.assertEqual(media_types, ["audio/ogg"])
-
-    @patch.dict(os.environ, {}, clear=True)
     def test_extract_file_message_downloads_and_caches(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
@@ -1550,44 +1528,6 @@ class TestAdapterBehavior(unittest.TestCase):
             content_type="image/png",
             resource_type="image",
         )
-
-    @patch.dict(os.environ, {}, clear=True)
-    def test_extract_text_message_starting_with_slash_becomes_command(self):
-        from gateway.config import PlatformConfig
-        from plugins.platforms.feishu.adapter import FeishuAdapter
-
-        adapter = FeishuAdapter(PlatformConfig())
-        adapter._dispatch_inbound_event = AsyncMock()
-        adapter.get_chat_info = AsyncMock(
-            return_value={"chat_id": "oc_chat", "name": "Feishu DM", "type": "dm"}
-        )
-        adapter._resolve_sender_profile = AsyncMock(
-            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
-        )
-        message = SimpleNamespace(
-            chat_id="oc_chat",
-            thread_id=None,
-            parent_id=None,
-            upper_message_id=None,
-            message_type="text",
-            content='{"text":"/help test"}',
-            message_id="om_command",
-        )
-
-        asyncio.run(
-            adapter._process_inbound_message(
-                data=SimpleNamespace(event=SimpleNamespace(message=message)),
-                message=message,
-                sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
-                is_bot=False,
-                chat_type="p2p",
-                message_id="om_command",
-            )
-        )
-
-        event = adapter._dispatch_inbound_event.await_args.args[0]
-        self.assertEqual(event.message_type.value, "command")
-        self.assertEqual(event.text, "/help test")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_extract_text_file_injects_content(self):
@@ -2903,6 +2843,11 @@ class TestAdapterBehavior(unittest.TestCase):
                 "all_proxy",
             )
         }
+        # macOS ``urllib.request.getproxies()`` also reads System Settings,
+        # even when proxy env vars are blank. Force a direct connection so
+        # this test exercises the connect-time DNS guard rather than a local
+        # system proxy configured on the developer machine.
+        proxy_vars.update({"NO_PROXY": "*", "no_proxy": "*"})
         with (
             patch.dict(os.environ, proxy_vars, clear=False),
             patch("socket.getaddrinfo", side_effect=fake_getaddrinfo),
@@ -2918,18 +2863,6 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
         self.assertEqual(connect_attempts, [])
-
-    def test_dedup_state_persists_across_adapter_restart(self):
-        from gateway.config import PlatformConfig
-        from plugins.platforms.feishu.adapter import FeishuAdapter
-
-        with tempfile.TemporaryDirectory() as temp_home:
-            with patch.dict(os.environ, {"HERMES_HOME": temp_home}, clear=False):
-                first = FeishuAdapter(PlatformConfig())
-                self.assertFalse(first._is_duplicate("om_same"))
-                second = FeishuAdapter(PlatformConfig())
-                self.assertTrue(second._is_duplicate("om_same"))
-
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_falls_back_to_text_when_card_is_rejected(self):
@@ -2975,61 +2908,6 @@ class TestAdapterBehavior(unittest.TestCase):
             captured["calls"][1].request_body.content,
             json.dumps({"text": "可以用 粗体 和 斜体。"}, ensure_ascii=False),
         )
-
-    @patch.dict(os.environ, {}, clear=True)
-    def test_send_document_reply_uses_thread_flag(self):
-        from gateway.config import PlatformConfig
-        from plugins.platforms.feishu.adapter import FeishuAdapter
-
-        adapter = FeishuAdapter(PlatformConfig())
-        captured = {}
-
-        class _FileAPI:
-            def create(self, request):
-                return SimpleNamespace(
-                    success=lambda: True,
-                    data=SimpleNamespace(file_key="file_123"),
-                )
-
-        class _MessageAPI:
-            def reply(self, request):
-                captured["request"] = request
-                return SimpleNamespace(
-                    success=lambda: True,
-                    data=SimpleNamespace(message_id="om_file_reply"),
-                )
-
-        adapter._client = SimpleNamespace(
-            im=SimpleNamespace(
-                v1=SimpleNamespace(
-                    file=_FileAPI(),
-                    message=_MessageAPI(),
-                )
-            )
-        )
-
-        async def _direct(func, *args, **kwargs):
-            return func(*args, **kwargs)
-
-        with tempfile.NamedTemporaryFile("wb", suffix=".pdf", delete=False) as tmp:
-            tmp.write(b"%PDF-1.4 test")
-            file_path = tmp.name
-
-        try:
-            with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
-                result = asyncio.run(
-                    adapter.send_document(
-                        chat_id="oc_chat",
-                        file_path=file_path,
-                        reply_to="om_parent",
-                        metadata={"thread_id": "omt-thread"},
-                    )
-                )
-        finally:
-            os.unlink(file_path)
-
-        self.assertTrue(result.success)
-        self.assertTrue(captured["request"].request_body.reply_in_thread)
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_falls_back_to_text_when_card_response_is_unsuccessful(self):

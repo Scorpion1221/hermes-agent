@@ -101,6 +101,15 @@ def resolve_feishu_context_message_type(
     context: FeishuMessageContext,
     media_types: Sequence[str],
 ) -> MessageType:
+    if (
+        str(getattr(context, "content_type", "") or "").strip().lower() == "audio"
+        and str(getattr(context, "preferred_message_type", "") or "").strip().lower()
+        == "audio"
+    ):
+        # Feishu's native ``audio`` message is an in-app voice note. Uploaded
+        # audio files arrive through ``file``/``media`` and keep the document
+        # path, so only the native context should trigger auto-transcription.
+        return MessageType.VOICE
     return _resolve_preferred_message_type(
         getattr(context, "preferred_message_type", "text"),
         media_types,

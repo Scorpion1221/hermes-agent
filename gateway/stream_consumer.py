@@ -278,6 +278,19 @@ class GatewayStreamConsumer:
         # streaming, even if the final edit (cursor removal etc.)
         # subsequently failed.
         self._final_content_delivered = False
+        # Exact cleaned payload of the turn-final delivery that set the flags
+        # above.  The gateway compares this against the completed
+        # ``final_response`` before trusting the flags: a *successful* finalize
+        # edit that carried only a stale preview snapshot must not suppress the
+        # complete send (#71643).  ``None`` means "no record" — legacy trust,
+        # so paths that predate the record keep their behavior.
+        self._delivered_final_text: Optional[str] = None
+        # True when the current turn's answer was delivered across multiple
+        # sealed messages (overflow split / adapter continuation adoption).
+        # Payload-equality against a single recorded string is meaningless in
+        # that shape, so delivered_final_matches() falls back to legacy trust
+        # rather than risking a duplicate re-send of a multi-message reply.
+        self._turn_split_delivery = False
         self._delivered_commentary_texts: list[str] = []
         # Retains the finalized visible text of each streaming segment so
         # ``has_delivered_text`` can still match after ``_reset_segment_state``
@@ -419,6 +432,57 @@ class GatewayStreamConsumer:
                 pass
         return await self.adapter.edit_message(**kwargs)
 
+    def _record_turn_final_payload(self, text: str) -> None:
+        """Record the exact cleaned payload of a turn-final delivery.
+
+        Normalized the same way ``_send_or_edit`` normalizes outgoing text
+        (media-directive strip + fence closing) so the gateway can compare it
+        against the completed ``final_response`` (#71643). No-op when the turn
+        was delivered across multiple sealed messages — payload equality is
+        undefined there and ``delivered_final_matches`` returns ``None``.
+        """
+        if self._turn_split_delivery:
+            self._delivered_final_text = None
+            return
+        self._delivered_final_text = ensure_closed_code_fences(
+            self._clean_for_display(text or "")
+        ).strip()
+
+    def delivered_final_matches(self, final_text: str) -> Optional[bool]:
+        """Reconcile the recorded turn-final payload against ``final_text``.
+
+        Returns a tri-state verdict for the gateway's suppression decision
+        (#71643 — a *successful* finalize edit can still carry only a stale
+        preview snapshot, so call success alone must not confirm delivery):
+
+        - ``True``  — the recorded turn-final payload (or a previously
+          delivered segment/commentary) matches ``final_text``; suppressing
+          the normal final send is safe.
+        - ``False`` — a turn-final delivery was recorded but its payload
+          demonstrably differs from ``final_text``; the user has NOT seen the
+          complete response and the normal final send must run.
+        - ``None``  — no payload comparison is possible (multi-message split
+          delivery, or a legacy/uncertain path that recorded nothing). The
+          caller keeps the pre-existing flag-trusting behavior so overflow
+          splits and ambiguous-timeout dedup are not regressed.
+        """
+        if self._turn_split_delivery:
+            return None
+        if self._delivered_final_text is None:
+            return None
+        target = ensure_closed_code_fences(
+            self._clean_for_display(final_text or "")
+        ).strip()
+        if not target:
+            return None
+        if self._delivered_final_text.strip() == target:
+            return True
+        # A segment break / commentary may have delivered the final text
+        # earlier in the turn under a different record.
+        if self.has_delivered_text(final_text):
+            return True
+        return False
+
     def has_delivered_text(self, text: str) -> bool:
         """Return True if *text* was already delivered as visible chat content."""
         target = self._clean_for_display(text or "").strip()
@@ -527,6 +591,8 @@ class GatewayStreamConsumer:
         # run.py reads these only after the consumer task exits.
         self._final_response_sent = False
         self._final_content_delivered = False
+        self._delivered_final_text = None
+        self._turn_split_delivery = False
         # Native draft streaming: bump the draft_id so the next text segment
         # animates as a fresh preview below the tool-progress bubbles, not
         # over the prior segment's already-finalized draft.  This is how
@@ -978,6 +1044,11 @@ class GatewayStreamConsumer:
                             self._final_response_sent = chunks_delivered and tail_delivered
                             if self._final_response_sent:
                                 self._final_content_delivered = True
+                                # Multi-message split delivery — payload
+                                # equality against a single record is
+                                # undefined (#71643).
+                                self._turn_split_delivery = True
+                                self._delivered_final_text = None
                             return
                         if got_segment_break:
                             self._message_id = None
@@ -1031,6 +1102,9 @@ class GatewayStreamConsumer:
                         self._accumulated = self._accumulated[split_at:].lstrip("\n")
                         self._message_id = None
                         self._last_sent_text = ""
+                        # Sealed head chunk delivered — this turn is now a
+                        # multi-message delivery (#71643 record semantics).
+                        self._turn_split_delivery = True
 
                     display_text = self._accumulated
                     if not got_done and not got_segment_break and commentary_text is None:
@@ -1084,6 +1158,7 @@ class GatewayStreamConsumer:
                             # edit here would duplicate the message / re-delete,
                             # so just record delivery and stop.
                             self._final_content_delivered = True
+                            self._record_turn_final_payload(self._accumulated)
                         elif (
                             current_update_visible
                             and (
@@ -1103,6 +1178,7 @@ class GatewayStreamConsumer:
                             # on screen.
                             self._final_response_sent = True
                             self._final_content_delivered = True
+                            self._record_turn_final_payload(self._accumulated)
                         elif self._message_id:
                             # Either the mid-stream edit didn't run (no
                             # visible update this tick) OR the adapter needs
@@ -1112,6 +1188,7 @@ class GatewayStreamConsumer:
                             )
                             if self._final_response_sent:
                                 self._final_content_delivered = True
+                                self._record_turn_final_payload(self._accumulated)
                             elif self._fallback_final_send and not self._adapter_requires_finalize:
                                 # The finalize edit failed and dropped us into
                                 # fallback mode. For adapters that do NOT require
@@ -1125,6 +1202,7 @@ class GatewayStreamConsumer:
                             self._final_response_sent = await self._send_or_edit(self._accumulated)
                             if self._final_response_sent:
                                 self._final_content_delivered = True
+                                self._record_turn_final_payload(self._accumulated)
                     finalize_cls_fn = getattr(type(self.adapter), "finalize_streaming_message", None)
                     streaming_message_finalized = False
                     final_content_committed = False
@@ -1153,6 +1231,7 @@ class GatewayStreamConsumer:
                         self._final_response_sent = True
                         self._final_content_delivered = True
                         self._fallback_final_send = False
+                        self._record_turn_final_payload(final_stream_text)
                     elif self._cardkit_mode and self._fallback_final_send:
                         # The native final replacement did not commit the full
                         # answer. Preserve the existing recovery behavior, but
@@ -1261,6 +1340,7 @@ class GatewayStreamConsumer:
             if _best_effort_ok and not self._final_response_sent:
                 self._final_response_sent = True
                 self._final_content_delivered = True
+                self._record_turn_final_payload(self._accumulated)
         except Exception as e:
             logger.error("Stream consumer error: %s", e)
         finally:
@@ -1500,6 +1580,8 @@ class GatewayStreamConsumer:
                 self._already_sent = True
                 self._final_response_sent = True
                 self._final_content_delivered = True
+                # The visible partial equals the complete final text (#71643).
+                self._delivered_final_text = final_text.strip()
                 return
 
         raw_limit = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
@@ -1602,6 +1684,10 @@ class GatewayStreamConsumer:
         self._already_sent = True
         self._final_response_sent = True
         self._final_content_delivered = True
+        # The fallback delivered the complete ``final_text`` (as one message
+        # or prefix + continuation chunks that union to it), so record it as
+        # the turn-final payload for the gateway's reconciliation (#71643).
+        self._delivered_final_text = final_text.strip()
         self._last_sent_text = chunks[-1]
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
@@ -1672,6 +1758,8 @@ class GatewayStreamConsumer:
         self._already_sent = True
         self._final_response_sent = True
         self._final_content_delivered = True
+        # Fresh commit of the complete answer after a failed finalize (#71643).
+        self._delivered_final_text = final_text.strip()
         self._last_sent_text = final_text
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
@@ -2084,6 +2172,8 @@ class GatewayStreamConsumer:
         self._already_sent = False
         self._final_response_sent = False
         self._final_content_delivered = False
+        self._delivered_final_text = None
+        self._turn_split_delivery = False
         logger.info(
             "Suppressed streamed intentional-silence marker (chat=%s)",
             self.chat_id,
@@ -2263,6 +2353,9 @@ class GatewayStreamConsumer:
                             and result.message_id != self._message_id
                         ):
                             self._last_edit_overflowed = True
+                            # Adapter adopted continuation messages — this
+                            # turn is a multi-message delivery (#71643).
+                            self._turn_split_delivery = True
                             self._message_id = str(result.message_id)
                             self._message_created_ts = time.monotonic()
                             self._last_sent_text = ""
@@ -2290,6 +2383,11 @@ class GatewayStreamConsumer:
                             # when Telegram/Discord rate-limit this cosmetic
                             # final edit (#36965, #25349).
                             self._final_content_delivered = True
+                            # ``text`` is already cleaned/fence-closed here and
+                            # equals the visible prefix — the on-screen content
+                            # IS this finalize payload (#71643).
+                            if not self._turn_split_delivery:
+                                self._delivered_final_text = text.strip()
                         raw_response = getattr(result, "raw_response", None)
                         if isinstance(raw_response, dict) and raw_response.get("partial_overflow"):
                             # Telegram edited/sent one or more overflow chunks,
