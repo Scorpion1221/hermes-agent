@@ -44,6 +44,18 @@ logger = logging.getLogger("gateway.stream_consumer")
 _DONE = object()
 _NEW_SEGMENT = object()
 
+# Queue marker for progress text that CardKit folds into its cumulative live
+# card.  Progress is visible card content, but it is not part of the model's
+# final assistant segment and therefore must not participate in final-response
+# reconciliation.
+_PROGRESS = object()
+
+# Queue marker for a CardKit display flush requested by the progress renderer.
+# Unlike a model/tool segment boundary, this must not reset the assistant-text
+# tracker: the marker is delivered on an independent queue and can arrive
+# between two deltas from the same final assistant segment.
+_PROGRESS_BOUNDARY = object()
+
 # Sentinel for a blocking user-input boundary (for example ``clarify``).
 # Unlike ordinary tool boundaries, this MUST close native streaming cards and
 # reset the active message so work resumed after the user's reply appears in a
@@ -274,6 +286,11 @@ class GatewayStreamConsumer:
         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
         self._final_response_sent = False
         self._cardkit_mode = bool(metadata and metadata.get("streaming"))
+        # CardKit intentionally keeps pre-tool prose and progress lines in one
+        # cumulative card. Track the current assistant segment separately so
+        # the gateway can reconcile it against ``final_response`` without
+        # mistaking the extra visible card content for a stale finalize.
+        self._cardkit_turn_final_text = ""
         # Set when the final response content was sent to the user via
         # streaming, even if the final edit (cursor removal etc.)
         # subsequently failed.
@@ -444,8 +461,11 @@ class GatewayStreamConsumer:
         if self._turn_split_delivery:
             self._delivered_final_text = None
             return
+        delivered_text = text or ""
+        if self._cardkit_mode and self._cardkit_turn_final_text.strip():
+            delivered_text = self._cardkit_turn_final_text
         self._delivered_final_text = ensure_closed_code_fences(
-            self._clean_for_display(text or "")
+            self._clean_for_display(delivered_text)
         ).strip()
 
     def delivered_final_matches(self, final_text: str) -> Optional[bool]:
@@ -499,6 +519,15 @@ class GatewayStreamConsumer:
     def on_segment_break(self) -> None:
         """Finalize the current stream segment and start a fresh message."""
         self._queue.put(_NEW_SEGMENT)
+
+    def on_progress(self, text: str) -> None:
+        """Queue visible CardKit progress outside the assistant segment."""
+        if text:
+            self._queue.put((_PROGRESS, text))
+
+    def on_progress_boundary(self) -> None:
+        """Flush CardKit display state without splitting assistant text."""
+        self._queue.put(_PROGRESS_BOUNDARY)
 
     def on_user_input_boundary(self) -> threading.Event:
         """Close the current stream before a blocking user prompt.
@@ -593,6 +622,7 @@ class GatewayStreamConsumer:
         self._final_content_delivered = False
         self._delivered_final_text = None
         self._turn_split_delivery = False
+        self._cardkit_turn_final_text = ""
         # Native draft streaming: bump the draft_id so the next text segment
         # animates as a fresh preview below the tool-progress bubbles, not
         # over the prior segment's already-finalized draft.  This is how
@@ -870,6 +900,7 @@ class GatewayStreamConsumer:
                 # Drain all available items from the queue
                 got_done = False
                 got_segment_break = False
+                preserve_cardkit_final_segment = False
                 user_input_boundary_done = None
                 got_flush = False
                 flush_event = None
@@ -883,6 +914,10 @@ class GatewayStreamConsumer:
                         if item is _NEW_SEGMENT:
                             got_segment_break = True
                             break
+                        if item is _PROGRESS_BOUNDARY:
+                            got_segment_break = True
+                            preserve_cardkit_final_segment = True
+                            break
                         if (
                             isinstance(item, tuple)
                             and len(item) == 2
@@ -893,6 +928,19 @@ class GatewayStreamConsumer:
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
                             commentary_text = item[1]
                             break
+                        if isinstance(item, tuple) and len(item) == 2 and item[0] is _PROGRESS:
+                            # CardKit displays progress in the same cumulative
+                            # card, but it is not model-authored final-answer
+                            # text. Keep it out of the exact final segment used
+                            # by delivered_final_matches(). Progress text is
+                            # trusted gateway output, so append it directly;
+                            # feeding it through the model think-tag filter can
+                            # corrupt a partial tag buffered across LLM deltas.
+                            progress_text = item[1]
+                            if not self._accumulated:
+                                progress_text = progress_text.lstrip("\n\r")
+                            self._accumulated += progress_text
+                            continue
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _FLUSH:
                             # Flush barrier: finalize the current segment like a
                             # tool boundary, then signal the waiting thread once
@@ -901,7 +949,10 @@ class GatewayStreamConsumer:
                             got_segment_break = True
                             flush_event = item[1]
                             break
+                        before_len = len(self._accumulated)
                         self._filter_and_accumulate(item)
+                        if self._cardkit_mode:
+                            self._cardkit_turn_final_text += self._accumulated[before_len:]
                     except queue.Empty:
                         break
 
@@ -917,7 +968,10 @@ class GatewayStreamConsumer:
                 # so trailing text that was waiting for a potential open
                 # tag is not lost.
                 if got_done:
+                    before_len = len(self._accumulated)
                     self._flush_think_buffer()
+                    if self._cardkit_mode:
+                        self._cardkit_turn_final_text += self._accumulated[before_len:]
 
                     # Intentional-silence suppression.  When the agent chose
                     # not to reply it emits a bare control marker (NO_REPLY /
@@ -1295,6 +1349,11 @@ class GatewayStreamConsumer:
                         ):
                             await self._flush_segment_tail_on_edit_failure()
                         self._reset_segment_state(preserve_no_edit=True)
+                    elif not preserve_cardkit_final_segment:
+                        # CardKit keeps one live card across ordinary tool
+                        # boundaries, but final-response reconciliation only
+                        # concerns the assistant segment after this boundary.
+                        self._cardkit_turn_final_text = ""
 
                 # Flush barrier satisfied: the buffered segment (if any) has now
                 # been finalized and delivered above, so wake the thread blocked

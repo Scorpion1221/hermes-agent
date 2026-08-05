@@ -13,6 +13,7 @@ import gateway.platforms.base as base_platform
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource
+from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -135,6 +136,34 @@ class CardKitProgressCaptureAdapter(MetadataEditProgressCaptureAdapter):
 
     async def finalize_streaming_message(self, message_id, content):
         self.finalized.append((message_id, content))
+
+
+class FinalizedCardKitProgressCaptureAdapter(CardKitProgressCaptureAdapter):
+    """Reject edits after CardKit has committed and detached the final card."""
+
+    def __init__(self, platform=Platform.FEISHU):
+        super().__init__(platform=platform)
+        self.card_finalized = False
+        self.post_finalize_edits = []
+
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
+        if self.card_finalized:
+            self.post_finalize_edits.append(content)
+            return SendResult(success=False, error="CardKit state already detached")
+        return await super().edit_message(
+            chat_id,
+            message_id,
+            content,
+            finalize=finalize,
+            metadata=metadata,
+        )
+
+    async def finalize_streaming_message(self, message_id, content):
+        self.finalized.append((message_id, content))
+        self.card_finalized = True
+        return True
 
 
 class CodeBlockCardKitProgressCaptureAdapter(CardKitProgressCaptureAdapter):
@@ -809,6 +838,43 @@ class CommentaryAgent:
         }
 
 
+class CardKitToolBoundaryAgent:
+    PREAMBLE = "I'll inspect the repo first.\n\n"
+    FINAL = "The config is updated."
+    STREAMED_FINAL = FINAL
+
+    def __init__(self, **kwargs):
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.stream_delta_callback(self.PREAMBLE)
+        self.interim_assistant_callback(self.PREAMBLE, already_streamed=True)
+        self.tool_progress_callback(
+            "tool.started",
+            "terminal",
+            "pwd",
+            {"command": "pwd"},
+        )
+        # Let the independent gateway progress task append the tool line to
+        # the cumulative CardKit card before the final assistant segment.
+        time.sleep(0.4)
+        self.stream_delta_callback(self.STREAMED_FINAL)
+        return {
+            "final_response": self.FINAL,
+            "messages": [],
+            "api_calls": 2,
+        }
+
+
+class StaleCardKitToolBoundaryAgent(CardKitToolBoundaryAgent):
+    """Streams only a prefix of the final answer, matching upstream #71643."""
+
+    STREAMED_FINAL = "The config is"
+
+
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -1092,6 +1158,118 @@ async def test_run_agent_marks_visible_cardkit_stream_for_delivery_ledger(
 
     assert result.get("already_sent") is True
     assert result.get("_cardkit_stream_visible") is True
+
+
+@pytest.mark.asyncio
+async def test_cardkit_tool_boundary_does_not_redeliver_final_response(
+    monkeypatch, tmp_path
+):
+    """A cumulative CardKit card may include prose and progress before the reply."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CardKitToolBoundaryAgent,
+        session_id="sess-cardkit-tool-boundary-final",
+        config_data={
+            "display": {"tool_progress": "all", "interim_assistant_messages": True},
+            "streaming": {"enabled": True},
+        },
+        platform=Platform.FEISHU,
+        chat_id="oc_cardkit",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=FinalizedCardKitProgressCaptureAdapter,
+    )
+
+    assert result.get("already_sent") is True
+    assert adapter.post_finalize_edits == []
+    assert len(adapter.finalized) == 1
+    message_id, card_text = adapter.finalized[0]
+    assert message_id == "progress-1"
+    assert card_text.startswith(CardKitToolBoundaryAgent.PREAMBLE)
+    assert "terminal" in card_text
+    assert card_text.endswith(CardKitToolBoundaryAgent.FINAL)
+
+
+@pytest.mark.asyncio
+async def test_cardkit_tool_boundary_still_reconciles_partial_final_response(
+    monkeypatch, tmp_path
+):
+    """CardKit progress exclusion must preserve stale-tail detection (#71643)."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StaleCardKitToolBoundaryAgent,
+        session_id="sess-cardkit-tool-boundary-stale-final",
+        config_data={
+            "display": {"tool_progress": "all", "interim_assistant_messages": True},
+            "streaming": {"enabled": True},
+        },
+        platform=Platform.FEISHU,
+        chat_id="oc_cardkit",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=FinalizedCardKitProgressCaptureAdapter,
+    )
+
+    assert result.get("already_sent") is not True
+    assert adapter.post_finalize_edits == [StaleCardKitToolBoundaryAgent.FINAL]
+    assert len(adapter.finalized) == 1
+    assert adapter.finalized[0][1].endswith(
+        StaleCardKitToolBoundaryAgent.STREAMED_FINAL
+    )
+
+
+@pytest.mark.asyncio
+async def test_cardkit_delayed_progress_boundary_preserves_final_segment():
+    """An async display reset may land between deltas of one final segment."""
+    adapter = FinalizedCardKitProgressCaptureAdapter()
+    consumer = GatewayStreamConsumer(
+        adapter,
+        "oc_cardkit",
+        StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        metadata={"streaming": True},
+    )
+
+    consumer.on_delta(CardKitToolBoundaryAgent.PREAMBLE)
+    consumer.on_segment_break()
+    consumer.on_progress('\n> 💻 terminal: "pwd"\n')
+    consumer.on_delta("The config ")
+    consumer.on_progress_boundary()
+    consumer.on_delta("is updated.")
+    consumer.finish()
+
+    await consumer.run()
+
+    assert consumer.delivered_final_matches(CardKitToolBoundaryAgent.FINAL) is True
+    assert adapter.finalized[0][1].endswith(CardKitToolBoundaryAgent.FINAL)
+
+
+@pytest.mark.asyncio
+async def test_cardkit_progress_does_not_corrupt_partial_think_tag():
+    """Gateway progress must not enter the model delta think-tag state machine."""
+    adapter = FinalizedCardKitProgressCaptureAdapter()
+    consumer = GatewayStreamConsumer(
+        adapter,
+        "oc_cardkit",
+        StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        metadata={"streaming": True},
+    )
+
+    consumer.on_delta(CardKitToolBoundaryAgent.PREAMBLE)
+    consumer.on_segment_break()
+    consumer.on_delta("<thi")
+    consumer.on_progress('\n> 💻 terminal: "pwd"\n')
+    consumer.on_delta("nk>hidden reasoning</think>" + CardKitToolBoundaryAgent.FINAL)
+    consumer.finish()
+
+    await consumer.run()
+
+    final_card = adapter.finalized[0][1]
+    assert "terminal" in final_card
+    assert "<think>" not in final_card
+    assert "hidden reasoning" not in final_card
+    assert consumer.delivered_final_matches(CardKitToolBoundaryAgent.FINAL) is True
 
 
 @pytest.mark.asyncio

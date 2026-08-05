@@ -3861,7 +3861,7 @@ class TurnRunner:
                             else None
                         )
                         if _sc is not None:
-                            _sc.on_segment_break()
+                            _sc.on_progress_boundary()
                         continue
                     if (
                         isinstance(raw, tuple)
@@ -3878,7 +3878,7 @@ class TurnRunner:
                         else None
                     )
                     if _sc is not None:
-                        _sc.on_delta(f"\n> {msg}\n")
+                        _sc.on_progress(f"\n> {msg}\n")
                 except queue.Empty:
                     await asyncio.sleep(0.3)
                 except asyncio.CancelledError:
