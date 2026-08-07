@@ -1353,6 +1353,16 @@ class GatewayStreamConsumer:
                         # CardKit keeps one live card across ordinary tool
                         # boundaries, but final-response reconciliation only
                         # concerns the assistant segment after this boundary.
+                        # Retain the segment before clearing it: some runtimes
+                        # project a completed, already-streamed final message as
+                        # a trailing boundary immediately before DONE.  In that
+                        # shape the exact final was delivered at this boundary
+                        # and must remain available to has_delivered_text().
+                        finalized = self._clean_for_display(
+                            self._cardkit_turn_final_text
+                        ).strip()
+                        if finalized:
+                            self._delivered_segment_texts.append(finalized)
                         self._cardkit_turn_final_text = ""
 
                 # Flush barrier satisfied: the buffered segment (if any) has now

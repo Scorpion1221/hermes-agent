@@ -875,6 +875,28 @@ class StaleCardKitToolBoundaryAgent(CardKitToolBoundaryAgent):
     STREAMED_FINAL = "The config is"
 
 
+class TrailingBoundaryCardKitAgent(CardKitToolBoundaryAgent):
+    """Projects the completed final message after its deltas were streamed."""
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        result = super().run_conversation(
+            message,
+            conversation_history=conversation_history,
+            task_id=task_id,
+        )
+        self.interim_assistant_callback(
+            self.STREAMED_FINAL,
+            already_streamed=True,
+        )
+        return result
+
+
+class StaleTrailingBoundaryCardKitAgent(TrailingBoundaryCardKitAgent):
+    """Keeps #71643 detection when the projected segment is only partial."""
+
+    STREAMED_FINAL = "The config is"
+
+
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -1217,6 +1239,62 @@ async def test_cardkit_tool_boundary_still_reconciles_partial_final_response(
     assert len(adapter.finalized) == 1
     assert adapter.finalized[0][1].endswith(
         StaleCardKitToolBoundaryAgent.STREAMED_FINAL
+    )
+
+
+@pytest.mark.asyncio
+async def test_cardkit_trailing_final_boundary_does_not_redeliver_response(
+    monkeypatch, tmp_path
+):
+    """A completed streamed final projected as interim must remain delivered."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TrailingBoundaryCardKitAgent,
+        session_id="sess-cardkit-trailing-final-boundary",
+        config_data={
+            "display": {"tool_progress": "all", "interim_assistant_messages": True},
+            "streaming": {"enabled": True},
+        },
+        platform=Platform.FEISHU,
+        chat_id="oc_cardkit",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=FinalizedCardKitProgressCaptureAdapter,
+    )
+
+    assert result.get("already_sent") is True
+    assert adapter.post_finalize_edits == []
+    assert len(adapter.finalized) == 1
+    assert adapter.finalized[0][1].endswith(TrailingBoundaryCardKitAgent.FINAL)
+
+
+@pytest.mark.asyncio
+async def test_cardkit_trailing_partial_boundary_still_reconciles_response(
+    monkeypatch, tmp_path
+):
+    """A trailing boundary must not turn a partial stream into final evidence."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StaleTrailingBoundaryCardKitAgent,
+        session_id="sess-cardkit-trailing-partial-boundary",
+        config_data={
+            "display": {"tool_progress": "all", "interim_assistant_messages": True},
+            "streaming": {"enabled": True},
+        },
+        platform=Platform.FEISHU,
+        chat_id="oc_cardkit",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=FinalizedCardKitProgressCaptureAdapter,
+    )
+
+    assert result.get("already_sent") is not True
+    assert adapter.post_finalize_edits == [StaleTrailingBoundaryCardKitAgent.FINAL]
+    assert len(adapter.finalized) == 1
+    assert adapter.finalized[0][1].endswith(
+        StaleTrailingBoundaryCardKitAgent.STREAMED_FINAL
     )
 
 
