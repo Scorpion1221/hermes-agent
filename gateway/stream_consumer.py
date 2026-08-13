@@ -468,6 +468,39 @@ class GatewayStreamConsumer:
             self._clean_for_display(delivered_text)
         ).strip()
 
+    def _apply_authoritative_cardkit_final(self, final_text: str) -> None:
+        """Fold post-loop verifier/plugin output into CardKit before detach."""
+        if not self._cardkit_mode or not final_text:
+            return
+        authoritative = str(final_text)
+        target = self._clean_for_display(authoritative).strip()
+        if not target:
+            return
+
+        accumulated = self._accumulated.rstrip()
+        if self._clean_for_display(accumulated).strip().endswith(target):
+            self._cardkit_turn_final_text = authoritative
+            return
+
+        candidate = self._cardkit_turn_final_text.strip()
+        if not candidate:
+            # Some runtimes project a completed, already-streamed final as a
+            # trailing boundary.  The prior fix retained that exact segment;
+            # use it only when the authoritative response extends it, so an
+            # unrelated preamble is never overwritten.
+            for delivered in reversed(self._delivered_segment_texts):
+                delivered = delivered.strip()
+                if delivered and target.startswith(delivered):
+                    candidate = delivered
+                    break
+
+        if candidate and accumulated.endswith(candidate):
+            self._accumulated = accumulated[:-len(candidate)] + authoritative
+        else:
+            separator = "\n\n" if accumulated else ""
+            self._accumulated = accumulated + separator + authoritative
+        self._cardkit_turn_final_text = authoritative
+
     def delivered_final_matches(self, final_text: str) -> Optional[bool]:
         """Reconcile the recorded turn-final payload against ``final_text``.
 
@@ -646,9 +679,12 @@ class GatewayStreamConsumer:
         elif text is None:
             self.on_segment_break()
 
-    def finish(self) -> None:
-        """Signal that the stream is complete."""
-        self._queue.put(_DONE)
+    def finish(self, final_text: Optional[str] = None) -> None:
+        """Signal completion, optionally carrying authoritative post-loop text."""
+        if final_text is None:
+            self._queue.put(_DONE)
+        else:
+            self._queue.put((_DONE, final_text))
 
     # ── Think-block filtering ────────────────────────────────────────
     # Models like MiniMax emit inline <think>...</think> blocks in their
@@ -899,6 +935,7 @@ class GatewayStreamConsumer:
 
                 # Drain all available items from the queue
                 got_done = False
+                authoritative_final_text = None
                 got_segment_break = False
                 preserve_cardkit_final_segment = False
                 user_input_boundary_done = None
@@ -910,6 +947,14 @@ class GatewayStreamConsumer:
                         item = self._queue.get_nowait()
                         if item is _DONE:
                             got_done = True
+                            break
+                        if (
+                            isinstance(item, tuple)
+                            and len(item) == 2
+                            and item[0] is _DONE
+                        ):
+                            got_done = True
+                            authoritative_final_text = item[1]
                             break
                         if item is _NEW_SEGMENT:
                             got_segment_break = True
@@ -972,6 +1017,10 @@ class GatewayStreamConsumer:
                     self._flush_think_buffer()
                     if self._cardkit_mode:
                         self._cardkit_turn_final_text += self._accumulated[before_len:]
+                        if authoritative_final_text is not None:
+                            self._apply_authoritative_cardkit_final(
+                                authoritative_final_text
+                            )
 
                     # Intentional-silence suppression.  When the agent chose
                     # not to reply it emits a bare control marker (NO_REPLY /

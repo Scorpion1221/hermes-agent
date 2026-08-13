@@ -5415,9 +5415,19 @@ class TurnRunner:
             reset_current_session_key(_approval_session_token)
         ctx.result_holder[0] = result
 
-        # Signal the stream consumer that the agent is done
+        final_response = result.get("final_response")
+
+        # Post-loop verifiers and output hooks can change the authoritative
+        # response after the last delta. Give CardKit that text before its
+        # one-shot finalization detaches the live card.
         if _stream_consumer is not None:
-            _stream_consumer.finish()
+            if (
+                result.get("response_transformed")
+                and getattr(_stream_consumer, "cardkit_mode", False)
+            ):
+                _stream_consumer.finish(final_response)
+            else:
+                _stream_consumer.finish()
 
         # Signal the streaming-TTS consumer that the agent is done (#60671).
         # finish() is called from the outer event-loop thread after the
@@ -5425,8 +5435,6 @@ class TurnRunner:
         # finalised.  See the outer finally/completion section below.
         
         # Return final response, or a message if something went wrong
-        final_response = result.get("final_response")
-
         # Extract actual token counts from the agent instance used for this run
         _last_prompt_toks = 0
         _input_toks = 0
@@ -25816,18 +25824,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (#51828 / #33793) is unaffected because those paths leave the
             # flags False or record the complete fallback payload.
             _stale_finalized = False
-            if _content_delivered and not _is_empty_sentinel:
+            _final_match = None
+            if _sc is not None and not _is_empty_sentinel:
                 _matcher = getattr(_sc, "delivered_final_matches", None)
                 if callable(_matcher):
                     try:
-                        _stale_finalized = _matcher(_final) is False
+                        _final_match = _matcher(_final)
                     except Exception:
-                        _stale_finalized = False
+                        _final_match = None
+            if _content_delivered:
+                _stale_finalized = _final_match is False
                 if _stale_finalized:
                     _content_delivered = False
-            # Plugin hooks (e.g. transform_llm_output) may have appended content
-            # after streaming finished — when the response was transformed, always
-            # send the final version so the appended content reaches the client.
+            # Built-in verifiers and plugin hooks may append content after the
+            # last model delta. CardKit receives that authoritative text before
+            # detach; other transports still use the edit/fallback path below.
             _transformed = bool(response.get("response_transformed"))
             # Only suppress the normal send when the actual final reply reached
             # the user: the stream consumer streamed it (final_response_sent /
@@ -25840,7 +25851,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _final,
                 previewed=_previewed,
             )
-            if not _is_empty_sentinel and not _transformed and (_streamed or _content_delivered):
+            if not _is_empty_sentinel and (
+                (not _transformed and (_streamed or _content_delivered))
+                or (_transformed and _final_match is True)
+            ):
                 logger.info(
                     "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
                     session_key or "?",
@@ -25889,22 +25903,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_key or "?",
                     )
             elif not _is_empty_sentinel and _transformed and _sc is not None:
-                # Plugin hooks transformed the response after streaming — edit the
-                # existing streamed message instead of sending a duplicate.
+                # Post-loop processing transformed the response after streaming
+                # — edit the existing message instead of sending a duplicate.
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
+                        _transform_res = await _sc.adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
+                        if getattr(_transform_res, "success", True):
+                            response["already_sent"] = True
+                            logger.info(
+                                "Edited streamed message %s for session %s to include transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
+                        else:
+                            logger.warning(
+                                "Failed to edit transformed streamed message for session %s (%s); sending complete response via normal final send.",
+                                session_key or "?",
+                                getattr(_transform_res, "error", None),
+                            )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",

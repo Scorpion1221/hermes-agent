@@ -128,6 +128,61 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert agent.persisted_messages[-1] == {"role": "assistant", "content": "Done."}
 
 
+def test_file_mutation_verifier_marks_final_response_transformed(monkeypatch):
+    """Gateway streaming must know a built-in footer changed the final text."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent._turn_failed_file_mutations = {"/tmp/example.txt": "patch failed"}
+    agent._file_mutation_verifier_enabled = lambda: True
+    agent._format_file_mutation_failure_footer = lambda _failed: "verifier footer"
+
+    result = finalize_turn(
+        agent,
+        final_response="Done.",
+        api_call_count=2,
+        interrupted=False,
+        failed=False,
+        messages=[{"role": "user", "content": "do it"}],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="do it",
+        original_user_message="do it",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    assert result["final_response"] == "Done.\n\nverifier footer"
+    assert result["response_transformed"] is True
+
+
+def test_turn_completion_explainer_marks_final_response_transformed(monkeypatch):
+    """A post-loop completion explanation must also reach streaming clients."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent._turn_completion_explainer_enabled = lambda: True
+    agent._format_turn_completion_explanation = lambda _reason: "turn explanation"
+
+    result = finalize_turn(
+        agent,
+        final_response="(empty)",
+        api_call_count=2,
+        interrupted=False,
+        failed=False,
+        messages=[{"role": "user", "content": "do it"}],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="do it",
+        original_user_message="do it",
+        _should_review_memory=False,
+        _turn_exit_reason="partial_stream_recovery",
+    )
+
+    assert result["final_response"] == "turn explanation"
+    assert result["response_transformed"] is True
+
+
 def test_final_response_fills_pure_tool_call_tail(monkeypatch):
     """A tail assistant row that is a *pure tool-call turn* carries no answer.
 

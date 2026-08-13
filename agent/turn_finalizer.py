@@ -456,6 +456,8 @@ def finalize_turn(
     else:
         logger.info(_diag_msg, *_diag_args)
 
+    _response_transformed = False
+
     # File-mutation verifier footer.
     # If one or more ``write_file`` / ``patch`` calls failed during this
     # turn and were never superseded by a successful write to the same
@@ -478,6 +480,7 @@ def finalize_turn(
                 footer = agent._format_file_mutation_failure_footer(_failed)
                 if footer:
                     final_response = final_response.rstrip() + "\n\n" + footer
+                    _response_transformed = True
         except Exception as _ver_err:
             logger.debug("file-mutation verifier footer failed: %s", _ver_err)
 
@@ -535,10 +538,9 @@ def finalize_turn(
                             final_response = (
                                 _stripped + "\n\n" + _explanation
                             )
+                        _response_transformed = True
         except Exception as _exp_err:
             logger.debug("turn-completion explainer failed: %s", _exp_err)
-
-    _response_transformed = False
 
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.

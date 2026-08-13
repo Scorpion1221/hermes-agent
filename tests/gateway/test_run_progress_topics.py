@@ -128,6 +128,31 @@ class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id=message_id)
 
 
+class FailedTransformedEditAdapter(MetadataEditProgressCaptureAdapter):
+    """Accept the stream preview but reject the post-loop transformed edit."""
+
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
+        if "[plugin appended this]" in content:
+            self.edits.append(
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "content": content,
+                    "metadata": metadata,
+                }
+            )
+            return SendResult(success=False, error="edit rejected")
+        return await super().edit_message(
+            chat_id,
+            message_id,
+            content,
+            finalize=finalize,
+            metadata=metadata,
+        )
+
+
 class CardKitProgressCaptureAdapter(MetadataEditProgressCaptureAdapter):
     def __init__(self, platform=Platform.FEISHU):
         super().__init__(platform=platform)
@@ -1453,6 +1478,22 @@ class TransformedStreamAgent:
         }
 
 
+class TransformedCardKitAgent(TrailingBoundaryCardKitAgent):
+    """Adds authoritative post-loop content after the visible final delta."""
+
+    FOOTER = "⚠️ File-mutation verifier: the requested file was not modified."
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        result = super().run_conversation(
+            message,
+            conversation_history=conversation_history,
+            task_id=task_id,
+        )
+        result["final_response"] = self.FINAL + "\n\n" + self.FOOTER
+        result["response_transformed"] = True
+        return result
+
+
 @pytest.mark.asyncio
 async def test_transformed_response_edits_streamed_message_in_place(monkeypatch, tmp_path):
     """When a transform_llm_output hook modifies the response after streaming,
@@ -1483,6 +1524,60 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
     edited_texts = [e["content"] for e in adapter.edits]
     assert any("[plugin appended this]" in text for text in edited_texts), (
         f"expected transformed text in adapter.edits, got: {edited_texts!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_transformed_edit_keeps_normal_final_fallback(
+    monkeypatch, tmp_path
+):
+    """A failed edit result is not delivery evidence for transformed text."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TransformedStreamAgent,
+        session_id="sess-transformed-edit-fails",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        platform=Platform.MATRIX,
+        chat_id="!room:matrix.example.org",
+        chat_type="group",
+        thread_id="$thread",
+        adapter_cls=FailedTransformedEditAdapter,
+    )
+
+    assert result.get("already_sent") is not True
+    assert any("[plugin appended this]" in edit["content"] for edit in adapter.edits)
+
+
+@pytest.mark.asyncio
+async def test_transformed_cardkit_finalizes_once_with_authoritative_response(
+    monkeypatch, tmp_path
+):
+    """Post-loop verifier/plugin text must join CardKit before it detaches."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TransformedCardKitAgent,
+        session_id="sess-transformed-cardkit",
+        config_data={
+            "display": {"tool_progress": "all", "interim_assistant_messages": True},
+            "streaming": {"enabled": True},
+        },
+        platform=Platform.FEISHU,
+        chat_id="oc_cardkit",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=FinalizedCardKitProgressCaptureAdapter,
+    )
+
+    assert result.get("already_sent") is True
+    assert adapter.post_finalize_edits == []
+    assert len(adapter.finalized) == 1
+    assert adapter.finalized[0][1].endswith(
+        TransformedCardKitAgent.FINAL + "\n\n" + TransformedCardKitAgent.FOOTER
     )
 
 
