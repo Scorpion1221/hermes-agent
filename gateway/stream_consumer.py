@@ -1497,21 +1497,42 @@ class GatewayStreamConsumer:
                     )
                 except Exception:
                     pass
+            final_content_committed = False
             if self._message_id and getattr(type(self.adapter), "finalize_streaming_message", None):
                 try:
-                    await self.adapter.finalize_streaming_message(
+                    finalize_result = await self.adapter.finalize_streaming_message(
                         self._message_id, self._accumulated or "", stopped=True,
+                    )
+                    # Match the normal DONE path: Feishu returns literal True
+                    # only after CardKit accepts the full-card replacement.
+                    # The preceding incremental edit can fail during bounded
+                    # cleanup even though this authoritative stopped-card
+                    # commit succeeds; ignoring that ACK makes the gateway
+                    # repeat the same answer through its normal send path.
+                    final_content_committed = (
+                        self._cardkit_mode
+                        and finalize_result is True
+                        and bool(
+                            self._clean_for_display(
+                                self._accumulated or ""
+                            ).strip()
+                        )
                     )
                 except Exception:
                     pass
-            # Only confirm final delivery if the best-effort send above
-            # actually succeeded OR if the final response was already
-            # confirmed before we were cancelled.  Previously this
-            # promoted any partial send (already_sent=True) to
-            # final_response_sent — which suppressed the gateway's
-            # fallback send even when only intermediate text (e.g.
-            # "Let me search…") had been delivered, not the real answer.
-            if _best_effort_ok and not self._final_response_sent:
+            # Only promote final delivery from an explicit ACK: either the
+            # best-effort send succeeded or CardKit committed the stopped
+            # full-card replacement. Previously this promoted any partial
+            # send (already_sent=True), which suppressed the gateway's
+            # fallback even when only intermediate text (e.g. "Let me
+            # search…") had been delivered, not the real answer.
+            if final_content_committed:
+                self._already_sent = True
+                self._final_response_sent = True
+                self._final_content_delivered = True
+                self._fallback_final_send = False
+                self._record_turn_final_payload(self._accumulated)
+            elif _best_effort_ok and not self._final_response_sent:
                 self._final_response_sent = True
                 self._final_content_delivered = True
                 self._record_turn_final_payload(self._accumulated)

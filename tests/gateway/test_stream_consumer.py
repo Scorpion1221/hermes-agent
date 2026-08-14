@@ -1133,6 +1133,60 @@ class TestCancelledConsumerSetsFlags:
         # was never processed, preventing a duplicate message.
         assert consumer.final_response_sent is True
 
+    @pytest.mark.asyncio
+    async def test_cancelled_cardkit_finalize_commit_marks_final_response_sent(self):
+        """A successful stopped CardKit replacement is final delivery evidence.
+
+        The gateway bounds stream-consumer cleanup and may cancel the task
+        after the answer has accumulated.  If the cancellation-path
+        incremental edit fails but Feishu accepts the stopped full-card
+        replacement, the normal final-send path must not repeat that answer.
+        """
+
+        class CardKitAdapter:
+            MAX_MESSAGE_LENGTH = 30_000
+
+            def __init__(self):
+                self.send = AsyncMock(
+                    return_value=SimpleNamespace(success=True, message_id="card_1")
+                )
+                self.edit_message = AsyncMock(
+                    return_value=SimpleNamespace(success=False, error="edit failed")
+                )
+                self.finalized = []
+
+            async def finalize_streaming_message(
+                self, message_id, content, *, stopped=False,
+            ):
+                self.finalized.append((message_id, content, stopped))
+                return True
+
+        adapter = CardKitAdapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5),
+            metadata={"streaming": True},
+        )
+
+        final_text = "The final answer is already visible."
+        consumer.on_delta(final_text)
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.08)
+
+        assert consumer.already_sent is True
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert adapter.finalized == [("card_1", final_text, True)]
+        assert consumer.final_response_sent is True
+        assert consumer.final_content_delivered is True
+        assert consumer.delivered_final_matches(final_text) is True
+        # The flag alone is not trusted: if cancellation committed only a
+        # partial answer, the gateway's exact matcher must still allow the
+        # complete response through its normal recovery send (#71643).
+        assert consumer.delivered_final_matches(final_text + " More.") is False
+
 
 # ── Think-block filtering unit tests ─────────────────────────────────────
 
