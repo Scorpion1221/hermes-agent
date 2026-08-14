@@ -161,7 +161,9 @@ def test_turn_completion_explainer_marks_final_response_transformed(monkeypatch)
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     agent = FakeAgent()
     agent._turn_completion_explainer_enabled = lambda: True
-    agent._format_turn_completion_explanation = lambda _reason: "turn explanation"
+    agent._format_turn_completion_explanation = (
+        lambda _reason, _cause=None: "turn explanation"
+    )
 
     result = finalize_turn(
         agent,

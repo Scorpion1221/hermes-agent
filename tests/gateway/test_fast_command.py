@@ -18,9 +18,12 @@ from gateway.session import SessionSource
 class _CapturingAgent:
     last_init = None
     last_run = None
+    last_instance = None
 
     def __init__(self, *args, **kwargs):
         type(self).last_init = dict(kwargs)
+        type(self).last_instance = self
+        self.session_id = kwargs.get("session_id")
         self.tools = []
 
     def run_conversation(
@@ -220,7 +223,7 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_run_agent_passes_discord_auto_thread_title_callback(monkeypatch, tmp_path):
+async def test_run_agent_attaches_discord_auto_thread_title_callback(monkeypatch, tmp_path):
     _install_fake_agent(monkeypatch)
     runner = _make_runner()
     runner._session_db = SimpleNamespace(_db=MagicMock())  # type: ignore[assignment]
@@ -245,20 +248,18 @@ async def test_run_agent_passes_discord_auto_thread_title_callback(monkeypatch, 
     import hermes_cli.tools_config as tools_config
     monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
 
-    with patch("agent.title_generator.maybe_auto_title") as mock_title:
-        await runner._run_agent(
-            message="raw user prompt",
-            context_prompt="",
-            history=[],
-            source=_make_discord_auto_thread_source(),
-            session_id="session-1",
-            session_key="agent:main:discord:thread:999",
-        )
+    await runner._run_agent(
+        message="raw user prompt",
+        context_prompt="",
+        history=[],
+        source=_make_discord_auto_thread_source(),
+        session_id="session-1",
+        session_key="agent:main:discord:thread:999",
+    )
 
-    mock_title.assert_called_once()
-    callback = mock_title.call_args.kwargs["title_callback"]
+    callback = _CapturingAgent.last_instance._on_session_title
     with patch.object(runner, "_schedule_discord_semantic_thread_rename") as mock_schedule:
-        callback("Semantic Session Title")
+        callback("Semantic Session Title", "llm")
     mock_schedule.assert_called_once()
     assert mock_schedule.call_args.args[1] == "session-1"
     assert mock_schedule.call_args.args[2] == "Semantic Session Title"
