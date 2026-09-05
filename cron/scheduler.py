@@ -3060,7 +3060,7 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, run_status: str = "", elapsed_seconds: Optional[float] = None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -3181,6 +3181,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+        # Presentation belongs to the adapter, not an English-text parser.
+        # Preserve the existing wrapper on every other platform and honor the
+        # explicit wrap_response=false opt-out on Feishu too.
+        notification = None
+        target_delivery_content = cleaned_delivery_content
+        if platform_name == "feishu" and wrap_response:
+            notification = {
+                "kind": "cron", "name": job.get("name") or job["id"],
+                "job_id": job["id"], "status": run_status,
+                "completed_at": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z"),
+                "elapsed_seconds": elapsed_seconds,
+            }
+            target_delivery_content = mirror_text
 
         # bot-chat targets don't ride a gateway adapter: the output becomes a
         # real inbound turn in the target profile's canonical Bot Chat via the
@@ -3525,7 +3538,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # standalone cron path lacked this, so DM-topic cron deliveries
                 # landed in the General topic or were rejected by Bot API 10.0
                 # (#22773).
-                text_to_send = cleaned_delivery_content.strip()
+                text_to_send = target_delivery_content.strip()
+                if notification:
+                    route_metadata["notification"] = notification
                 adapter_ok = True
                 timed_out = False
                 delivered_message_id = None
@@ -3826,7 +3841,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            delivery_kwargs = {"metadata": {"notification": notification}} if notification else {}
+            coro = _send_to_platform(platform, pconfig, chat_id, target_delivery_content, thread_id=thread_id, media_files=media_files, **delivery_kwargs)
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -3855,7 +3871,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, target_delivery_content, thread_id=thread_id, media_files=media_files, **delivery_kwargs))
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -7144,6 +7160,7 @@ def _run_one_job_body(
     fire_claim_lost: Optional[_CancelEventLike] = None,
     execution_token: Optional[object] = None,
 ) -> bool:
+    notification_started_at = time.monotonic()
     claim = job.get("fire_claim")
     fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else None
 
@@ -7435,6 +7452,8 @@ def _run_one_job_body(
                             deliver_content,
                             adapters=adapters,
                             loop=loop,
+                            run_status="completed" if success else "error",
+                            elapsed_seconds=time.monotonic() - notification_started_at,
                         )
                 except Exception as de:
                     if isinstance(de, _FireClaimLostDuringSideEffect):
@@ -7605,6 +7624,8 @@ def _run_one_job_body(
                         + _failure_streak_nudge(job),
                         adapters=adapters,
                         loop=loop,
+                        run_status="error",
+                        elapsed_seconds=time.monotonic() - notification_started_at,
                     )
                 except Exception as delivery_exc:
                     delivery_error = str(delivery_exc)

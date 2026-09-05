@@ -181,6 +181,7 @@ class CardKitProgressCaptureAdapter(MetadataEditProgressCaptureAdapter):
 
     async def finalize_streaming_message(self, message_id, content):
         self.finalized.append((message_id, content))
+        return True  # Rotation requires a confirmed full-card replacement.
 
 
 class FinalizedCardKitProgressCaptureAdapter(CardKitProgressCaptureAdapter):
@@ -217,6 +218,10 @@ class CodeBlockCardKitProgressCaptureAdapter(CardKitProgressCaptureAdapter):
 
 class FailingFinalCardKitAdapter(CardKitProgressCaptureAdapter):
     """Shows a preview, then rejects both finalization and fallback send."""
+
+    async def finalize_streaming_message(self, message_id, content):
+        self.finalized.append((message_id, content))
+        return False
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         self.sent.append(

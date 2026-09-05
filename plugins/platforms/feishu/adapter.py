@@ -171,6 +171,7 @@ from gateway.platforms.feishu_inbound.cardkit import (
     CardKitState,
     build_card_id_message_content,
     build_final_card_body,
+    build_cron_notification_card,
     create_streaming_card,
     render_markdown_for_card,
     set_card_streaming_mode,
@@ -2147,6 +2148,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 msg_type, payload = self._build_outbound_payload(
                     chunk, prefer_post=prefer_post,
                 )
+                notification = (metadata or {}).get("notification")
+                if isinstance(notification, dict) and notification.get("kind") == "cron":
+                    msg_type = "interactive"
+                    payload = json.dumps(build_cron_notification_card(chunk, notification), ensure_ascii=False)
                 try:
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
@@ -2378,7 +2383,7 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="CardKit stream failed")
         return SendResult(success=True, message_id=state.message_id)
 
-    async def finalize_streaming_message(self, message_id: str, final_text: str = "", *, stopped: bool = False) -> bool:
+    async def finalize_streaming_message(self, message_id: str, final_text: str = "", *, stopped: bool = False, status: str = "") -> bool:
         state = self._streaming_cards.get(message_id)
         if not state:
             return False
@@ -2401,7 +2406,7 @@ class FeishuAdapter(BasePlatformAdapter):
             state.sequence += 1
             final_card_updated = await cardkit_update_card(
                 self._client, card_id=state.card_id,
-                card_body=build_final_card_body(final_text, elapsed_seconds=elapsed, stopped=stopped), sequence=state.sequence,
+                card_body=build_final_card_body(final_text, elapsed_seconds=elapsed, stopped=stopped, status=status), sequence=state.sequence,
             )
             logger.info(
                 "[Feishu] Final card updated for %s: %s",
@@ -6627,6 +6632,7 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    metadata=None,
 ):
     """Out-of-process Feishu/Lark delivery via the adapter's send pipeline.
 
@@ -6644,9 +6650,9 @@ async def _standalone_send(
         domain_name = getattr(adapter, "_domain_name", "feishu")
         domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
         adapter._client = adapter._build_lark_client(domain)
-        metadata = None
+        metadata = dict(metadata or {})
         if thread_id:
-            metadata = {"thread_id": thread_id}
+            metadata["thread_id"] = thread_id
             try:
                 from gateway.session_context import get_session_env
 

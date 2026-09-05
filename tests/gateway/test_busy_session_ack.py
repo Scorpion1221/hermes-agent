@@ -471,3 +471,56 @@ class TestLongRunningNotificationOwnership:
         ) is False
 
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode,native", [("steer", False), ("interrupt", False), ("steer", True)])
+@pytest.mark.parametrize("entry", ["adapter", "priority", "slash"])
+async def test_feishu_followup_receipt_binds_to_consumed_message_without_english_ack(mode, native, entry, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    runner, _ = _make_runner()
+    runner._busy_input_mode = mode
+    source = SessionSource(platform=Platform.FEISHU, chat_id="oc_test", chat_type="dm", user_id="owner", thread_id="topic")
+    event = MessageEvent(text="new correction", message_type=MessageType.TEXT, source=source, message_id="om_new")
+    sk = build_session_key(source)
+    adapter = _make_adapter()
+    adapter.MAX_MESSAGE_LENGTH = 30000
+    adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="receipt"))
+    adapter.finalize_streaming_message = AsyncMock(return_value=True)
+    runner.adapters[Platform.FEISHU] = adapter
+    consumer = GatewayStreamConsumer(adapter, source.chat_id, StreamConsumerConfig(), metadata={"streaming": True})
+    agent = SimpleNamespace(
+        _gateway_stream_consumer=consumer, _interrupt_requested=False,
+        _supports_active_turn_redirect=True, api_mode="codex_app_server" if native else "chat_completions",
+    )
+    runner._running_agents[sk] = agent
+    boundaries = []
+
+    def accept(text):
+        # Simulate the actual consumption notification beating the RPC ACK.
+        assert consumer._followups[0].text == text
+        boundaries.append(consumer.on_user_input_boundary(text=text))
+        return True
+
+    agent.steer = accept
+    agent.redirect = accept
+    if entry == "priority":
+        assert await runner._handle_message(event) is None
+    elif entry == "slash":
+        event.text = "/steer " + event.text
+        assert await runner._busy_steer_command(event, sk, source) == ""
+    else:
+        assert await runner._handle_active_session_busy_message(event, sk) is True
+    adapter._send_with_retry.assert_not_awaited()
+    adapter.send.assert_awaited_once()
+    assert adapter.send.call_args.kwargs["reply_to"] == "om_new"
+    assert adapter.send.call_args.kwargs["metadata"]["thread_id"] == "topic"
+    assert consumer._followups[0].message_id == "receipt"
+    assert sk not in runner._pending_messages
+    consumer.finish()
+    await asyncio.wait_for(consumer.run(), 5)
+    assert boundaries[0].is_set()

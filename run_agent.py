@@ -3568,6 +3568,8 @@ class AIAgent:
         """
         if not text or not text.strip():
             return False
+        if getattr(self, "api_mode", None) == "codex_app_server":
+            return self.redirect(text)
         cleaned = text.strip()
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
@@ -3620,6 +3622,9 @@ class AIAgent:
                 except Exception:
                     logger.debug("Codex app-server turn/steer failed", exc_info=True)
                     return False
+            # The native loop never drains Hermes' local steer queue. If its
+            # session is gone, let the gateway preserve this as the next turn.
+            return False
 
         # Never kill a tool merely to deliver conversational guidance. The
         # existing steer drain puts it on the final tool result before the next
@@ -3712,13 +3717,20 @@ class AIAgent:
             self._pending_steer = None
         return text
 
-    def _notify_steer_consumed(self) -> None:
+    def _notify_steer_consumed(self, text: str = "") -> None:
         """Notify the host after steer text enters model-visible context."""
         callback = getattr(self, "steer_consumed_callback", None)
         if callback is None:
             return
         try:
-            callback()
+            # Keep existing zero-argument host callbacks compatible. The
+            # gateway uses the exact consumed batch to bind follow-up replies
+            # without accidentally taking a newer, not-yet-consumed message.
+            import inspect
+            if "text" in inspect.signature(callback).parameters:
+                callback(text=text)
+            else:
+                callback()
         except Exception:
             logger.debug("steer_consumed_callback error", exc_info=True)
 

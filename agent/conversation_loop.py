@@ -565,6 +565,7 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
 
     agent._current_streamed_assistant_text = ""
     agent._stream_needs_break = True
+    agent._notify_steer_consumed(text)
 
 
 def _is_copilot_provider(agent: Any) -> bool:
@@ -2264,7 +2265,7 @@ def run_conversation(
                     )
                     break
             if _injected:
-                agent._notify_steer_consumed()
+                agent._notify_steer_consumed(_pre_api_steer)
             if not _injected:
                 # No tool message to inject into — put it back so
                 # the post-tool-execution drain picks it up later.

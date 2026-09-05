@@ -667,6 +667,20 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if not isinstance(item, dict):
             return
         item_type = item.get("type") or ""
+        if method == "item/started" and item_type == "userMessage":
+            # This ordered server notification, NOT the turn/steer RPC ACK,
+            # is the boundary between old output and the accepted guidance.
+            text = "\n".join(
+                part.get("text", "") for part in (item.get("content") or [])
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+            notify = getattr(agent, "_notify_steer_consumed", None)
+            if text and callable(notify):
+                try:
+                    notify(text)
+                except Exception:
+                    logger.debug("Codex input-boundary display callback failed", exc_info=True)
+            return
         if method == "item/started" and item_type in _CODEX_TOOL_ITEM_TYPES:
             _fire_tool_started(item)
             return

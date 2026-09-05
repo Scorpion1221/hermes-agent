@@ -544,6 +544,7 @@ class TestUserInputBoundary:
 
             async def finalize_streaming_message(self, message_id, content):
                 self.finalized.append((message_id, content))
+                return True  # Explicit full-card commit ACK, as on real CardKit.
 
             async def on_streaming_message_complete(self, message_id):
                 self.completed.append(message_id)

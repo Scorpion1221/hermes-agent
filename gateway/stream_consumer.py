@@ -24,7 +24,8 @@ import re
 import secrets
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Callable, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
@@ -63,6 +64,20 @@ _PROGRESS_BOUNDARY = object()
 # reset the active message so work resumed after the user's reply appears in a
 # fresh bubble below the prompt.
 _USER_INPUT_BOUNDARY = object()
+
+
+@dataclass
+class FollowupReceipt:
+    text: str
+    reply_to_id: str
+    metadata: dict
+    requeue: Callable[[], bool]
+    received_at: str = field(default_factory=lambda: datetime.now().astimezone().strftime("%H:%M:%S"))
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    message_id: Optional[str] = None
+    accepted: bool = False
+    consumed: bool = False
+
 
 # Queue marker for a completed assistant commentary message emitted between
 # API/tool iterations (for example: "I'll inspect the repo first.").
@@ -349,6 +364,9 @@ class GatewayStreamConsumer:
         self._cardkit_turn_final_text = ""
         # Assistant text already sealed before a clarify/steer boundary.
         self._cardkit_boundary_prefix = ""
+        self._followups: list[FollowupReceipt] = []
+        self._followup_lock = threading.Lock()
+        self._closed = False
         # Set when the final response content was sent to the user via
         # streaming, even if the final edit (cursor removal etc.)
         # subsequently failed.
@@ -776,7 +794,66 @@ class GatewayStreamConsumer:
         """Flush CardKit display state without splitting assistant text."""
         self._queue.put(_PROGRESS_BOUNDARY)
 
-    def on_user_input_boundary(self) -> threading.Event:
+    def register_followup(self, text: str, reply_to_id: str, metadata: dict, requeue: Callable[[], bool]) -> FollowupReceipt:
+        receipt = FollowupReceipt(text.strip(), reply_to_id, dict(metadata), requeue)
+        with self._followup_lock:
+            self._followups.append(receipt)
+        return receipt
+
+    def discard_followup(self, receipt: FollowupReceipt) -> None:
+        with self._followup_lock:
+            if receipt in self._followups:
+                self._followups.remove(receipt)
+        receipt.ready.set()
+
+    async def acknowledge_followup(self, receipt: FollowupReceipt) -> None:
+        """The receipt becomes the next reply card, but owns no output yet."""
+        receipt.accepted = True
+        try:
+            result = await self.adapter.send(
+                chat_id=self.chat_id,
+                content=f"已收到补充 · {receipt.received_at}\n\n等待当前步骤结束，原卡内容会完整保留。",
+                reply_to=receipt.reply_to_id,
+                metadata={**receipt.metadata, "streaming": True, "reply_to": receipt.reply_to_id},
+            )
+            if result and result.success and result.message_id:
+                receipt.message_id = str(result.message_id)
+        except Exception:
+            logger.warning("Follow-up receipt failed; create its reply after handoff", exc_info=True)
+        finally:
+            receipt.ready.set()
+        if self._closed:
+            await self._requeue_unconsumed_followups()
+
+    async def _requeue_unconsumed_followups(self) -> None:
+        with self._followup_lock:
+            pending, self._followups = self._followups, []
+        for receipt in pending:
+            await receipt.ready.wait()
+            if not receipt.accepted:
+                continue
+            status = "回复已中断" if receipt.consumed else "补充未接入"
+            content = "补充已接入，但本轮回复中断；未自动重放，避免重复执行。"
+            if not receipt.consumed:
+                try:
+                    queued = receipt.requeue() is True
+                    status = "等待后续处理" if queued else "补充已取消"
+                    content = (
+                        "本轮已结束，补充未在本轮接入；将按后续消息处理。" if queued
+                        else "当前任务已停止或切换，未继续处理这条补充。"
+                    )
+                except Exception:
+                    content = "补充未接入，后续排队失败；请重新发送。"
+                    logger.warning("Could not requeue follow-up", exc_info=True)
+            if receipt.message_id:
+                try:
+                    await self.adapter.finalize_streaming_message(
+                        receipt.message_id, content, status=status,
+                    )
+                except Exception:
+                    logger.warning("Could not close unconsumed follow-up receipt", exc_info=True)
+
+    def on_user_input_boundary(self, *, text: str = "") -> threading.Event:
         """Close the current stream before a blocking user prompt.
 
         Returns an event that is set after the async consumer has flushed and
@@ -785,7 +862,22 @@ class GatewayStreamConsumer:
         sending the clarify prompt without blocking the asyncio event loop.
         """
         completed = threading.Event()
-        self._queue.put((_USER_INPUT_BOUNDARY, completed))
+        if self._closed:
+            completed.set()
+            return completed
+        receipts = []
+        offset = 0
+        with self._followup_lock:
+            for receipt in self._followups:
+                if receipt.consumed:
+                    continue
+                index = text.find(receipt.text, offset) if text else -1
+                if index < 0:
+                    continue
+                offset = index + len(receipt.text)
+                receipts.append(receipt)
+                receipt.consumed = True
+        self._queue.put((_USER_INPUT_BOUNDARY, (completed, receipts)))
         return completed
 
     def close_for_approval_prompt(
@@ -1321,8 +1413,83 @@ class GatewayStreamConsumer:
             self._append_accumulated(self._strip_orphan_close_tags(self._think_buffer))
             self._think_buffer = ""
 
-    async def _finalize_user_input_boundary(self) -> None:
+    async def _finalize_user_input_boundary(self, receipts: list[FollowupReceipt] | None = None) -> None:
         """Flush, close, and detach the active message at a user prompt."""
+        receipts = receipts or []
+        if self._cardkit_mode:
+            # The marker is FIFO behind ALL old deltas/progress. Never read
+            # past it until the immutable old snapshot has a full-card ACK.
+            before_len = len(self._accumulated)
+            self._flush_think_buffer()
+            self._cardkit_turn_final_text += self._accumulated[before_len:]
+            final_text = self._clean_for_display(self._accumulated or self._last_sent_text or "")
+            consumed_at = datetime.now().astimezone().strftime("%H:%M:%S")
+            committed = not final_text.strip() and not self._message_id
+            for attempt in range(3):
+                if committed:
+                    break
+                try:
+                    if not self._message_id:
+                        await self._send_or_edit(final_text, finalize=True, is_turn_final=False)
+                    if self._message_id and self._message_id != "__no_edit__":
+                        kwargs = {}
+                        finalize = self.adapter.finalize_streaming_message
+                        if receipts and "status" in inspect.signature(finalize).parameters:
+                            kwargs["status"] = f"已转向后续消息 · {consumed_at}"
+                        committed = await finalize(self._message_id, final_text, **kwargs) is True
+                except Exception:
+                    logger.warning("CardKit boundary commit failed (attempt %s)", attempt + 1, exc_info=True)
+                if not committed and attempt < 2:
+                    await asyncio.sleep(0.25 * (attempt + 1))
+
+            for receipt in receipts:
+                await receipt.ready.wait()
+            if not committed:
+                # Fail closed for segmentation, not for content. Keep the
+                # entire old ledger and continue visibly in that SAME card.
+                # A failed PATCH must never authorize resetting the buffer.
+                self._accumulated += "\n\n---\n⚠️ 旧卡同步尚未确认，暂在本卡继续；转向前内容已保留。\n\n"
+                self._cardkit_turn_final_text = ""
+                for receipt in receipts:
+                    if receipt.message_id:
+                        try:
+                            await self.adapter.finalize_streaming_message(
+                                receipt.message_id,
+                                "旧卡同步尚未确认，后续暂在原卡继续，避免丢失内容。",
+                                status="暂未切卡",
+                            )
+                        except Exception:
+                            logger.warning("Could not close deferred handoff receipt", exc_info=True)
+                return
+
+            self._last_sent_text = final_text
+            self._cardkit_boundary_prefix += self._cardkit_turn_final_text
+            self._reset_segment_state(preserve_no_edit=True)
+            if receipts:
+                for receipt in receipts[:-1]:
+                    if receipt.message_id:
+                        try:
+                            await self.adapter.finalize_streaming_message(
+                                receipt.message_id, "补充已一并接入，后续见最新回复。", status="已合并补充",
+                            )
+                        except Exception:
+                            logger.warning("Could not seal merged follow-up receipt", exc_info=True)
+                receipt = receipts[-1]
+                self._initial_reply_to_id = receipt.reply_to_id
+                self.metadata = {
+                    **receipt.metadata, "streaming": True,
+                    "reply_to": receipt.reply_to_id, "reply_to_message_id": receipt.reply_to_id,
+                }
+                self._message_id = receipt.message_id
+                if receipt.message_id:
+                    self._message_created_ts = time.monotonic()
+                    self._preview_message_ids.add(receipt.message_id)
+                    self._segment_preview_message_ids.add(receipt.message_id)
+                self._notify_new_message()
+                self._accumulated = f"↪ 已按补充继续 · 收到 {receipt.received_at} / 接入 {consumed_at}\n\n"
+                await self._send_or_edit(self._accumulated, is_turn_final=False)
+            return
+
         current_update_visible = True
         if self._accumulated:
             current_update_visible = await self._send_or_edit(
@@ -1583,10 +1750,13 @@ class GatewayStreamConsumer:
                         break
 
                 if user_input_boundary_done is not None:
+                    boundary_event, boundary_receipts = user_input_boundary_done
                     try:
-                        await self._finalize_user_input_boundary()
+                        await self._finalize_user_input_boundary(boundary_receipts)
+                        for receipt in boundary_receipts:
+                            self.discard_followup(receipt)
                     finally:
-                        user_input_boundary_done.set()
+                        boundary_event.set()
                     await asyncio.sleep(0.05)
                     continue
 
@@ -2303,6 +2473,7 @@ class GatewayStreamConsumer:
         except Exception as e:
             logger.error("Stream consumer error: %s", e)
         finally:
+            self._closed = True
             # Safety net: if run() exits (normal return, cancellation, or
             # exception) while a _FLUSH barrier is still queued or was consumed
             # but not yet signaled, wake any waiters now. Without this a caller
@@ -2318,10 +2489,13 @@ class GatewayStreamConsumer:
                         and item[0] is _FLUSH
                     ):
                         self._signal_flush(item[1])
+                    elif isinstance(item, tuple) and len(item) == 2 and item[0] is _USER_INPUT_BOUNDARY:
+                        item[1][0].set()
             except queue.Empty:
                 pass
             except Exception:
                 pass
+            await self._requeue_unconsumed_followups()
 
     # Strip MEDIA:<path> tags before display. Uses the shared anchored
     # MEDIA_TAG_CLEANUP_RE from gateway/platforms/base.py — only tags whose

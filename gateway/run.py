@@ -4994,6 +4994,20 @@ class TurnRunner:
             msg = f"{emoji} {tool_name}..."
             ctx.last_was_terminal_block[0] = False
 
+        # CardKit shares the SAME FIFO as assistant deltas and handoffs. A
+        # second async progress queue could deliver an old tool line after
+        # the input boundary and accidentally put it in the new reply card.
+        _sc = ctx.stream_consumer_holder[0] if ctx.stream_consumer_holder else None
+        if ctx.cardkit_tool_progress and _sc is not None:
+            if msg == ctx.last_progress_msg[0]:
+                ctx.repeat_count[0] += 1
+                msg = f"{msg} (×{ctx.repeat_count[0] + 1})"
+            else:
+                ctx.last_progress_msg[0] = msg
+                ctx.repeat_count[0] = 0
+            _sc.on_progress(f"\n> {msg}\n")
+            return
+
         # Dedup: collapse consecutive identical progress messages.
         # Common with execute_code where models iterate with the same
         # code (same boilerplate imports → identical previews).
@@ -6328,18 +6342,24 @@ class TurnRunner:
             else None
         )
 
-        def _steer_consumed_callback_sync() -> None:
+        def _steer_consumed_callback_sync(text: str = "") -> None:
             # Split CardKit only once steer text actually enters model-visible
             # context. Resumed output then opens a fresh card below the old one.
             if _stream_consumer is None or not _stream_consumer.cardkit_mode:
                 return
-            boundary_done = _stream_consumer.on_user_input_boundary()
+            boundary_done = _stream_consumer.on_user_input_boundary(text=text)
+            # Native events may be dispatched on the RPC reader thread.
+            # Never block that reader waiting for the steer ACK/receipt;
+            # the consumer FIFO still holds all new output behind the barrier.
+            if getattr(agent, "api_mode", None) == "codex_app_server":
+                return
             if not boundary_done.wait(timeout=15):
                 logger.warning(
                     "Timed out finalizing Feishu CardKit after /steer consumption"
                 )
 
         agent.steer_consumed_callback = _steer_consumed_callback_sync
+        agent._gateway_stream_consumer = _stream_consumer
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = _stream_delta_cb
         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
@@ -10987,7 +11007,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return True  # handled (silently dropped); do not fall through
 
-        effective_mode = self._effective_busy_input_mode(event.source)
+        explicit_steer = event.get_command() == "steer"
+        effective_mode = "steer" if explicit_steer else self._effective_busy_input_mode(event.source)
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
@@ -11161,8 +11182,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             effective_mode = "queue"
         steered = False
         redirected = False
+        followup_receipt = None
+        from gateway.stream_consumer import GatewayStreamConsumer
+        followup_consumer = getattr(running_agent, "_gateway_stream_consumer", None)
+        if not (
+            event.source.platform == Platform.FEISHU
+            and isinstance(followup_consumer, GatewayStreamConsumer)
+            and followup_consumer.cardkit_mode
+        ):
+            followup_consumer = None
+
+        def register_followup(text):
+            if followup_consumer is None:
+                return None
+            anchor = self._reply_anchor_for_event(event) or event.message_id
+            def requeue_unconsumed():
+                # /stop or /new supersedes pending guidance; a normal final
+                # race instead preserves the message as an ordinary next turn.
+                if followup_consumer._run_still_current() and not getattr(running_agent, "_interrupt_requested", False):
+                    self._queue_or_replace_pending_event(session_key, event)
+                    return True
+                return False
+            return followup_consumer.register_followup(
+                text, anchor, self._thread_metadata_for_source(event.source, anchor) or {},
+                requeue_unconsumed,
+            )
+
         if effective_mode == "steer":
-            steer_text = await self._prepare_busy_steer_text(event)
+            steer_text = event.get_command_args().strip() if explicit_steer else await self._prepare_busy_steer_text(event)
             # A follow-up qualifies for steering when it is plain text, OR
             # when every attachment is STT-eligible voice media whose
             # transcript was just folded into steer_text — otherwise a voice
@@ -11186,8 +11233,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and hasattr(running_agent, "steer")
             )
             if can_steer:
+                followup_receipt = register_followup(steer_text)
                 try:
-                    steered = bool(running_agent.steer(steer_text))
+                    if getattr(running_agent, "api_mode", None) == "codex_app_server":
+                        steered = bool(await asyncio.to_thread(running_agent.steer, steer_text))
+                    else:
+                        steered = bool(running_agent.steer(steer_text))
+                except asyncio.CancelledError:
+                    if followup_receipt is not None:
+                        followup_consumer.discard_followup(followup_receipt)
+                    raise
                 except Exception as exc:
                     logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
                     steered = False
@@ -11204,11 +11259,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and getattr(running_agent, "_supports_active_turn_redirect", False) is True
             and hasattr(running_agent, "redirect")
         ):
+            followup_receipt = register_followup((event.text or "").strip())
             try:
-                redirected = bool(running_agent.redirect((event.text or "").strip()))
+                if getattr(running_agent, "api_mode", None) == "codex_app_server":
+                    redirected = bool(await asyncio.to_thread(running_agent.redirect, (event.text or "").strip()))
+                else:
+                    redirected = bool(running_agent.redirect((event.text or "").strip()))
+            except asyncio.CancelledError:
+                if followup_receipt is not None:
+                    followup_consumer.discard_followup(followup_receipt)
+                raise
             except Exception as exc:
                 logger.warning("Gateway redirect failed for session %s: %s", session_key, exc)
                 redirected = False
+
+        if followup_receipt is not None:
+            if steered or redirected or followup_receipt.consumed:
+                # Reuse this receipt as the next stream; no separate English
+                # busy acknowledgement and no debounce that hides a new input.
+                await followup_consumer.acknowledge_followup(followup_receipt)
+                return True
+            followup_consumer.discard_followup(followup_receipt)
 
         # Store the message so it's processed as the next turn after the
         # current run finishes (or is interrupted).  Skip this for a
@@ -18071,6 +18142,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 self._enqueue_fifo(quick_key, queued_event, adapter)
             return "Agent still starting — /steer queued for the next turn."
+        from gateway.stream_consumer import GatewayStreamConsumer
+        consumer = getattr(running_agent, "_gateway_stream_consumer", None)
+        if source.platform == Platform.FEISHU and isinstance(consumer, GatewayStreamConsumer) and consumer.cardkit_mode:
+            if await self._handle_active_session_busy_message(event, quick_key):
+                return ""
         if running_agent and hasattr(running_agent, "steer"):
             try:
                 accepted = running_agent.steer(steer_text)
@@ -18855,6 +18931,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
                 self._queue_or_replace_pending_event(_quick_key, event)
                 return None
+            # Adapter busy callbacks and the runner's priority path must use
+            # the same Feishu handoff/receipt contract (including /steer).
+            from gateway.stream_consumer import GatewayStreamConsumer
+            consumer = getattr(running_agent, "_gateway_stream_consumer", None)
+            if source.platform == Platform.FEISHU and isinstance(consumer, GatewayStreamConsumer) and consumer.cardkit_mode:
+                if await self._handle_active_session_busy_message(event, _quick_key):
+                    return None
             if effective_busy_input_mode == "steer":
                 # Steer mode: inject text into the running agent mid-run via
                 # agent.steer().  Falls back to queue semantics if the payload

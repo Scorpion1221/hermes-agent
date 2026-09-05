@@ -8,6 +8,7 @@ and prompt-cache integrity.
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -486,6 +487,44 @@ class TestEmptyHiddenAssistantRehealRegression:
 
 
 class TestSteerInjection:
+    def test_redirect_notifies_with_exact_consumed_text_after_preserving_old_tail(self):
+        from agent.conversation_loop import _apply_active_turn_redirect
+        agent = _bare_agent()
+        agent._current_streamed_assistant_text = "Complete old visible tail"
+        messages = [{"role": "user", "content": "original"}]
+        seen = []
+        def on_consumed(text):
+            seen.append((text, list(messages)))
+        agent.steer_consumed_callback = on_consumed
+        _apply_active_turn_redirect(agent, messages, "correction")
+        assert seen[0][0] == "correction"
+        assert seen[0][1][-1]["content"] == "correction"
+        assert seen[0][1][-2]["content"] == "Complete old visible tail"
+        assert messages[0] == {"role": "user", "content": "original"}
+
+    def test_steer_notifies_only_the_drained_batch_not_newer_input(self):
+        agent = _bare_agent()
+        seen = []
+        def on_consumed(text):
+            seen.append(text)
+            agent.steer("newer")
+        agent.steer_consumed_callback = on_consumed
+        agent.steer("first")
+        agent.steer("second")
+        messages = [{"role": "tool", "content": "result", "tool_call_id": "1"}]
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+        assert seen == ["first\nsecond"]
+        assert agent._drain_pending_steer() == "newer"
+
+    def test_native_codex_steer_does_not_use_the_unconsumed_local_tool_queue(self):
+        agent = _bare_agent()
+        agent.api_mode = "codex_app_server"
+        calls = []
+        agent._codex_session = SimpleNamespace(request_steer=lambda text: calls.append(text) or True)
+        assert agent.steer("new requirement") is True
+        assert calls == ["new requirement"]
+        assert agent._drain_pending_steer() is None
+
     def test_notifies_host_only_after_steer_enters_tool_context(self):
         agent = _bare_agent()
         consumed = []
@@ -877,3 +916,12 @@ class TestLegacyHiddenPlaceholderWireSubstitution:
         wire = agent.client.chat.completions.create.call_args.kwargs["messages"]
         wire_assistants = [m for m in wire if m.get("role") == "assistant"]
         assert wire_assistants[0]["content"] == "visible text"
+
+
+def test_native_codex_missing_session_rejects_instead_of_recursing_or_losing_input():
+    agent = _bare_agent()
+    agent.api_mode = "codex_app_server"
+    agent._codex_session = None
+    agent._executing_tools = True
+    assert agent.steer("preserve as next turn") is False
+    assert agent._pending_steer is None

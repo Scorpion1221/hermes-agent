@@ -177,7 +177,7 @@ def build_streaming_card_body() -> dict:
     }
 
 
-def build_final_card_body(content: str, *, elapsed_seconds: float = 0.0, stopped: bool = False) -> dict:
+def build_final_card_body(content: str, *, elapsed_seconds: float = 0.0, stopped: bool = False, status: str = "") -> dict:
     elements: list[dict] = [
         {
             "tag": "markdown",
@@ -186,17 +186,17 @@ def build_final_card_body(content: str, *, elapsed_seconds: float = 0.0, stopped
             "text_size": "normal_v2",
         },
     ]
-    if elapsed_seconds > 0:
+    if elapsed_seconds > 0 or status:
         if elapsed_seconds >= 60:
             mins = int(elapsed_seconds // 60)
             secs = int(elapsed_seconds % 60)
             time_str = f"{mins}m {secs}s"
         else:
             time_str = f"{elapsed_seconds:.1f}s"
-        status = "已停止" if stopped else "已完成"
+        status = status or ("已停止" if stopped else "已完成")
         elements.append({
             "tag": "markdown",
-            "content": f"{status} · 耗时 {time_str}",
+            "content": f"{status} · 耗时 {time_str}" if elapsed_seconds > 0 else status,
             "text_size": "notation",
             "text_align": "left",
         })
@@ -208,6 +208,35 @@ def build_final_card_body(content: str, *, elapsed_seconds: float = 0.0, stopped
         "body": {
             "elements": elements,
         },
+    }
+
+
+def build_cron_notification_card(content: str, notification: dict) -> dict:
+    """Render scheduler-owned metadata, never infer success from model prose."""
+    failed = notification.get("status") == "error"
+    title = str(notification.get("name") or "定时任务")
+    footer = []
+    if notification.get("completed_at"):
+        footer.append(f"通知时间：{notification['completed_at']}")
+    elapsed = notification.get("elapsed_seconds")
+    if isinstance(elapsed, (int, float)) and elapsed >= 0:
+        footer.append(f"执行耗时：{int(elapsed) // 60}分 {int(elapsed) % 60}秒")
+    if notification.get("job_id"):
+        footer.append(f"任务 ID：{notification['job_id']}")
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "red" if failed else "blue",
+            "title": {"tag": "plain_text", "content": f"{'⚠️' if failed else '⏰'} {title}"},
+            "subtitle": {"tag": "plain_text", "content": "执行失败" if failed else "定时任务通知"},
+        },
+        "body": {"elements": [
+            {"tag": "markdown", "content": render_markdown_for_card(content)},
+            {"tag": "hr"},
+            {"tag": "markdown", "text_size": "notation", "content": "\n".join(footer)},
+            {"tag": "markdown", "text_size": "notation", "content": "需要调整或暂停？回复并说明任务名称即可。"},
+        ]},
     }
 
 

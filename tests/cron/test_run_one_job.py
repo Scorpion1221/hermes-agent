@@ -29,7 +29,9 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("save", jid))
         return f"/tmp/{jid}.txt"
 
-    def fake_deliver(job, content, adapters=None, loop=None):
+    def fake_deliver(job, content, adapters=None, loop=None, **delivery_metadata):
+        assert delivery_metadata["run_status"] == ("completed" if success else "error")
+        assert delivery_metadata["elapsed_seconds"] >= 0
         calls.append(("deliver", job["id"]))
         return None
 

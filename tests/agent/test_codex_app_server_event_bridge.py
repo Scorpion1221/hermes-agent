@@ -155,6 +155,19 @@ class TestCodexItemCompletionPayload:
 
 
 class TestStreamDeltaDispatch:
+    def test_guidance_notification_is_ordered_after_old_delta_and_before_new_delta(self):
+        agent = _make_stub_agent()
+        seen = []
+        agent._fire_stream_delta = lambda text: seen.append(("delta", text))
+        agent._notify_steer_consumed = lambda text: seen.append(("consumed", text))
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge({"method": "item/agentMessage/delta", "params": {"delta": "OLD TAIL"}})
+        guidance = {"id": "guidance-1", "type": "userMessage", "content": [{"type": "text", "text": "correction"}]}
+        bridge({"method": "item/started", "params": {"item": guidance}})
+        bridge({"method": "item/completed", "params": {"item": guidance}})
+        bridge({"method": "item/agentMessage/delta", "params": {"delta": "NEW"}})
+        assert seen == [("delta", "OLD TAIL"), ("consumed", "correction"), ("delta", "NEW")]
+
     def test_agent_message_delta_fires_stream_delta(self):
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)
