@@ -271,6 +271,9 @@ def _make_monitor_job(hermes_env, script_body: str):
     _write_script(hermes_env, "mon.sh", script_body)
     return create_job(
         prompt="Summarize what changed",
+        # The execution stub below uses test; never snapshot the host provider.
+        provider="test",
+        model="test-model",
         schedule="every 5m",
         monitor_script="mon.sh",
         deliver="local",

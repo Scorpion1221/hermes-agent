@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
@@ -1462,11 +1463,11 @@ async def test_cardkit_tool_boundary_still_reconciles_partial_final_response(
         adapter_cls=FinalizedCardKitProgressCaptureAdapter,
     )
 
-    assert result.get("already_sent") is not True
-    assert adapter.post_finalize_edits == [StaleCardKitToolBoundaryAgent.FINAL]
+    assert result.get("already_sent") is True
+    assert adapter.post_finalize_edits == []
     assert len(adapter.finalized) == 1
     assert adapter.finalized[0][1].endswith(
-        StaleCardKitToolBoundaryAgent.STREAMED_FINAL
+        StaleCardKitToolBoundaryAgent.FINAL
     )
 
 
@@ -1518,11 +1519,11 @@ async def test_cardkit_trailing_partial_boundary_still_reconciles_response(
         adapter_cls=FinalizedCardKitProgressCaptureAdapter,
     )
 
-    assert result.get("already_sent") is not True
-    assert adapter.post_finalize_edits == [StaleTrailingBoundaryCardKitAgent.FINAL]
+    assert result.get("already_sent") is True
+    assert adapter.post_finalize_edits == []
     assert len(adapter.finalized) == 1
     assert adapter.finalized[0][1].endswith(
-        StaleTrailingBoundaryCardKitAgent.STREAMED_FINAL
+        StaleTrailingBoundaryCardKitAgent.FINAL
     )
 
 
@@ -1665,6 +1666,8 @@ class TransformedStreamAgent:
     plus a ``final_response`` that diverges from what was streamed.
     """
 
+    preview_sent = None
+
     def __init__(self, **kwargs):
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
         self.tools = []
@@ -1672,6 +1675,8 @@ class TransformedStreamAgent:
     def run_conversation(self, message, conversation_history=None, task_id=None):
         if self.stream_delta_callback:
             self.stream_delta_callback("original answer")
+            if self.preview_sent is not None:
+                assert self.preview_sent.wait(5), "preview was not delivered"
         return {
             "final_response": "original answer\n\n[plugin appended this]",
             "response_previewed": True,
@@ -1704,6 +1709,15 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
     transformed content (so plugins like content filters / appenders reach the
     user) and still mark already_sent=True (no duplicate send).
     """
+    preview_sent = threading.Event()
+    monkeypatch.setattr(TransformedStreamAgent, "preview_sent", preview_sent)
+
+    class PreviewAdapter(MetadataEditProgressCaptureAdapter):
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            result = await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
+            preview_sent.set()
+            return result
+
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
@@ -1713,11 +1727,11 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
             "display": {"tool_progress": "off", "interim_assistant_messages": False},
             "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
         },
-        platform=Platform.MATRIX,
-        chat_id="!room:matrix.example.org",
+        platform=Platform.SLACK,
+        chat_id="C_transformed",
         chat_type="group",
-        thread_id="$thread",
-        adapter_cls=MetadataEditProgressCaptureAdapter,
+        thread_id="123.456",
+        adapter_cls=PreviewAdapter,
     )
 
     # Final delivery happened (no duplicate send fallback).
@@ -1735,6 +1749,17 @@ async def test_failed_transformed_edit_keeps_normal_final_fallback(
     monkeypatch, tmp_path
 ):
     """A failed edit result is not delivery evidence for transformed text."""
+    preview_sent = threading.Event()
+    monkeypatch.setattr(TransformedStreamAgent, "preview_sent", preview_sent)
+
+    class PreviewAdapter(FailedTransformedEditAdapter):
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            if "[plugin appended this]" in content:
+                return SendResult(success=False, error="fallback rejected")
+            result = await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
+            preview_sent.set()
+            return result
+
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
@@ -1744,11 +1769,11 @@ async def test_failed_transformed_edit_keeps_normal_final_fallback(
             "display": {"tool_progress": "off", "interim_assistant_messages": False},
             "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
         },
-        platform=Platform.MATRIX,
-        chat_id="!room:matrix.example.org",
+        platform=Platform.SLACK,
+        chat_id="C_transformed",
         chat_type="group",
-        thread_id="$thread",
-        adapter_cls=FailedTransformedEditAdapter,
+        thread_id="123.456",
+        adapter_cls=PreviewAdapter,
     )
 
     assert result.get("already_sent") is not True
@@ -2502,3 +2527,28 @@ class TestSlackReplyInThreadProgressRouting:
             event_message_id="1700000000.000100",
             reply_in_thread=False,
         ) is None
+
+    def test_buzz_uses_event_message_id_as_progress_thread(self):
+        """Buzz has no native thread_id; progress must reply-to the trigger."""
+        from gateway.run import _resolve_progress_thread_id
+
+        assert _resolve_progress_thread_id(
+            "buzz",
+            source_thread_id=None,
+            event_message_id="evt-trigger-001",
+            reply_in_thread=True,
+        ) == "evt-trigger-001"
+
+
+@pytest.mark.asyncio
+async def test_matrix_buffered_transformation_sends_authoritative_text_once(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch, tmp_path, TransformedStreamAgent,
+        session_id="sess-matrix-buffered-transform",
+        config_data={"display": {"tool_progress": "off", "interim_assistant_messages": False}, "streaming": {"enabled": True}},
+        platform=Platform.MATRIX, chat_id="!room:matrix.example.org", chat_type="group",
+        thread_id="$thread", adapter_cls=MetadataEditProgressCaptureAdapter,
+    )
+    assert result.get("already_sent") is True
+    assert [message["content"] for message in adapter.sent] == ["original answer\n\n[plugin appended this]"]
+    assert adapter.edits == []

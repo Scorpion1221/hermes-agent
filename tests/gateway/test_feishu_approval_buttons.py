@@ -54,6 +54,35 @@ def _make_adapter() -> FeishuAdapter:
     return adapter
 
 
+def _bind_paired_request(adapter, tmp_path, monkeypatch, *, profile="default", paired=True):
+    from gateway.config import GatewayConfig, Platform
+    from gateway.pairing import PairingStore
+    from gateway.session import SessionSource, SessionStore
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("gateway.pairing.get_default_hermes_root", lambda: tmp_path)
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    adapter.set_session_store(store)
+    adapter.set_owner_profile(profile)
+    source = SessionSource(
+        platform=Platform.FEISHU, chat_id="oc_dm_chat", user_id="tenant_user",
+        auth_user_ids=["ou_dm_user"], profile=profile, chat_type="dm",
+    )
+    entry = store.get_or_create_session(source)
+    pairing = PairingStore(profile=profile)
+    if paired:
+        code = pairing.generate_code("feishu", "tenant_user")
+        assert pairing.approve_code("feishu", code)
+    adapter.gateway_runner = SimpleNamespace(
+        pairing_stores={profile: pairing}, pairing_store=pairing,
+    )
+    state = {
+        "session_key": entry.session_key, "message_id": "paired_card", "chat_id": "oc_dm_chat",
+        "request_source": adapter._interactive_request_source(entry.session_key),
+    }
+    return state, pairing, source
+
+
 def _make_card_action_data(
     action_value: dict,
     chat_id: str = "oc_12345",
@@ -533,6 +562,30 @@ class TestCardActionCallbackResponse:
         assert response.card is None
         mock_submit.assert_not_called()
 
+    def test_rejects_approval_click_when_group_policy_open(self, _patch_callback_card_types):
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._allowed_group_users = {"ou_allowed"}
+        adapter._group_policy = "open"
+        adapter._default_group_policy = "open"
+        adapter._approval_state[6] = {
+            "session_key": "sess-6",
+            "message_id": "msg-6",
+            "chat_id": "oc_12345",
+        }
+        data = _make_card_action_data(
+            {"hermes_action": "approve_once", "approval_id": 6},
+            open_id="ou_attacker",
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_submit:
+            response = adapter._on_card_action_trigger(data)
+
+        assert response is not None
+        assert response.card is None
+        mock_submit.assert_not_called()
+
 
     def test_update_prompt_unauthorized_operator_returns_no_card(self, _patch_callback_card_types):
         adapter = _make_adapter()
@@ -546,6 +599,30 @@ class TestCardActionCallbackResponse:
         adapter._allowed_group_users = {"ou_allowed"}
         data = _make_card_action_data(
             {"hermes_update_prompt_action": "y", "update_prompt_id": 1},
+            open_id="ou_intruder",
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_submit:
+            response = adapter._on_card_action_trigger(data)
+
+        assert response is not None
+        assert response.card is None
+        mock_submit.assert_not_called()
+
+    def test_update_prompt_unauthorized_click_rejected_when_group_policy_open(self, _patch_callback_card_types):
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._allowed_group_users = {"ou_allowed"}
+        adapter._group_policy = "open"
+        adapter._default_group_policy = "open"
+        adapter._update_prompt_state[7] = {
+            "session_key": "sess-up-7",
+            "message_id": "msg_up_007",
+            "chat_id": "oc_12345",
+        }
+        data = _make_card_action_data(
+            {"hermes_update_prompt_action": "y", "update_prompt_id": 7},
             open_id="ou_intruder",
         )
 
@@ -581,6 +658,131 @@ class TestCardActionCallbackResponse:
         assert 8 in adapter._update_prompt_state
         mock_submit.assert_not_called()
 
+    # Scenarios below are adapted from @liuliu0223's regression suite in
+    # #99021: DM paired-mode (empty allowlist) positive paths, fail-closed
+    # rejection of missing operator identity, and forwarded-card rejection.
+
+    def test_paired_mode_participant_can_approve(self, _patch_callback_card_types, tmp_path, monkeypatch):
+        """Empty allowlist (DM paired mode): the card recipient can still approve."""
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._admins = set()
+        adapter._allowed_group_users = set()
+        adapter._approval_state[15], _, _ = _bind_paired_request(adapter, tmp_path, monkeypatch)
+        data = _make_card_action_data(
+            {"hermes_action": "approve_once", "approval_id": 15},
+            chat_id="oc_dm_chat",
+            open_id="ou_dm_user",
+        )
+        adapter._sender_name_cache["ou_dm_user"] = ("DM User", 9999999999)
+
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro):
+            response = adapter._on_card_action_trigger(data)
+
+        assert response is not None
+        assert response.card is not None
+        assert "Approved once" in response.card.data["header"]["title"]["content"]
+
+    def test_paired_mode_participant_can_confirm_update_prompt(self, _patch_callback_card_types, tmp_path, monkeypatch):
+        """Empty allowlist (DM paired mode): the prompt recipient can still confirm."""
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._admins = set()
+        adapter._allowed_group_users = set()
+        adapter._update_prompt_state[23], _, _ = _bind_paired_request(adapter, tmp_path, monkeypatch)
+        data = _make_card_action_data(
+            {"hermes_update_prompt_action": "y", "update_prompt_id": 23},
+            chat_id="oc_dm_chat",
+            open_id="ou_dm_user",
+        )
+        adapter._sender_name_cache["ou_dm_user"] = ("DM User", 9999999999)
+
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro):
+            response = adapter._on_card_action_trigger(data)
+
+        assert response is not None
+        assert response.card is not None
+
+    def test_empty_open_id_rejected_on_approval(self, _patch_callback_card_types):
+        """Approval click without an operator identity is rejected (fail-closed)."""
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._admins = set()
+        adapter._allowed_group_users = set()
+        adapter._approval_state[24] = {
+            "session_key": "sess-24",
+            "message_id": "msg-24",
+            "chat_id": "oc_dm_chat",
+        }
+        data = _make_card_action_data(
+            {"hermes_action": "approve_once", "approval_id": 24},
+            chat_id="oc_dm_chat",
+            open_id="",
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_submit:
+            response = adapter._on_card_action_trigger(data)
+
+        assert response is not None
+        assert response.card is None
+        mock_submit.assert_not_called()
+        assert 24 in adapter._approval_state
+
+    def test_empty_open_id_rejected_on_update_prompt(self, _patch_callback_card_types):
+        """Update prompt click without an operator identity is rejected (fail-closed)."""
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._admins = set()
+        adapter._allowed_group_users = set()
+        adapter._update_prompt_state[25] = {
+            "session_key": "sess-up-25",
+            "message_id": "msg_up_025",
+            "chat_id": "oc_dm_chat",
+        }
+        data = _make_card_action_data(
+            {"hermes_update_prompt_action": "y", "update_prompt_id": 25},
+            chat_id="oc_dm_chat",
+            open_id="",
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_submit:
+            response = adapter._on_card_action_trigger(data)
+
+        assert response is not None
+        assert response.card is None
+        mock_submit.assert_not_called()
+        assert 25 in adapter._update_prompt_state
+
+    def test_approval_card_forwarded_to_different_chat_rejected(self, _patch_callback_card_types):
+        """Approval card forwarded out of its DM: chat mismatch rejects the click."""
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._admins = set()
+        adapter._allowed_group_users = set()
+        adapter._approval_state[26] = {
+            "session_key": "sess-26",
+            "message_id": "msg-26",
+            "chat_id": "oc_dm_chat",
+        }
+        data = _make_card_action_data(
+            {"hermes_action": "approve_once", "approval_id": 26},
+            chat_id="oc_forwarded_group",
+            open_id="ou_dm_user",
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_submit:
+            response = adapter._on_card_action_trigger(data)
+
+        assert response is not None
+        assert response.card is None
+        mock_submit.assert_not_called()
+        assert 26 in adapter._approval_state
+
 
 class TestResolveUpdatePrompt:
     """Test update prompt resolution persists the response file."""
@@ -588,6 +790,7 @@ class TestResolveUpdatePrompt:
     @pytest.mark.asyncio
     async def test_writes_response_file(self, tmp_path, monkeypatch):
         adapter = _make_adapter()
+        adapter._allowed_group_users = {"ou_user1"}
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         (tmp_path / ".hermes").mkdir()
         adapter._update_prompt_state[1] = {
@@ -596,9 +799,128 @@ class TestResolveUpdatePrompt:
             "chat_id": "oc_12345",
         }
 
-        await adapter._resolve_update_prompt(1, "y", "Alice")
+        await adapter._resolve_update_prompt(1, "y", "Alice", open_id="ou_user1", chat_id="oc_12345")
 
         assert (tmp_path / ".hermes" / ".update_response").read_text() == "y"
         assert 1 not in adapter._update_prompt_state
 
+    @pytest.mark.asyncio
+    async def test_unauthorized_operator_does_not_write_response(self, tmp_path, monkeypatch):
+        adapter = _make_adapter()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        (tmp_path / ".hermes").mkdir()
+        adapter._allowed_group_users = {"ou_allowed"}
+        adapter._group_policy = "open"
+        adapter._default_group_policy = "open"
+        adapter._update_prompt_state[2] = {
+            "session_key": "sess-up-2",
+            "message_id": "msg_up_004",
+            "chat_id": "oc_12345",
+        }
 
+        await adapter._resolve_update_prompt(2, "y", "Mallory", open_id="ou_intruder", chat_id="oc_12345")
+
+        assert not (tmp_path / ".hermes" / ".update_response").exists()
+        assert 2 in adapter._update_prompt_state
+
+    @pytest.mark.asyncio
+    async def test_missing_operator_identity_does_not_write_response(self, tmp_path, monkeypatch):
+        adapter = _make_adapter()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        (tmp_path / ".hermes").mkdir()
+        adapter._allowed_group_users = {"ou_allowed"}
+        adapter._update_prompt_state[3] = {
+            "session_key": "sess-up-3",
+            "message_id": "msg_up_005",
+            "chat_id": "oc_12345",
+        }
+
+        await adapter._resolve_update_prompt(3, "y", "Anonymous", open_id="", chat_id="oc_12345")
+
+        assert not (tmp_path / ".hermes" / ".update_response").exists()
+        assert 3 in adapter._update_prompt_state
+
+
+
+
+@pytest.mark.parametrize("kind", ["approval", "update"])
+@pytest.mark.parametrize("rejection", ["unpaired", "wrong_user", "wrong_chat", "missing_chat", "group", "wrong_profile", "missing_profile_store", "revoked", "unknown_request"])
+@pytest.mark.asyncio
+async def test_paired_interactive_request_is_bound_and_rechecked(tmp_path, monkeypatch, kind, rejection):
+    adapter = _make_adapter()
+    adapter._admins = adapter._allowed_group_users = set()
+    state, pairing, source = _bind_paired_request(
+        adapter, tmp_path, monkeypatch, profile="work", paired=rejection != "unpaired",
+    )
+    open_id, chat_id = "ou_dm_user", "oc_dm_chat"
+    if rejection == "wrong_user":
+        open_id = "ou_other"
+    elif rejection == "wrong_chat":
+        chat_id = "oc_forwarded"
+    elif rejection == "missing_chat":
+        chat_id = ""
+    elif rejection == "group":
+        state["request_source"]["chat_type"] = "group"
+    elif rejection == "wrong_profile":
+        adapter.set_owner_profile("other")
+    elif rejection == "missing_profile_store":
+        adapter.gateway_runner.pairing_stores = {}  # Must not borrow the global store.
+    elif rejection == "unknown_request":
+        state.pop("request_source")
+    elif rejection == "revoked":
+        assert adapter._is_interactive_operator_authorized(open_id, state=state, chat_id=chat_id)
+        assert pairing.revoke("feishu", "tenant_user")
+    states = adapter._approval_state if kind == "approval" else adapter._update_prompt_state
+    states[1] = state
+    with patch("tools.approval.resolve_gateway_approval") as resolve, patch.object(adapter, "_write_update_prompt_response") as write:
+        if kind == "approval":
+            await adapter._resolve_approval(1, "once", "User", open_id=open_id, chat_id=chat_id)
+        else:
+            await adapter._resolve_update_prompt(1, "y", "User", open_id=open_id, chat_id=chat_id)
+    resolve.assert_not_called()
+    write.assert_not_called()
+    assert states[1] is state
+
+
+@pytest.mark.parametrize("kind", ["approval", "update"])
+@pytest.mark.asyncio
+async def test_send_binds_paired_owner_before_network_yield(tmp_path, monkeypatch, kind):
+    from gateway.platforms.base import SendResult
+    adapter = _make_adapter()
+    adapter._admins = adapter._allowed_group_users = set()
+    state, _, source = _bind_paired_request(adapter, tmp_path, monkeypatch)
+
+    async def send(**kwargs):
+        source.user_id = "other_user"
+        source.auth_user_ids = ["ou_other"]
+        return object()
+
+    adapter._feishu_send_with_retry = send
+    adapter._finalize_send_result = lambda *args: SendResult(success=True, message_id="card")
+    if kind == "approval":
+        result = await adapter.send_exec_approval("oc_dm_chat", "echo test", state["session_key"])
+        bound = next(iter(adapter._approval_state.values()))
+    else:
+        result = await adapter.send_update_prompt("oc_dm_chat", "Continue?", session_key=state["session_key"])
+        bound = next(iter(adapter._update_prompt_state.values()))
+    assert result.success
+    assert adapter._is_interactive_operator_authorized("ou_dm_user", state=bound, chat_id="oc_dm_chat")
+    assert not adapter._is_interactive_operator_authorized("ou_other", state=bound, chat_id="oc_dm_chat")
+
+
+@pytest.mark.asyncio
+async def test_update_callback_writes_request_home_not_callback_home(tmp_path, monkeypatch):
+    from gateway.platforms.base import SendResult
+    adapter = _make_adapter()
+    adapter._admins = adapter._allowed_group_users = set()
+    state, _, _ = _bind_paired_request(adapter, tmp_path, monkeypatch)
+    adapter._feishu_send_with_retry = AsyncMock(return_value=object())
+    adapter._finalize_send_result = lambda *args: SendResult(success=True, message_id="card")
+    assert (await adapter.send_update_prompt("oc_dm_chat", "Continue?", session_key=state["session_key"])).success
+    prompt_id = next(iter(adapter._update_prompt_state))
+    other_home = tmp_path / "callback-profile"
+    other_home.mkdir()
+    monkeypatch.setattr(feishu_module, "get_hermes_home", lambda: other_home)
+    await adapter._resolve_update_prompt(prompt_id, "y", "User", open_id="ou_dm_user", chat_id="oc_dm_chat")
+    assert (tmp_path / ".update_response").read_text() == "y"
+    assert not (other_home / ".update_response").exists()

@@ -67,7 +67,8 @@ def add_contributor(email: str, login: str, comment: str = "") -> int:
         return 2
 
     path = EMAILS_DIR / email
-    existing = read_mapping_file(path) if path.is_file() else None
+    filenames = {entry.name for entry in EMAILS_DIR.iterdir()} if EMAILS_DIR.is_dir() else set()
+    existing = read_mapping_file(path) if email in filenames and path.is_file() else None
     if existing is None:
         existing = _legacy_login(email)
     if existing is not None:
@@ -79,6 +80,10 @@ def add_contributor(email: str, login: str, comment: str = "") -> int:
             "resolve manually",
             file=sys.stderr,
         )
+        return 1
+
+    if any(name.casefold() == email.casefold() for name in filenames):
+        print(f"error: {email} has a case-colliding mapping filename — resolve manually", file=sys.stderr)
         return 1
 
     EMAILS_DIR.mkdir(parents=True, exist_ok=True)

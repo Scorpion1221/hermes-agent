@@ -9,10 +9,20 @@ Covers:
 """
 
 import subprocess
+import pytest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from hermes_cli.main import cmd_update
+
+
+@pytest.fixture(autouse=True)
+def _isolate_fake_update(monkeypatch):
+    # Git is mocked; purging would discard config fixtures and probe live services.
+    monkeypatch.setattr("hermes_cli.update_cmd._purge_stale_hermes_modules", lambda: None)
+    monkeypatch.setattr("hermes_cli.update_cmd._restart_macos_launchd_gateways", lambda *a, **kw: None)
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda **kw: [])
+    monkeypatch.setattr("hermes_cli.gateway.find_profile_gateway_processes", lambda **kw: [])
 
 
 def _make_run_side_effect(

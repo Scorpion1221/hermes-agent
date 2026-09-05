@@ -1980,6 +1980,8 @@ class FeishuAdapter(BasePlatformAdapter):
             await self._connect_with_retry()
             self._mark_connected()
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
+            # Plugin-registered native handlers (lark_oapi client).
+            self._wire_plugin_handlers(self._client)
             return True
         except Exception as exc:
             await self._release_app_lock()
@@ -2459,6 +2461,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         try:
             approval_id = next(self._approval_counter)
+            request_source = self._interactive_request_source(session_key)
 
             def _btn(label: str, action_name: str, btn_type: str = "default") -> dict:
                 return {
@@ -2505,6 +2508,7 @@ class FeishuAdapter(BasePlatformAdapter):
             if result.success:
                 self._approval_state[approval_id] = {
                     "session_key": session_key,
+                    "request_source": request_source,
                     "message_id": result.message_id or "",
                     "chat_id": chat_id,
                 }
@@ -2557,6 +2561,8 @@ class FeishuAdapter(BasePlatformAdapter):
 
         try:
             prompt_id = next(self._update_prompt_counter)
+            request_source = self._interactive_request_source(session_key)
+            response_path = str(get_hermes_home() / ".update_response")
             payload = json.dumps(
                 self._build_update_prompt_card(prompt=prompt, default=default, prompt_id=prompt_id),
                 ensure_ascii=False,
@@ -2573,6 +2579,8 @@ class FeishuAdapter(BasePlatformAdapter):
             if result.success:
                 self._update_prompt_state[prompt_id] = {
                     "session_key": session_key,
+                    "response_path": response_path,
+                    "request_source": request_source,
                     "message_id": result.message_id or "",
                     "chat_id": chat_id,
                 }
@@ -2616,8 +2624,9 @@ class FeishuAdapter(BasePlatformAdapter):
         }
 
     @staticmethod
-    def _write_update_prompt_response(answer: str) -> None:
-        response_path = get_hermes_home() / ".update_response"
+    def _write_update_prompt_response(answer: str, response_path: Optional[str] = None) -> None:
+        # Callback execution may have a different profile context from send.
+        response_path = Path(response_path) if response_path else get_hermes_home() / ".update_response"
         tmp_path = response_path.with_suffix(".tmp")
         tmp_path.write_text(answer, encoding="utf-8")
         tmp_path.replace(response_path)
@@ -2631,15 +2640,36 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        """Send audio to Feishu as a file attachment plus optional caption."""
-        return await self._send_uploaded_file_message(
-            chat_id=chat_id,
-            file_path=audio_path,
-            reply_to=reply_to,
-            metadata=metadata,
-            caption=caption,
-            outbound_message_type="audio",
-        )
+        """Send audio to Feishu as a native voice message (opus) or file.
+
+        Feishu's voice channel only accepts Opus (msg_type='audio' with an
+        opus upload). Non-opus audio (mp3/wav/flac/...) is transcoded on the
+        fly via the shared ffmpeg engine so audio actually arrives as a
+        playable voice message; when ffmpeg is unavailable the original
+        file is sent as a file attachment (previous behavior).
+        """
+        transcoded_path: Optional[str] = None
+        ext = Path(audio_path).suffix.lower()
+        if ext not in _FEISHU_OPUS_UPLOAD_EXTENSIONS:
+            from gateway.platforms.base import transcode_to_ogg_opus
+            transcoded_path = await asyncio.to_thread(transcode_to_ogg_opus, audio_path)
+            if transcoded_path:
+                audio_path = transcoded_path
+        try:
+            return await self._send_uploaded_file_message(
+                chat_id=chat_id,
+                file_path=audio_path,
+                reply_to=reply_to,
+                metadata=metadata,
+                caption=caption,
+                outbound_message_type="audio",
+            )
+        finally:
+            if transcoded_path:
+                try:
+                    os.unlink(transcoded_path)
+                except OSError:
+                    pass
 
     async def send_document(
         self,
@@ -3191,15 +3221,62 @@ class FeishuAdapter(BasePlatformAdapter):
         future.add_done_callback(self._log_background_failure)
         return True
 
-    def _is_interactive_operator_authorized(self, open_id: str) -> bool:
-        """Return whether this card-action operator may answer gated prompts."""
+    def _interactive_request_source(self, session_key: str) -> Optional[Dict[str, Any]]:
+        """Snapshot the trusted request owner, never identity supplied by a card."""
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            return None
+        try:
+            entry = store.lookup_by_session_key(session_key)
+            source = entry.origin if entry else None
+            if source is None or source.platform != Platform.FEISHU:
+                return None
+            return {
+                "chat_id": source.chat_id,
+                "chat_type": source.chat_type,
+                "profile": source.profile or self._session_key_profile() or "default",
+                "user_ids": [source.user_id, source.user_id_alt, *source.auth_user_ids],
+            }
+        except Exception:
+            logger.debug("[Feishu] Cannot bind interactive request owner", exc_info=True)
+            return None
+
+    def _is_interactive_operator_authorized(
+        self, open_id: str, *, state: Dict[str, Any], chat_id: str,
+    ) -> bool:
+        """Allow explicit operators, or the still-paired owner of this exact DM."""
         normalized = str(open_id or "").strip()
         if not normalized:
             return False
         allowed_ids = set(self._admins) | set(self._allowed_group_users)
-        if not allowed_ids:
+        if allowed_ids:
+            return "*" in allowed_ids or normalized in allowed_ids
+
+        source = state.get("request_source")
+        if not isinstance(source, dict) or source.get("chat_type") != "dm":
             return False
-        return "*" in allowed_ids or normalized in allowed_ids
+        if not chat_id or chat_id != state.get("chat_id") or chat_id != source.get("chat_id"):
+            return False
+        user_ids = {uid for uid in source.get("user_ids", []) if isinstance(uid, str) and uid}
+        if normalized not in user_ids:
+            return False
+        profile = source.get("profile")
+        if not profile or profile != (self._session_key_profile() or "default"):
+            return False
+        runner = getattr(self, "gateway_runner", None)
+        stores = getattr(runner, "pairing_stores", {}) or {}
+        pairing = stores.get(profile)
+        if pairing is None and profile == "default":
+            pairing = getattr(runner, "pairing_store", None)
+        if pairing is None:
+            return False
+        # Re-read on both the callback and async resolution paths: revocation
+        # between scheduling and execution must not grant a stale approval.
+        try:
+            return any(pairing.is_approved("feishu", uid) is True for uid in user_ids)
+        except Exception:
+            logger.warning("[Feishu] Cannot verify interactive pairing", exc_info=True)
+            return False
 
     def _handle_approval_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
         """Schedule approval resolution and build the synchronous callback response."""
@@ -3215,14 +3292,11 @@ class FeishuAdapter(BasePlatformAdapter):
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
-        # Upstream security checks: authorize the clicker and verify the
-        # callback chat matches the approval's origin (prevents unauthorized
-        # / cross-chat spoofed approval clicks).
-        if not self._is_interactive_operator_authorized(open_id):
+        callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
+        if not self._is_interactive_operator_authorized(open_id, state=state, chat_id=callback_chat_id):
             logger.warning("[Feishu] Unauthorized approval click by %s", open_id or "<unknown>")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
-        callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
         expected_chat_id = str(state.get("chat_id", "") or "")
         if callback_chat_id and expected_chat_id and callback_chat_id != expected_chat_id:
             logger.warning(
@@ -3306,11 +3380,11 @@ class FeishuAdapter(BasePlatformAdapter):
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
-        if not self._is_interactive_operator_authorized(open_id):
+        callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
+        if not self._is_interactive_operator_authorized(open_id, state=state, chat_id=callback_chat_id):
             logger.warning("[Feishu] Unauthorized update prompt click by %s", open_id or "<unknown>")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
-        callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
         expected_chat_id = str(state.get("chat_id", "") or "")
         if callback_chat_id and expected_chat_id and callback_chat_id != expected_chat_id:
             logger.warning(
@@ -3358,7 +3432,7 @@ class FeishuAdapter(BasePlatformAdapter):
         if not state:
             logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
             return
-        if not self._is_interactive_operator_authorized(open_id):
+        if not self._is_interactive_operator_authorized(open_id, state=state, chat_id=chat_id):
             logger.warning("[Feishu] Unauthorized approval click by %s for approval %s", open_id or "<unknown>", approval_id)
             return
         expected_chat_id = str(state.get("chat_id", "") or "")
@@ -3412,11 +3486,9 @@ class FeishuAdapter(BasePlatformAdapter):
         if not state:
             logger.debug("[Feishu] Update prompt %s already resolved or unknown", prompt_id)
             return
-        if open_id:
-            sender_id = SimpleNamespace(open_id=open_id, user_id="")
-            if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
-                logger.warning("[Feishu] Unauthorized update prompt click by %s for prompt %s", open_id, prompt_id)
-                return
+        if not self._is_interactive_operator_authorized(open_id, state=state, chat_id=chat_id):
+            logger.warning("[Feishu] Unauthorized update prompt click by %s for prompt %s", open_id, prompt_id)
+            return
         expected_chat_id = str(state.get("chat_id", "") or "")
         if expected_chat_id and chat_id and expected_chat_id != chat_id:
             logger.warning(
@@ -3431,7 +3503,7 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Update prompt %s already resolved while validating callback", prompt_id)
             return
         try:
-            self._write_update_prompt_response(answer)
+            self._write_update_prompt_response(answer, response_path=state.get("response_path"))
             logger.info(
                 "Feishu update prompt resolved for session %s (answer=%s, user=%s)",
                 state["session_key"], answer, user_name,
@@ -3935,6 +4007,7 @@ class FeishuAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=self._session_key_profile(event.source),
         )
         return f"{session_key}:media:{event.message_type.value}"
 
@@ -4243,7 +4316,7 @@ class FeishuAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=event.source.profile,
+            profile=self._session_key_profile(event.source),
         )
 
     @staticmethod

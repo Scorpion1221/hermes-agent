@@ -116,3 +116,23 @@ def test_cli_entrypoint_end_to_end(tmp_path):
     assert proc.returncode == 0, proc.stderr
     out = (tmp_path / "contributors" / "emails" / "cli@example.com").read_text(encoding="utf-8")
     assert out.splitlines()[0] == "cliperson"
+
+
+def test_existing_case_distinct_authors_survive_portable_checkout():
+    assert release.AUTHOR_MAP["agent@Agents-Mac-mini.local"] == "skip-agent"
+    assert release.AUTHOR_MAP["agent@agents-Mac-mini.local"] == "momomojo"
+    paths = [p.name for p in (REPO_ROOT / "contributors" / "emails").iterdir() if p.is_file()]
+    assert len(paths) == len({name.casefold() for name in paths})
+
+
+def test_add_rejects_case_colliding_filename_without_overwrite(emails_dir):
+    assert add_contributor("Case@example.com", "alice") == 0
+    assert add_contributor("case@example.com", "bob") == 1
+    assert read_mapping_file(emails_dir / "Case@example.com") == "alice"
+
+
+def test_relocated_legacy_mapping_does_not_read_case_sibling(emails_dir):
+    emails_dir.mkdir(parents=True)
+    (emails_dir / "agent@agents-Mac-mini.local").write_text("momomojo\n")
+    assert add_contributor("agent@Agents-Mac-mini.local", "skip-agent") == 0
+    assert read_mapping_file(emails_dir / "agent@agents-Mac-mini.local") == "momomojo"

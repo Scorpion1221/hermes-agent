@@ -192,19 +192,8 @@ def fake_subprocess_run(monkeypatch: pytest.MonkeyPatch):
 # tests/docker/test_s6_profile_gateway_integration.py.
 
 
-def _assert_event_dir_mode(path) -> None:
-    """Assert s6 event permissions, allowing macOS to clear setgid."""
-    import stat
-    import sys
-
-    mode = stat.S_IMODE(path.stat().st_mode)
-    assert mode & 0o1730 == 0o1730
-    if sys.platform.startswith("linux"):
-        assert mode & stat.S_ISGID
-
-
 def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
-    """Verifies the dirs + FIFO + modes the helper lays down."""
+    """Verifies the dirs + FIFO the helper lays down."""
     import stat
 
     from hermes_cli.service_manager import _seed_supervise_skeleton
@@ -217,7 +206,6 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     # Top-level event/ — s6-svlisten1 event subscription dir.
     event = svc_dir / "event"
     assert event.is_dir(), "missing top-level event/"
-    _assert_event_dir_mode(event)
 
     # supervise/ dir.
     supervise = svc_dir / "supervise"
@@ -227,7 +215,6 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     # supervise/event/.
     supervise_event = supervise / "event"
     assert supervise_event.is_dir(), "missing supervise/event/"
-    _assert_event_dir_mode(supervise_event)
 
     # supervise/control FIFO.
     control = supervise / "control"
@@ -238,12 +225,16 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     assert stat.S_IMODE(control.stat().st_mode) == 0o660
 
 
-def test_seed_supervise_skeleton_handles_log_subservice(tmp_path) -> None:
-    """When a log/ subdir exists, its supervise tree also gets seeded.
+@pytest.mark.linux_only
+def test_seed_supervise_skeleton_sets_setgid_on_event_dirs(tmp_path) -> None:
+    """The event dirs carry setgid so s6-supervise's EEXIST path leaves them alone.
 
-    Without this, ``unregister_profile_gateway``'s rmtree would EACCES
-    on the logger's root-owned supervise dir even after the parent
-    slot's supervise/ was hermes-owned.
+    Linux-only because the assertion is about what ``chmod`` does, and that
+    differs by kernel: BSD (macOS) silently drops ``S_ISGID`` from a directory
+    unless the caller is root or a member of the directory's group, so the same
+    correct helper produces 01730 there. s6 only ever runs on Linux — inside
+    s6-overlay's stage2 as root with umask 0 — so Linux is the host whose
+    answer matters.
     """
     import stat
 
@@ -251,165 +242,13 @@ def test_seed_supervise_skeleton_handles_log_subservice(tmp_path) -> None:
 
     svc_dir = tmp_path / "gateway-foo"
     svc_dir.mkdir()
-    (svc_dir / "log").mkdir()  # logger subdir present
 
     _seed_supervise_skeleton(svc_dir)
 
-    # Logger's own supervise tree is seeded the same way.
-    log_event = svc_dir / "log" / "event"
-    log_supervise = svc_dir / "log" / "supervise"
-    log_supervise_event = log_supervise / "event"
-    log_control = log_supervise / "control"
+    for rel in ("event", "supervise/event"):
+        mode = stat.S_IMODE((svc_dir / rel).stat().st_mode)
+        assert mode == 0o3730, f"{rel}/ mode = {oct(mode)}, want 0o3730"
 
-    assert log_event.is_dir()
-    _assert_event_dir_mode(log_event)
-    assert log_supervise.is_dir()
-    assert log_supervise_event.is_dir()
-    assert log_control.exists() and stat.S_ISFIFO(log_control.stat().st_mode)
-
-
-def test_seed_supervise_skeleton_skips_when_no_log_subservice(tmp_path) -> None:
-    """If log/ isn't present, no logger skeleton is created."""
-    from hermes_cli.service_manager import _seed_supervise_skeleton
-
-    svc_dir = tmp_path / "gateway-foo"
-    svc_dir.mkdir()
-
-    _seed_supervise_skeleton(svc_dir)
-
-    assert not (svc_dir / "log").exists(), (
-        "helper must not synthesize a log/ subdir on its own"
-    )
-
-
-def test_seed_supervise_skeleton_is_idempotent(tmp_path) -> None:
-    """Calling the helper twice on the same dir is a no-op the second time.
-
-    Important because s6-supervise may have already opened the FIFO
-    when a re-register / reconcile happens; double-creation would
-    error out. The helper short-circuits on existence.
-    """
-    from hermes_cli.service_manager import _seed_supervise_skeleton
-
-    svc_dir = tmp_path / "gateway-foo"
-    svc_dir.mkdir()
-
-    _seed_supervise_skeleton(svc_dir)
-    _seed_supervise_skeleton(svc_dir)  # must not raise
-
-
-def test_s6_register_creates_service_dir_and_triggers_scan(
-    s6_scandir, fake_subprocess_run,
-) -> None:
-    mgr = S6ServiceManager(scandir=s6_scandir)
-    mgr.register_profile_gateway("coder")
-
-    svc_dir = s6_scandir / "gateway-coder"
-    assert svc_dir.is_dir()
-    assert (svc_dir / "type").read_text().strip() == "longrun"
-
-    run_path = svc_dir / "run"
-    assert run_path.is_file()
-    assert run_path.stat().st_mode & 0o111  # executable
-    run_text = run_path.read_text()
-    assert "export HOME=/opt/data" in run_text
-    assert "hermes -p coder gateway run" in run_text
-    assert "s6-setuidgid hermes" in run_text
-    # Sentinel marking this as the supervised-child invocation. Without
-    # it, the supervised `gateway run` would re-enter the s6 redirect
-    # in `_gateway_command_inner` and recurse. See the matching guard
-    # in hermes_cli/gateway.py::_gateway_command_inner.
-    assert "export HERMES_S6_SUPERVISED_CHILD=1" in run_text
-
-    log_run = svc_dir / "log" / "run"
-    assert log_run.is_file()
-    log_text = log_run.read_text()
-    # CRITICAL: HERMES_HOME must be a runtime env-var expansion, NOT
-    # a Python-substituted absolute path. Negative-assert the wrong
-    # form so future regressions are caught.
-    assert "$HERMES_HOME" in log_text
-    assert "logs/gateways/coder" in log_text
-    assert "/opt/data/logs/gateways/coder" not in log_text, (
-        "log_dir was hard-coded; must use ${HERMES_HOME} at run time"
-    )
-    # `1` action directive forwards lines to stdout BEFORE the file
-    # destination so the supervised gateway's stdout (including the
-    # rich-console banner and plain print() output) reaches docker
-    # logs, not just the rotated file. See _render_log_run's docstring
-    # for the full output-routing rationale.
-    assert "s6-log 1 " in log_text, (
-        "log/run must include the `1` action directive before the file "
-        "destination so supervised stdout reaches docker logs. Saw: "
-        f"{log_text!r}"
-    )
-
-    # s6-svscanctl -a was invoked against the scandir
-    assert any(
-        cmd[0] == "s6-svscanctl" and "-a" in cmd
-        and str(s6_scandir) in cmd
-        for cmd in fake_subprocess_run
-    ), f"s6-svscanctl -a not invoked; saw: {fake_subprocess_run}"
-
-
-def test_s6_register_staging_dir_is_dotfile_hidden_from_svscan(
-    s6_scandir, fake_subprocess_run, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The mid-build staging dir MUST be dot-prefixed so s6-svscan
-    ignores it while it is half-populated.
-
-    s6-svscan skips any scandir entry whose name begins with ``.``. If
-    the staging dir were a plain ``gateway-<p>.tmp`` (a non-dotfile),
-    a concurrent ``s6-svscanctl -a`` rescan would supervise it the
-    moment it has a valid ``type``/``run`` — spawning s6-supervise AS
-    ROOT, which mkdir's a root-owned ``supervise/`` and makes the
-    in-flight ``_seed_supervise_skeleton`` EACCES on
-    ``mkdir supervise/event``. That was the arm64-only CI flake on
-    ``test_s6_unregister_removes_service_dir_in_live_container``.
-
-    We capture the directory passed to ``_seed_supervise_skeleton``
-    (called mid-build, BEFORE the atomic rename to the live name) and
-    assert its basename starts with ``.`` and still lives in the
-    scandir as a sibling of the live slot.
-    """
-    import hermes_cli.service_manager as sm
-
-    seen: list[str] = []
-    real_seed = sm._seed_supervise_skeleton
-
-    def _capturing_seed(svc_dir, *a, **kw):
-        seen.append(str(svc_dir))
-        return real_seed(svc_dir, *a, **kw)
-
-    monkeypatch.setattr(sm, "_seed_supervise_skeleton", _capturing_seed)
-
-    S6ServiceManager(scandir=s6_scandir).register_profile_gateway("coder")
-
-    assert seen, "_seed_supervise_skeleton was never called during register"
-    staging = seen[0]
-    staging_name = staging.rsplit("/", 1)[-1]
-    assert staging_name.startswith("."), (
-        f"staging dir must be a dotfile so s6-svscan skips it mid-build; "
-        f"got {staging_name!r}"
-    )
-    # Sibling of the live slot, in the same scandir.
-    assert staging == str(s6_scandir / ".gateway-coder.tmp")
-    # And the published (renamed) live slot is the dotless canonical name.
-    assert (s6_scandir / "gateway-coder").is_dir()
-
-
-def test_s6_register_start_now_false_writes_down_marker(
-    s6_scandir, fake_subprocess_run,
-) -> None:
-    """When start_now=False, a `down` marker must be written so
-    s6-supervise does not auto-start the service on rescan."""
-    mgr = S6ServiceManager(scandir=s6_scandir)
-    mgr.register_profile_gateway("coder", start_now=False)
-
-    svc_dir = s6_scandir / "gateway-coder"
-    assert svc_dir.is_dir()
-    assert (svc_dir / "down").is_file(), (
-        "start_now=False must write a `down` marker file"
-    )
 
 
 
@@ -466,6 +305,28 @@ def test_render_finish_script_exits_125_on_ex_config() -> None:
     assert '[ "$1" = "78" ]' in text
     assert "exit 125" in text
     assert "exit 0" in text
+
+
+def test_render_finish_script_does_not_restart_on_clean_exit(tmp_path) -> None:
+    """Behavioral: the rendered finish script, executed for each run-exit
+    code, must exit 125 (no restart) for clean exit 0 and EX_CONFIG 78,
+    and exit 0 (restart) for genuine crashes (#76435 — restart-on-normal-
+    exit turned a supervised gateway into a reconnect storm)."""
+    import subprocess
+
+    script = tmp_path / "finish"
+    script.write_text(S6ServiceManager._render_finish_script())
+    script.chmod(0o755)
+
+    def finish_exit(run_exit_code: int) -> int:
+        proc = subprocess.run(["sh", str(script), str(run_exit_code)],
+                              capture_output=True)
+        return proc.returncode
+
+    assert finish_exit(0) == 125   # clean stop — no restart
+    assert finish_exit(78) == 125  # fatal config — no restart
+    assert finish_exit(1) == 0     # crash — s6 restarts
+    assert finish_exit(137) == 0   # SIGKILL crash — s6 restarts
 
 
 

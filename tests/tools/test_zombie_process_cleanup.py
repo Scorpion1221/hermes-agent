@@ -472,7 +472,32 @@ class TestDelegationCleanup:
         parent._active_children.append(child)
         relay_host = MagicMock()
         monkeypatch.setattr(relay_runtime, "get_runtime", lambda **_kwargs: relay_host)
+        # The coordinator resolves through the registry, not get_runtime().
+        # Keep native Relay/plugin initialization out of this cleanup test.
+        monkeypatch.setattr(
+            relay_runtime.HOST_REGISTRY, "for_profile", lambda *_args, **_kwargs: relay_host
+        )
         monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 0.1)
+
+        # Exercise timeout cleanup of an active turn, not whether a worker can
+        # finish importing and start within 100 ms under parallel suite load.
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+
+        original_submit = DaemonThreadPoolExecutor.submit
+        first_submit = True
+
+        def submit_started_turn(executor, *args, **kwargs):
+            nonlocal first_submit
+            wait_for_start = first_submit
+            first_submit = False
+            future = original_submit(executor, *args, **kwargs)
+            if wait_for_start and not child_started.wait(timeout=10):
+                if future.done():
+                    future.result()
+                raise AssertionError("Child turn did not start")
+            return future
+
+        monkeypatch.setattr(DaemonThreadPoolExecutor, "submit", submit_started_turn)
 
         def run_conversation(**kwargs):
             lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
@@ -487,7 +512,7 @@ class TestDelegationCleanup:
             )
             child_started.set()
             try:
-                release_child.wait(timeout=5)
+                release_child.wait(timeout=30)
                 return {
                     "final_response": "late result",
                     "completed": True,

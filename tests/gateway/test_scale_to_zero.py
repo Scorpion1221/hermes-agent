@@ -38,6 +38,14 @@ def test_timeout_parses_minutes_to_seconds():
     assert parse_idle_timeout_seconds("5") == 300.0
 
 
+def test_timeout_invalid_values_degrade_to_default():
+    # Behavior contract: bad config falls back to the module default (whatever
+    # its current value), never to zero/negative — an instant-dormant gateway
+    # is never the intent.
+    for bad in (None, "", "nope", 0, -3):
+        assert parse_idle_timeout_seconds(bad) == DEFAULT_IDLE_TIMEOUT_MINUTES * 60.0
+
+
 # ── messaging_is_relay_only_or_absent (F6/D1) ────────────────────────────────
 
 
@@ -71,7 +79,7 @@ def test_arm_blocked_without_wake_url():
 
 def _idle_kwargs(**over):
     base = dict(
-        running_agent_count=0,
+        active_work_count=0,
         seconds_since_last_inbound=600.0,
         idle_timeout_seconds=300.0,
         has_live_background_work=False,
@@ -81,7 +89,7 @@ def _idle_kwargs(**over):
 
 
 def test_not_idle_with_running_agent():
-    assert is_idle(**_idle_kwargs(running_agent_count=1)) is False
+    assert is_idle(**_idle_kwargs(active_work_count=1)) is False
 
 
 def test_idle_exactly_at_threshold():
@@ -114,6 +122,15 @@ from gateway.scale_to_zero import (  # noqa: E402 - grouped with their section
 _FLY_ENV = {FLY_APP_NAME_ENV: "hermes-agent-stg-test", FLY_MACHINE_ID_ENV: "d891234f"}
 
 
+@pytest.fixture
+def socket_dir():
+    # sockaddr_un has a shorter path budget than pytest's nested tmp_path.
+    from tempfile import TemporaryDirectory
+    from pathlib import Path
+    with TemporaryDirectory(prefix="flaps-", dir="/tmp" if os.name == "posix" else None) as directory:
+        yield Path(directory)
+
+
 def _fake_flaps(tmp_path, status_line, capture):
     """One-shot unix-socket HTTP server standing in for flaps."""
     sock_path = str(tmp_path / "fly-api.sock")
@@ -142,9 +159,9 @@ def _fake_flaps(tmp_path, status_line, capture):
     return sock_path, t
 
 
-def test_suspend_self_posts_suspend_for_this_machine(tmp_path):
+def test_suspend_self_posts_suspend_for_this_machine(socket_dir):
     captured: list[bytes] = []
-    sock_path, t = _fake_flaps(tmp_path, "200 OK", captured)
+    sock_path, t = _fake_flaps(socket_dir, "200 OK", captured)
     assert suspend_self(_FLY_ENV, socket_path=sock_path) is True
     t.join(timeout=5)
     request = captured[0].decode()
@@ -156,9 +173,9 @@ def test_suspend_self_posts_suspend_for_this_machine(tmp_path):
     assert "Host: flaps\r\n" in request
 
 
-def test_suspend_self_non_2xx_is_false_not_raise(tmp_path):
+def test_suspend_self_non_2xx_is_false_not_raise(socket_dir):
     captured: list[bytes] = []
-    sock_path, t = _fake_flaps(tmp_path, "412 Precondition Failed", captured)
+    sock_path, t = _fake_flaps(socket_dir, "412 Precondition Failed", captured)
     assert suspend_self(_FLY_ENV, socket_path=sock_path) is False
     t.join(timeout=5)
 
