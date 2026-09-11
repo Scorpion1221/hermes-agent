@@ -17728,6 +17728,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    async def _get_completion_owner(
+        self, session_id: str,
+    ) -> tuple[str, Optional[dict]]:
+        """Resolve a delegated execution to its durable conversation owner.
+
+        Terminal watchers stamp the executing session, which may be a child
+        that inherited its parent's chat route. Such a child must never become
+        the gateway conversation through switch_session(). Use the explicit
+        delegation marker, not parent_session_id (also used by compression and
+        /branch). Compression continuations retain this marker. Resolve at
+        consumption time so checkpoint-recovered watchers get the same fix.
+
+        Missing/cyclic ownership fails closed. DB/decoding errors propagate so
+        the completion pre-flight can retry rather than acknowledge a loss.
+        """
+        seen = set()
+        while session_id not in seen:
+            seen.add(session_id)
+            row = await self._session_db.get_session(session_id)
+            if row is None:
+                return session_id, None
+            config = row.get("model_config")
+            if config is None or config == "":
+                config = {}
+            if isinstance(config, str):
+                config = json.loads(config)
+            if not isinstance(config, dict):
+                raise ValueError("Invalid completion-owner model_config")
+            owner = config.get("_delegate_from")
+            if owner is None or owner == "":
+                return session_id, row
+            if not isinstance(owner, str) or not owner.strip():
+                raise ValueError("Invalid completion-owner delegation marker")
+            if row.get("session_key"):
+                # /resume can promote a child to a gateway conversation. A key
+                # alone is not proof: a late-created delegate can inherit one
+                # from an already-compressed parent. Verify the actual route.
+                if row.get("ended_at") and row.get("end_reason") in _USER_BOUNDARY_END_REASONS:
+                    return session_id, row
+                routed_id = await self.async_session_store.peek_session_id(row["session_key"])
+                if routed_id == session_id:
+                    return session_id, row
+                if (
+                    routed_id and row.get("end_reason") == "compression"
+                    and await self._session_db.get_compression_tip(session_id) == routed_id
+                ):
+                    return session_id, row
+            session_id = owner.strip()
+        logger.warning("Cyclic delegation ownership for completion session %s", session_id)
+        return session_id, None
+
     async def _resolve_async_delegation_session(
         self,
         session_entry: SessionEntry,
@@ -17749,9 +17800,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
 
+        execution_session_id = pinned_session_id
         pinned_row = None
         try:
-            pinned_row = await session_db.get_session(pinned_session_id)
+            pinned_session_id, pinned_row = await self._get_completion_owner(
+                pinned_session_id
+            )
         except Exception:
             logger.debug(
                 "Async-delegation parent lookup failed for %s",
@@ -17867,6 +17921,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if target_session_id == session_entry.session_id:
             return session_entry
+
+        if execution_session_id != pinned_session_id and not follows_compression:
+            logger.warning(
+                "Delegated completion owner %s does not own current route %s; "
+                "dropping injection instead of switching conversations.",
+                pinned_session_id, session_entry.session_id,
+            )
+            return None
 
         prior_session_id = session_entry.session_id
         if follows_compression:
@@ -27502,7 +27564,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if session_db is None:
             return "retry"
         try:
-            parent = await session_db.get_session(parent_session_id)
+            parent_session_id, parent = await self._get_completion_owner(
+                parent_session_id
+            )
         except Exception:
             logger.debug(
                 "Async-completion pre-flight parent lookup failed for %s",
@@ -27707,6 +27771,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return a routing-complete key for short-window process fan-in."""
         return tuple(str(evt.get(field) or "") for field in (
             "session_key",
+            "parent_session_id",
             "platform",
             "chat_type",
             "chat_id",
