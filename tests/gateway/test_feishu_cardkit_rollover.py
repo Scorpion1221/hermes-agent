@@ -907,3 +907,29 @@ async def test_seal_right_before_the_closing_fence_leaves_no_empty_block(stall_a
     assert not last.lstrip().startswith("```"), last
     assert last.strip() == "Done."
     assert consumer.delivered_final_matches(final) is True
+
+
+@pytest.mark.asyncio
+async def test_fallback_sends_never_open_another_streaming_card():
+    class BrokenCardTransport(RolloverCardTransport):
+        async def finalize_streaming_message(self, message_id, final_text="", **kwargs):
+            await super().finalize_streaming_message(message_id, final_text, **kwargs)
+            return False  # the final full-card update is rejected too
+
+    adapter = BrokenCardTransport(edit_failures=True)
+    consumer = consumer_for(adapter)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("Working on the CDN list. ")
+    await asyncio.wait_for(adapter.first_send.wait(), 3)
+    consumer.on_delta("More text the frozen card never showed.")
+    await asyncio.sleep(0.1)
+    consumer.finish("Working on the CDN list. More text the frozen card never showed.")
+    await asyncio.wait_for(task, 3)
+
+    # Only the first (live) card may be a CardKit streaming card; the
+    # fallback delivery is a plain one-shot message nobody has to close.
+    assert adapter.sent[0]["metadata"].get("streaming") is True
+    fallback = adapter.sent[1:]
+    assert fallback, "the unseen tail is delivered"
+    assert all(not (s["metadata"] or {}).get("streaming") for s in fallback)
+

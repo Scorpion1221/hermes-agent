@@ -170,6 +170,7 @@ from gateway.platforms.feishu_inbound import (
 )
 from gateway.platforms.feishu_inbound import parse as feishu_parse
 from gateway.platforms.feishu_inbound.cardkit import (
+    CARDKIT_INVALID_USER_RESOURCE,
     CARDKIT_RATE_LIMITED,
     CARDKIT_SEQUENCE_CONFLICT,
     CARDKIT_STREAM_EXPIRED_CODES,
@@ -178,10 +179,12 @@ from gateway.platforms.feishu_inbound.cardkit import (
     build_final_card_body,
     build_cron_notification_card,
     create_streaming_card,
+    has_card_mentions,
     render_markdown_for_card,
     set_card_streaming_mode,
     stream_card_element,
     stream_card_element_result,
+    strip_card_mentions,
     update_card as cardkit_update_card,
 )
 from gateway.status import acquire_scoped_lock, release_scoped_lock
@@ -2401,10 +2404,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
                 self._streaming_cards[result.message_id] = state
                 self._remember_cardkit_message(result.message_id)
-                first_frame = await stream_card_element_result(
-                    self._client, card_id=card_id, element_id=state.element_id,
-                    content=content, sequence=state.sequence,
-                )
+                first_frame = await self._stream_card_content(state, content)
                 state.sequence += 1
                 if first_frame.code == CARDKIT_RATE_LIMITED:
                     # The card exists but its first frame was skipped; let
@@ -2434,6 +2434,54 @@ class FeishuAdapter(BasePlatformAdapter):
             raw_response={"cardkit_stream_expired": True, "code": code, "card_id": state.card_id},
         )
 
+    async def _stream_card_content(self, state: CardKitState, content: str):
+        """Stream ``content`` into the card at ``state.sequence``.
+
+        A mention Feishu can't resolve (100290) rejects the whole frame; the
+        card then renders mentions as plain text from here on and the frame is
+        retried once with the next sequence number.
+        """
+        result = await stream_card_element_result(
+            self._client, card_id=state.card_id, element_id=state.element_id,
+            content=strip_card_mentions(content) if state.strip_mentions else content,
+            sequence=state.sequence,
+        )
+        if (
+            not result.ok
+            and result.code == CARDKIT_INVALID_USER_RESOURCE
+            and not state.strip_mentions
+            and has_card_mentions(content)
+        ):
+            logger.info("[Feishu] CardKit rejected a mention in %s; rendering mentions as text", state.card_id)
+            state.strip_mentions = True
+            state.sequence += 1
+            result = await stream_card_element_result(
+                self._client, card_id=state.card_id, element_id=state.element_id,
+                content=strip_card_mentions(content), sequence=state.sequence,
+            )
+        return result
+
+    async def _update_card_body(self, state: CardKitState, text: str, **body_kwargs) -> bool:
+        """Full-card update at the next sequence, retrying once without
+        mentions when a mention made Feishu reject the body."""
+        state.sequence += 1
+        updated = await cardkit_update_card(
+            self._client, card_id=state.card_id,
+            card_body=build_final_card_body(
+                strip_card_mentions(text) if state.strip_mentions else text, **body_kwargs,
+            ),
+            sequence=state.sequence,
+        )
+        if not updated and not state.strip_mentions and has_card_mentions(text):
+            state.strip_mentions = True
+            state.sequence += 1
+            updated = await cardkit_update_card(
+                self._client, card_id=state.card_id,
+                card_body=build_final_card_body(strip_card_mentions(text), **body_kwargs),
+                sequence=state.sequence,
+            )
+        return updated is True
+
     async def _edit_streaming_card(self, state: CardKitState, content: str) -> SendResult:
         if state.stopped:
             return SendResult(success=True, message_id=state.message_id)
@@ -2441,18 +2489,12 @@ class FeishuAdapter(BasePlatformAdapter):
             return self._cardkit_expired_result(state)
         state.sequence += 1
         state.last_content = content
-        result = await stream_card_element_result(
-            self._client, card_id=state.card_id, element_id=state.element_id,
-            content=content, sequence=state.sequence,
-        )
+        result = await self._stream_card_content(state, content)
         if not result.ok and result.code == CARDKIT_SEQUENCE_CONFLICT:
             # A number consumed by a failed or reordered call is never reused;
             # take the next one and retry once.
             state.sequence += 1
-            result = await stream_card_element_result(
-                self._client, card_id=state.card_id, element_id=state.element_id,
-                content=content, sequence=state.sequence,
-            )
+            result = await self._stream_card_content(state, content)
         if not result.ok and result.code in CARDKIT_STREAM_EXPIRED_CODES:
             state.expired = True
             logger.info(
@@ -2507,13 +2549,9 @@ class FeishuAdapter(BasePlatformAdapter):
             # update below is still authoritative.
             raise RuntimeError(f"CardKit streaming close failed for {state.card_id}")
         if final_text:
-            state.sequence += 1
-            final_card_updated = await cardkit_update_card(
-                self._client, card_id=state.card_id,
-                card_body=build_final_card_body(
-                    final_text, elapsed_seconds=elapsed, stopped=stopped, status=status, footer=footer,
-                ),
-                sequence=state.sequence,
+            final_card_updated = await self._update_card_body(
+                state, final_text,
+                elapsed_seconds=elapsed, stopped=stopped, status=status, footer=footer,
             )
             logger.info(
                 "[Feishu] Final card updated for %s: %s",
@@ -2548,14 +2586,10 @@ class FeishuAdapter(BasePlatformAdapter):
         text = content or state.sealed_text
         if not text:
             return False
-        state.sequence += 1
-        updated = await cardkit_update_card(
-            self._client, card_id=state.card_id,
-            card_body=build_final_card_body(
-                text, elapsed_seconds=self._cardkit_elapsed(state),
-                stopped=stopped, status=status, footer=footer,
-            ),
-            sequence=state.sequence,
+        updated = await self._update_card_body(
+            state, text,
+            elapsed_seconds=self._cardkit_elapsed(state),
+            stopped=stopped, status=status, footer=footer,
         )
         if updated:
             state.sealed_text = text

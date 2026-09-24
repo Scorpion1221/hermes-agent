@@ -25,6 +25,25 @@ CARDKIT_STREAMING_TIMEOUT = 200850
 CARDKIT_STREAMING_CLOSED = 300309
 CARDKIT_STREAM_EXPIRED_CODES = frozenset({CARDKIT_STREAMING_TIMEOUT, CARDKIT_STREAMING_CLOSED})
 CARDKIT_SEQUENCE_CONFLICT = 300317
+# "there is an invalid user resource (at/person) in your card": a mention of
+# a user this app can't resolve (another app's open_id, a placeholder like
+# ``ou_…``) makes Feishu reject the WHOLE card body.
+CARDKIT_INVALID_USER_RESOURCE = 100290
+
+_MENTION_TAG_RE = re.compile(
+    r"<(?P<tag>at|person)\b(?P<attrs>[^>]*?)(?:/>|>(?P<inner>.*?)</(?P=tag)\s*>)",
+    re.IGNORECASE | re.DOTALL,
+)
+_MENTION_ID_RE = re.compile(
+    r"\b(?:id|ids|user_id|open_id|email)\s*=\s*[\"']?(?P<value>[^\"'\s>]*)",
+    re.IGNORECASE,
+)
+# Shapes Feishu can resolve: open/union ids, ``all``, a user_id, an email.
+# Anything else (``ou_…``, ``ou_?``, ``ou_xxx``) is a model placeholder.
+_MENTION_ID_VALUE_RE = re.compile(
+    r"^(?:all|o[un]_[A-Za-z0-9]{8,}|(?!o[un]_)[A-Za-z0-9][A-Za-z0-9_-]{3,}"
+    r"|[^@\s]+@[^@\s]+\.[A-Za-z]{2,})$"
+)
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,}).*$")
 _MARKDOWN_ATX_HEADING_RE = re.compile(
     r"^(?P<indent>[ ]{0,3})(?P<marks>#{1,6})(?P<rest>(?:[ \t]+.*)?)$"
@@ -63,6 +82,9 @@ class CardKitState:
     elapsed_origin: float = 0.0
     # Raw text of the last full-card update, for later footer-only updates.
     sealed_text: str = ""
+    # Feishu rejected a mention in this card (100290): render every mention
+    # of this card as plain text from now on.
+    strip_mentions: bool = False
 
 
 @dataclass
@@ -120,6 +142,44 @@ def _space_cardkit_strong_boundaries(line: str) -> str:
     return "".join(pieces)
 
 
+def _mention_is_plausible(attrs: str) -> bool:
+    ids = [m.group("value") for m in _MENTION_ID_RE.finditer(attrs or "")]
+    return bool(ids) and all(
+        _MENTION_ID_VALUE_RE.match(value) for raw in ids for value in raw.split(",")
+    )
+
+
+def has_card_mentions(content: str) -> bool:
+    return bool(content) and _MENTION_TAG_RE.search(content) is not None
+
+
+def strip_card_mentions(content: str, *, only_invalid: bool = False) -> str:
+    """Render ``<at>``/``<person>`` mention tags as plain ``@name`` text.
+
+    ``only_invalid`` keeps mentions whose id looks real and neutralizes only
+    placeholders (``ou_…``, empty ids), which Feishu would reject. Text inside
+    fenced code blocks is left untouched.
+    """
+    if not content or "<" not in content:
+        return content
+
+    def _neutralize(match: re.Match) -> str:
+        if only_invalid and _mention_is_plausible(match.group("attrs")):
+            return match.group(0)
+        name = (match.group("inner") or "").strip()
+        return f"@{name}" if name else ""
+
+    out: list[str] = []
+    in_fence = False
+    for raw_line in content.splitlines(keepends=True):
+        if _MARKDOWN_FENCE_OPEN_RE.match(raw_line.rstrip("\r\n")):
+            in_fence = not in_fence
+            out.append(raw_line)
+            continue
+        out.append(raw_line if in_fence else _MENTION_TAG_RE.sub(_neutralize, raw_line))
+    return "".join(out)
+
+
 def render_markdown_for_card(content: str) -> str:
     """Render raw assistant Markdown for Feishu Card readability.
 
@@ -133,6 +193,7 @@ def render_markdown_for_card(content: str) -> str:
     text/session state and must not store this returned card-specific Markdown
     back into conversation or streaming state.
     """
+    content = strip_card_mentions(content, only_invalid=True)
     if not content or ("#" not in content and "**" not in content):
         return content
 
@@ -447,6 +508,9 @@ __all__ = [
     "CARDKIT_STREAMING_CLOSED",
     "CARDKIT_STREAM_EXPIRED_CODES",
     "CARDKIT_SEQUENCE_CONFLICT",
+    "CARDKIT_INVALID_USER_RESOURCE",
+    "has_card_mentions",
+    "strip_card_mentions",
     "CardKitCallResult",
     "CardKitState",
     "build_streaming_card_body",

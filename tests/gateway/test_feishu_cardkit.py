@@ -609,3 +609,80 @@ async def test_rate_limited_frame_is_reported_as_skipped():
     assert result.success is True
     assert result.raw_response == {"cardkit_rate_limited": True}
     assert state.failed is False and state.expired is False
+
+
+# ── Mentions Feishu can't resolve (100290) ─────────────────────────────────
+
+_REAL_ID = "ou_7b57032e3d973a86705e775c1f7aff96"
+
+
+def test_placeholder_mentions_render_as_text_and_real_ones_survive():
+    text = (
+        '<at id="ou_?"></at> 董晓东，已完成；<at id="ou_…">林启宁</at> 确认；'
+        f'<at id="{_REAL_ID}"></at> 请看。\n```\n<at id="ou_?"></at>\n```'
+    )
+
+    rendered = render_markdown_for_card(text)
+
+    assert "ou_?" not in rendered.split("```")[0]
+    assert "董晓东，已完成" in rendered
+    assert "@林启宁 确认" in rendered
+    assert f'<at id="{_REAL_ID}"></at> 请看' in rendered
+    # Code blocks are shown verbatim.
+    assert rendered.endswith('```\n<at id="ou_?"></at>\n```')
+
+
+@pytest.mark.asyncio
+async def test_rejected_mention_is_retried_as_text_and_stays_text():
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client, calls = _content_client([
+        _fail(100290, "there is an invalid user resource (at/person) in your card"),
+        _ok(),
+    ])
+    state = CardKitState(card_id="ck_1", message_id="om_1", sequence=5)
+    adapter._streaming_cards["om_1"] = state
+    text = f'<at id="{_REAL_ID}">董晓东</at> 在跑了'
+
+    first = await adapter.edit_message("oc_chat", "om_1", text)
+    second = await adapter.edit_message("oc_chat", "om_1", text + "，快好了")
+
+    assert first.success is True and second.success is True
+    assert state.failed is False and state.strip_mentions is True
+    assert [c.request_body.sequence for c in calls] == [6, 7, 8]
+    assert "<at" in calls[0].request_body.content
+    assert [c.request_body.content for c in calls[1:]] == ["@董晓东 在跑了", "@董晓东 在跑了，快好了"]
+
+
+@pytest.mark.asyncio
+async def test_rejection_without_mentions_still_fails_the_card():
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client, calls = _content_client([_fail(100290, "invalid user resource")])
+    state = CardKitState(card_id="ck_1", message_id="om_1", sequence=5)
+    adapter._streaming_cards["om_1"] = state
+
+    result = await adapter.edit_message("oc_chat", "om_1", "no mentions here")
+
+    assert result.success is False
+    assert state.failed is True
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_final_card_update_retries_without_rejected_mentions():
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client = object()
+    state = CardKitState(card_id="ck_1", message_id="om_1", sequence=7)
+    adapter._streaming_cards["om_1"] = state
+    update = AsyncMock(side_effect=[False, True])
+
+    with (
+        patch("plugins.platforms.feishu.adapter.set_card_streaming_mode", new=AsyncMock(return_value=True)),
+        patch("plugins.platforms.feishu.adapter.cardkit_update_card", new=update),
+    ):
+        done = await adapter.finalize_streaming_message("om_1", f'<at id="{_REAL_ID}">董晓东</at> 上线完成')
+
+    assert done is True
+    bodies = [c.kwargs for c in update.await_args_list]
+    assert [b["sequence"] for b in bodies] == [9, 10]
+    assert "<at" in bodies[0]["card_body"]["body"]["elements"][0]["content"]
+    assert bodies[1]["card_body"]["body"]["elements"][0]["content"] == "@董晓东 上线完成"

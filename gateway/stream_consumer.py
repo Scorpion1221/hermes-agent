@@ -640,6 +640,7 @@ class GatewayStreamConsumer:
         *,
         final: bool = False,
         expect_edits: bool = False,
+        live: bool = False,
     ) -> dict | None:
         """Return per-send metadata for stream-created messages.
 
@@ -653,6 +654,12 @@ class GatewayStreamConsumer:
         final-message delivery.
         """
         meta = dict(self.metadata) if self.metadata else {}
+        if not live:
+            # Only the live card this consumer keeps editing (and finalizes)
+            # may open a CardKit streaming card. Complete one-shot sends
+            # (fallback/overflow/commentary) would otherwise leave a card
+            # stuck in streaming mode forever.
+            meta.pop("streaming", None)
         if self._initial_reply_to_id:
             meta["reply_to_message_id"] = self._initial_reply_to_id
         if self._cardkit_mode and self._cardkit_rollovers:
@@ -4623,6 +4630,7 @@ class GatewayStreamConsumer:
                     metadata=self._metadata_for_send(
                         final=finalize,
                         expect_edits=not finalize,
+                        live=True,
                     ),
                 )
                 if result.success:
