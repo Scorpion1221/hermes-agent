@@ -5597,6 +5597,13 @@ class AIAgent:
         """
         if client is None:
             return
+        # Tell the owning worker its transport failure is our abort, so it
+        # does not retry inline on a new connection nobody will read (the
+        # caller's retry loop owns recovery).
+        try:
+            client._hermes_abort_reason = reason
+        except Exception:
+            pass
         # A pool whose sockets were shut down from a stranger thread must
         # never be reused: poison the cache slot so the owner-thread close
         # discards it and the next create builds a fresh client.
@@ -5813,6 +5820,13 @@ class AIAgent:
         """
         if client is None:
             return
+        # Tell the owning worker its transport failure is our abort, so it
+        # does not retry inline on a new connection nobody will read (the
+        # caller's retry loop owns recovery).
+        try:
+            client._hermes_abort_reason = reason
+        except Exception:
+            pass
         # A pool whose sockets were shut down from a stranger thread must
         # never be reused: poison the cache slot so the owner-thread close
         # discards it and the next create builds a fresh client.

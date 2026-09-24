@@ -1635,6 +1635,14 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
 
+    def _may_retry(attempt: int) -> bool:
+        # A watchdog or interrupt that aborted this client from another
+        # thread owns recovery; retrying here would open an orphan upstream
+        # stream that is billed but never read.
+        return attempt < max_stream_retries and not isinstance(
+            getattr(active_client, "_hermes_abort_reason", None), str
+        )
+
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
@@ -1709,7 +1717,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             _httpx.ConnectError,
             ConnectionError,
         ) as exc:
-            if attempt < max_stream_retries:
+            if _may_retry(attempt):
                 logger.debug(
                     "Codex Responses stream connect failed (attempt %s/%s); "
                     "retrying. %s error=%s",
@@ -1756,7 +1764,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     interrupt_check=_interrupt_or_superseded,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
-                if attempt < max_stream_retries:
+                if _may_retry(attempt):
                     logger.debug(
                         "Codex Responses stream transport failed mid-iteration "
                         "(attempt %s/%s); retrying. %s error=%s",

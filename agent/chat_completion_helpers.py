@@ -512,6 +512,25 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
     return _chars(api_payload) // 4
 
 
+def codex_stream_idle_timeout(
+    agent, api_kwargs: dict, *, openai_codex_backend: bool, default: float,
+) -> float:
+    """Seconds a Responses stream may go without events after the first one.
+
+    ``default`` is the context-scaled budget tuned for OpenAI's Codex
+    backend, which keeps emitting reasoning events while it thinks. Other
+    Responses backends (e.g. a proxy translating to Claude, whose thinking
+    arrives as no events at all) can stay silent through a whole reasoning
+    phase, so they get the same patience as the chat-completions/Anthropic
+    stream detector: provider ``stale_timeout_seconds``, context scaling and
+    reasoning-model floors. ``HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS``
+    still overrides both (0 disables).
+    """
+    if not openai_codex_backend:
+        default = max(default, _derive_stream_stale_timeout(agent, api_kwargs))
+    return _env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", default)
+
+
 def _is_openai_codex_backend(agent) -> bool:
     from agent.codex_responses_adapter import classify_responses_route
 
@@ -1588,12 +1607,29 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _ttfb_timeout = _ttfb_cap
 
     _codex_idle_enabled = _codex_watchdog_enabled
-    _codex_idle_timeout = _env_float(
-        "HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS",
-        _codex_idle_timeout_default,
+    _codex_idle_timeout = (
+        codex_stream_idle_timeout(
+            agent,
+            api_kwargs,
+            openai_codex_backend=_openai_codex_backend,
+            default=_codex_idle_timeout_default,
+        )
+        if _codex_watchdog_enabled
+        else 0.0
     )
     if _codex_idle_timeout <= 0:
         _codex_idle_enabled = False
+
+    # Once a Responses stream has produced events, the idle detector owns
+    # liveness. The wall-clock stale timeout is sized for a whole
+    # non-streaming call and would kill long but healthy generations, so
+    # after the first event non-OpenAI backends keep only the hard ceiling.
+    _streaming_stale_timeout = _stale_timeout
+    if _codex_idle_enabled and not _openai_codex_backend:
+        _streaming_stale_timeout = max(
+            _stale_timeout,
+            _codex_hard_timeout if _codex_hard_timeout > 0 else float("inf"),
+        )
 
     if _codex_watchdog_enabled:
         # Reset before the worker starts so a marker left over from a previous
@@ -1618,24 +1654,38 @@ def interruptible_api_call(agent, api_kwargs: dict):
         # usually a slow/overloaded provider, but the UI never said so).
         if _poll_count % 100 == 0:  # 100 × 0.3s = 30s
             _elapsed = time.time() - _call_start
+            _last_event_ts = (
+                getattr(agent, "_codex_stream_last_event_ts", None)
+                if _codex_watchdog_enabled
+                else None
+            )
             try:
                 _recovery = _codex_wait_notice_recovery(
-                    stale_timeout=_stale_timeout,
+                    stale_timeout=(
+                        _stale_timeout if _last_event_ts is None else _streaming_stale_timeout
+                    ),
                     ttfb_enabled=_ttfb_enabled,
                     ttfb_timeout=_ttfb_timeout,
-                    last_event_ts=getattr(
-                        agent, "_codex_stream_last_event_ts", None
-                    ),
+                    last_event_ts=_last_event_ts,
                     call_start=_call_start,
                     idle_enabled=_codex_idle_enabled,
                     idle_timeout=_codex_idle_timeout,
                     elapsed=_elapsed,
                 )
-                agent._emit_wait_notice(
-                    f"⏳ waiting on {api_kwargs.get('model', 'the provider')} — "
-                    f"{int(_elapsed)}s with no response yet (provider may be slow "
-                    f"or overloaded{_recovery})"
-                )
+                _model = api_kwargs.get('model', 'the provider')
+                if _last_event_ts is None:
+                    agent._emit_wait_notice(
+                        f"⏳ waiting on {_model} — {int(_elapsed)}s with no "
+                        f"response yet (provider may be slow or overloaded{_recovery})"
+                    )
+                elif time.time() - _last_event_ts >= 30:
+                    # The stream is open but quiet: measure from the last
+                    # event, not the call start ("no response" would be false).
+                    agent._emit_wait_notice(
+                        f"⏳ waiting on {_model} — no stream output for "
+                        f"{int(time.time() - _last_event_ts)}s (the model may be "
+                        f"thinking, or the provider is slow{_recovery})"
+                    )
             except Exception:
                 logger.debug("wait-notice construction failed", exc_info=True)
 
@@ -1744,6 +1794,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
         # Stale-call detector: kill the connection if no response
         # arrives within the configured timeout.
+        if _codex_watchdog_enabled and getattr(agent, "_codex_stream_last_event_ts", None) is not None:
+            _stale_timeout = _streaming_stale_timeout
         if _elapsed > _stale_timeout:
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
