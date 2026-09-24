@@ -152,6 +152,17 @@ def _open_fence_opener(text: str) -> Optional[str]:
     return opener
 
 
+def _open_fence_body_start(text: str) -> Optional[int]:
+    """Index just past the opener line of the code block ``text`` ends in."""
+    start = None
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        if _FENCE_LINE_RE.match(line):
+            start = None if start is not None else pos + len(line)
+        pos += len(line)
+    return start
+
+
 def _match_prefix_ignoring_whitespace(text: str, prefix: str) -> Optional[int]:
     """Return the index in ``text`` just past ``prefix``, or None.
 
@@ -1647,6 +1658,7 @@ class GatewayStreamConsumer:
             self._last_sent_text = final_text
             self._cardkit_boundary_prefix += self._cardkit_rollover_head + self._cardkit_turn_final_text
             self._cardkit_rollover_head = ""
+            self._cardkit_pending_fence = ""
             self._cardkit_last_sealed = None
             self._cardkit_stream_expired = False
             self._reset_segment_state(preserve_no_edit=True)
@@ -1871,7 +1883,8 @@ class GatewayStreamConsumer:
         acc = self._accumulated
         end = len(acc) if limit is None else min(limit, len(acc))
         idx = acc.rfind("\n", 0, end)
-        if idx > 0:
+        # Never a cut that would seal only a code block's opener line.
+        if idx > 0 and idx + 1 > (_open_fence_body_start(acc[:idx + 1]) or 0):
             return idx + 1
         return end if limit is not None and end > 0 else None
 
@@ -1885,13 +1898,21 @@ class GatewayStreamConsumer:
         acc = self._accumulated
         cut = len(acc) if cut is None else max(0, min(cut, len(acc)))
         fence_opener = None
-        if _has_open_code_fence(acc[:cut]):
-            # No clean cut was possible: cut at a line boundary, close the
-            # block in the sealed card and re-open it in the next one.
+        if self._cardkit_turn_final_text and _has_open_code_fence(acc[:cut]):
+            # No clean cut was possible inside the live answer: cut at a line
+            # boundary, close the block in the sealed card and re-open it in
+            # the next one.
             line_cut = acc.rfind("\n", 0, cut) + 1
-            if 0 < line_cut < cut:
+            if (_open_fence_body_start(acc[:cut]) or 0) < line_cut < cut:
                 cut = line_cut
             fence_opener = _open_fence_opener(acc[:cut])
+            closing = _FENCE_LINE_RE.match(acc, cut)
+            if fence_opener and closing:
+                # The block closes right at the cut: seal its closing fence
+                # too instead of re-opening an empty block.
+                newline = acc.find("\n", cut)
+                cut = len(acc) if newline < 0 else newline + 1
+                fence_opener = None
         carry = acc[cut:]
         sealed = ensure_closed_code_fences(
             self._clean_for_display(acc[:cut] or self._last_sent_text or "")
@@ -2235,8 +2256,17 @@ class GatewayStreamConsumer:
                                 self._tool_progress_active = True
                             continue  # continue draining to batch simultaneous progress lines
                         if self._cardkit_pending_fence and not self._accumulated:
-                            # Continue a code block a rollover cut through.
-                            self._accumulated = self._cardkit_pending_fence
+                            # Continue a code block a rollover cut through —
+                            # unless the delta is the block's closing fence:
+                            # the sealed card already closed it.
+                            _closing = _FENCE_LINE_RE.match(item)
+                            if _closing:
+                                _newline = item.find("\n")
+                                _fence_line = item if _newline < 0 else item[:_newline + 1]
+                                self._cardkit_rollover_head += _fence_line
+                                item = item[len(_fence_line):]
+                            else:
+                                self._accumulated = self._cardkit_pending_fence
                             self._cardkit_pending_fence = ""
                         before_len = len(self._accumulated)
                         self._filter_and_accumulate(item)

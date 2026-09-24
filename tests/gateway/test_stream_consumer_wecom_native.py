@@ -626,11 +626,15 @@ class TestClarifyEagerReseed:
 
         # User answered → request an eager re-seed.  NO on_delta yet.
         consumer.request_reopen_seed()
-        await self._drain(consumer, 0.05)  # let run() process _REOPEN_SEED
 
-        seeds_after = len(
-            [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
-        )
+        def _seeds():
+            return len(
+                [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
+            )
+
+        # Poll: a fixed drain loses the race when the suite loads the CPU.
+        await self._wait_until(lambda: _seeds() > seeds_before)
+        seeds_after = _seeds()
         assert seeds_after == seeds_before + 1, (
             "eager re-seed must emit exactly one new empty seed frame before "
             f"any delta (before={seeds_before}, after={seeds_after})"
@@ -1060,11 +1064,15 @@ class TestClarifyEagerReseed:
 
         # 第二轮 eager seed：即便标志有残留，仍能正确再次开流。
         consumer.request_reopen_seed()
-        await self._drain(consumer, 0.05)
 
-        seeds_after = len(
-            [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
-        )
+        def _seeds():
+            return len(
+                [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
+            )
+
+        # 轮询等待：固定 drain 在整套测试并发、CPU 紧张时会输掉竞争。
+        await self._wait_until(lambda: _seeds() > seeds_before_second_boundary)
+        seeds_after = _seeds()
         assert seeds_after == seeds_before_second_boundary + 1, (
             "第二轮 eager seed 必须再发一个新的空 seed 帧 "
             f"(before={seeds_before_second_boundary}, after={seeds_after})"

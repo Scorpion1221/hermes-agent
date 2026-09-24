@@ -842,10 +842,13 @@ async def test_unsplittable_oversized_line_does_not_spin():
     consumer.on_delta("```\n")
     await asyncio.wait_for(adapter.first_send.wait(), 3)
     consumer.on_delta("x" * 2000)  # one line, no clean or line cut
+    await asyncio.sleep(0.3)  # several edit intervals before finish
     consumer.finish()
-    # Must terminate (no endless seal loop), with nothing dropped.
+    # Must terminate (no endless seal loop), with nothing dropped and no
+    # card that is just an empty code block.
     await asyncio.wait_for(task, 3)
-    assert "x" * 2000 in "".join(f["content"] for f in adapter.finalized)
+    assert "".join(f["content"] for f in adapter.finalized).count("x") == 2000
+    assert all(f["content"].replace("`", "").strip() for f in adapter.finalized)
 
 
 @pytest.mark.asyncio
@@ -861,3 +864,46 @@ async def test_size_cut_keeps_a_heading_with_its_paragraph():
     await asyncio.wait_for(task, 3)
 
     assert not adapter.seals()[0]["content"].rstrip().endswith("## Details")
+
+
+@pytest.mark.asyncio
+async def test_unclosed_block_from_an_earlier_segment_is_not_reopened_in_the_next_answer():
+    adapter = RolloverCardTransport()
+    consumer = consumer_for(adapter)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("Running:\n\n```bash\nmake build\n")  # never closed
+    consumer.on_delta(None)
+    consumer.on_progress("\n> terminal: make build\n")
+    await asyncio.wait_for(adapter.first_send.wait(), 3)
+    await asyncio.sleep(0.1)
+    assert await consumer.request_cardkit_rollover(quiet_after=0.05) == "rolled"
+
+    consumer.on_delta("The build passed.")
+    consumer.finish("The build passed.")
+    await asyncio.wait_for(task, 3)
+
+    assert adapter.finalized[-1]["content"] == "The build passed."
+
+
+@pytest.mark.parametrize("stall_after", ["code_line", "carry_is_closing_fence"])
+@pytest.mark.asyncio
+async def test_seal_right_before_the_closing_fence_leaves_no_empty_block(stall_after):
+    adapter = RolloverCardTransport()
+    consumer = consumer_for(adapter)
+    task = asyncio.create_task(consumer.run())
+    # The card starts with the block, so the only cut is inside it.
+    head = "```python\nprint(1)\n"
+    consumer.on_delta(head if stall_after == "code_line" else head + "```")
+    await asyncio.wait_for(adapter.first_send.wait(), 3)
+    await asyncio.sleep(0.1)
+    assert await consumer.request_cardkit_rollover(quiet_after=0.05) == "rolled"
+
+    consumer.on_delta("```\n\nDone." if stall_after == "code_line" else "\n\nDone.")
+    final = "```python\nprint(1)\n```\n\nDone."
+    consumer.finish(final)
+    await asyncio.wait_for(task, 3)
+
+    last = adapter.finalized[-1]["content"]
+    assert not last.lstrip().startswith("```"), last
+    assert last.strip() == "Done."
+    assert consumer.delivered_final_matches(final) is True
