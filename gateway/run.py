@@ -3059,6 +3059,9 @@ from gateway.whatsapp_identity import (
 
 logger = logging.getLogger(__name__)
 
+# `cd <dir> && ` at the start of a terminal command (CardKit progress preview).
+_CD_PREFIX_RE = re.compile(r"^cd\s+(?:\"[^\"]*\"|'[^']*'|\S+)\s*&&\s*(?=[^\s\\({])")
+
 
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
@@ -4886,6 +4889,7 @@ class TurnRunner:
         _code_block_full = None
         _code_block_short = None
         _cardkit_terminal_line = None
+        _progress_key = None
         try:
             _progress_adapter = self._runner._adapter_for_source(ctx.source)
         except Exception:
@@ -4898,11 +4902,16 @@ class TurnRunner:
         ):
             from agent.display import get_tool_preview_max_len
             _cmd_full = args["command"].rstrip()
+            _progress_key = f"terminal\0{_cmd_full}"
             # Single-line, capped preview for non-verbose modes.
             _pl = get_tool_preview_max_len()
             _cap = _pl if _pl > 0 else 40
             _lines = _cmd_full.splitlines()
             _cmd_short = _lines[0] if _lines else _cmd_full
+            if ctx.cardkit_tool_progress:
+                # A leading `cd <dir> &&` is boilerplate; spend the short
+                # preview on the command itself.
+                _cmd_short = _CD_PREFIX_RE.sub("", _cmd_short, count=1) or _cmd_short
             _multiline = len(_lines) > 1
             if len(_cmd_short) > _cap:
                 _cmd_short = _cmd_short[:_cap - 3] + "..."
@@ -4999,13 +5008,9 @@ class TurnRunner:
         # the input boundary and accidentally put it in the new reply card.
         _sc = ctx.stream_consumer_holder[0] if ctx.stream_consumer_holder else None
         if ctx.cardkit_tool_progress and _sc is not None:
-            if msg == ctx.last_progress_msg[0]:
-                ctx.repeat_count[0] += 1
-                msg = f"{msg} (×{ctx.repeat_count[0] + 1})"
-            else:
-                ctx.last_progress_msg[0] = msg
-                ctx.repeat_count[0] = 0
-            _sc.on_progress(f"\n> {msg}\n")
+            # The consumer collapses back-to-back repeats in the card itself;
+            # a terminal call only counts as a repeat of the exact command.
+            _sc.on_progress(f"\n> {msg}\n", key=_progress_key)
             return
 
         # Dedup: collapse consecutive identical progress messages.
@@ -5018,7 +5023,7 @@ class TurnRunner:
             _sc = ctx.stream_consumer_holder[0] if ctx.stream_consumer_holder else None
             if _sc is not None and getattr(_sc, "accepts_tool_progress", False):
                 # Replace the last progress line with the dedup version
-                _sc.on_tool_progress(f"{msg} (×{ctx.repeat_count[0] + 1})")
+                _sc.on_tool_progress(f"{msg} (×{ctx.repeat_count[0] + 1})", replace_last=True)
                 return
             # Update the last line in progress_lines with a counter
             # via a special "dedup" queue message.
@@ -11397,7 +11402,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if elapsed_min > 0:
                         status_parts.append(f"{elapsed_min} min elapsed")
                 if max_iter:
-                    status_parts.append(f"iteration {iteration}/{max_iter}")
+                    # Unlimited turns carry sys.maxsize: show no denominator.
+                    status_parts.append(
+                        f"iteration {iteration}/{max_iter}" if max_iter < sys.maxsize
+                        else f"iteration {iteration}"
+                    )
                 if current_tool:
                     status_parts.append(f"running: {current_tool}")
             except Exception:
@@ -31261,8 +31270,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # who want it can opt in per platform.
                 _agent_ref = agent_holder[0]
                 _status_detail = ""
-                _hb_iteration = None
-                _hb_max_iterations = None
                 _want_iteration_detail = bool(
                     resolve_display_setting(
                         user_config,
@@ -31278,9 +31285,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if _want_iteration_detail:
                             _parts.append(
                                 f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
+                                if _a["max_iterations"] < sys.maxsize
+                                else f"iteration {_a['api_call_count']}"
                             )
-                            _hb_iteration = _a.get("api_call_count")
-                            _hb_max_iterations = _a.get("max_iterations")
                         _action = _a.get("current_tool") or _a.get("last_activity_desc")
                         if _action:
                             _parts.append(str(_action))
@@ -31294,9 +31301,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
                 )
                 # Feishu CardKit: instead of stacking a status bubble under a
-                # long reply, seal the live card with a progress footer and
-                # continue in a new card. Short-lived cards also stay inside
-                # Feishu's ~10 min streaming window.
+                # long reply, let a busy card speak for itself, or seal a
+                # quiet one with a progress footer and continue in a new card.
                 _hb_consumer = stream_consumer_holder[0]
                 if (
                     _hb_consumer is not None
@@ -31305,8 +31311,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ):
                     try:
                         _hb_verdict = await _hb_consumer.request_cardkit_rollover(
-                            iteration=_hb_iteration,
-                            max_iterations=_hb_max_iterations,
                             quiet_after=_NOTIFY_INTERVAL,
                         )
                     except asyncio.CancelledError:
@@ -31634,6 +31638,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cur_tool = _activity.get("current_tool")
                 _iter_n = _activity.get("api_call_count", 0)
                 _iter_max = _activity.get("max_iterations", 0)
+                # Unlimited turns carry sys.maxsize: show no denominator.
+                _iter_label = (
+                    f"{_iter_n}/{_iter_max}" if _iter_max and _iter_max < sys.maxsize else f"{_iter_n}"
+                )
 
                 logger.error(
                     "Agent idle for %.0fs (timeout %.0fs) in session %s "
@@ -31659,12 +31667,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _diag_lines.append(
                         f"The agent appears stuck on tool `{_cur_tool}` "
                         f"({_secs_ago:.0f}s since last activity, "
-                        f"iteration {_iter_n}/{_iter_max})."
+                        f"iteration {_iter_label})."
                     )
                 else:
                     _diag_lines.append(
                         f"Last activity: {_last_desc} ({_secs_ago:.0f}s ago, "
-                        f"iteration {_iter_n}/{_iter_max}). "
+                        f"iteration {_iter_label}). "
                         "The agent may have been waiting on an API response."
                     )
                 _diag_lines.append(

@@ -1141,3 +1141,23 @@ class TestNativeCommentaryPreservesAccumulated:
             f"pre-commentary prefix lost (the bug): {final_text!r}"
         )
         assert "finished (exit 0)." in final_text
+
+
+@pytest.mark.asyncio
+async def test_repeat_counter_rewrites_the_last_progress_line():
+    adapter = _make_native_streaming_adapter()
+    cfg = StreamConsumerConfig(chat_type="dm", cursor="", edit_interval=0.01, buffer_threshold=5)
+    consumer = GatewayStreamConsumer(adapter, "chat-1", cfg)
+    task = asyncio.create_task(consumer.run())
+
+    consumer.on_tool_progress("💻 terminal: ls")
+    consumer.on_tool_progress("💻 terminal: ls (×2)", replace_last=True)
+    consumer.on_tool_progress("💻 terminal: ls (×3)", replace_last=True)
+    await asyncio.sleep(0.1)
+    consumer.finish()
+    await task
+
+    progress_frames = [f["text"] for f in adapter.frames if "terminal: ls" in f["text"]]
+    assert progress_frames
+    last = progress_frames[-1]
+    assert last.count("terminal: ls") == 1 and last.rstrip().endswith("(×3)")

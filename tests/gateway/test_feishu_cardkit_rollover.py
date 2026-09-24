@@ -135,13 +135,13 @@ async def test_heartbeat_rollover_seals_live_card_and_continues_below():
     consumer.on_progress("\n> terminal: ls\n")
     await asyncio.wait_for(adapter.first_send.wait(), 3)
 
-    verdict = await consumer.request_cardkit_rollover(iteration=3, max_iterations=90)
+    verdict = await consumer.request_cardkit_rollover()
 
     assert verdict == "rolled"
     seal = adapter.finalized[0]
     assert seal["message_id"] == "card-1"
     assert seal["content"] == "I'll check the logs.\n> terminal: ls"
-    assert "第 3/90 轮" in seal["footer"] and "继续 ↓" in seal["footer"]
+    assert "已运行" in seal["footer"] and "继续 ↓" in seal["footer"]
 
     consumer.on_delta("All clear.")
     consumer.finish("All clear.")
@@ -296,12 +296,12 @@ async def test_heartbeat_without_live_card_refreshes_last_sealed_footer():
     assert await consumer.request_cardkit_rollover() == "rolled"
 
     # Silent period (model thinking): nothing new to stream.
-    assert await consumer.request_cardkit_rollover(iteration=5, max_iterations=90) == "annotated"
+    assert await consumer.request_cardkit_rollover() == "annotated"
     update = adapter.sealed_updates[-1]
     assert update["message_id"] == "card-1"
     assert update["content"] == "Working on it."
     # Same wording as the seal, so it stays true once content resumes below.
-    assert "第 5/90 轮" in update["footer"] and "继续 ↓" in update["footer"]
+    assert "已运行" in update["footer"] and "继续 ↓" in update["footer"]
 
     consumer.finish()
     await asyncio.wait_for(task, 3)
@@ -972,3 +972,146 @@ async def test_stale_turn_right_after_a_rollover_restatuses_the_sealed_card():
     assert adapter.sealed_updates[-1:] == [
         {"message_id": "card-1", "content": "part one", "footer": None, "stopped": True}
     ]
+
+
+def last_card(adapter):
+    return adapter.finalized[-1]["content"].rstrip()
+
+
+@pytest.mark.asyncio
+async def test_back_to_back_progress_repeat_is_counted_on_the_same_line():
+    adapter = RolloverCardTransport()
+    consumer = consumer_for(adapter)
+    task = asyncio.create_task(consumer.run())
+    for _ in range(3):
+        consumer.on_progress("\n> terminal: make test\n")
+    consumer.finish()
+    await asyncio.wait_for(task, 3)
+
+    assert last_card(adapter) == "> terminal: make test (×3)"
+
+
+@pytest.mark.parametrize("between", ["commentary", "answer"])
+@pytest.mark.asyncio
+async def test_repeat_counter_restarts_once_something_lands_between(between):
+    adapter = RolloverCardTransport()
+    consumer = consumer_for(adapter)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_progress("\n> terminal: swp next\n")
+    if between == "commentary":
+        consumer.on_commentary("Step 2 done.")
+    else:
+        consumer.on_delta("Step 2 done.")
+        consumer.on_delta(None)
+    consumer.on_progress("\n> terminal: swp next\n")
+    consumer.on_progress("\n> terminal: swp next\n")
+    consumer.finish()
+    await asyncio.wait_for(task, 3)
+
+    card = last_card(adapter)
+    # One line per streak; only the back-to-back pair is counted.
+    assert card.count("> terminal: swp next") == 2
+    assert card.count("(×") == 1 and card.endswith("> terminal: swp next (×2)")
+    assert card.index("Step 2 done.") < card.index("(×2)")
+
+
+@pytest.mark.asyncio
+async def test_repeat_counter_does_not_carry_into_a_new_card():
+    adapter = RolloverCardTransport()
+    consumer = consumer_for(adapter)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("Deploying.")
+    consumer.on_delta(None)
+    consumer.on_progress("\n> terminal: swp next\n")
+    await asyncio.wait_for(adapter.first_send.wait(), 3)
+    assert await consumer.request_cardkit_rollover() == "rolled"
+    consumer.on_progress("\n> terminal: swp next\n")
+    consumer.finish()
+    await asyncio.wait_for(task, 3)
+
+    assert all("(×" not in text for text in adapter.contents_for("card-2"))
+    assert last_card(adapter) == "> terminal: swp next"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_leaves_a_large_card_alone_while_it_keeps_changing():
+    adapter = RolloverCardTransport()
+    consumer = consumer_for(adapter, min_chars=300)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_commentary("A long step-by-step narration. " * 20)
+    consumer.on_progress("\n> terminal: swp next\n")
+    await asyncio.wait_for(adapter.first_send.wait(), 3)
+    await asyncio.sleep(0.1)
+
+    # Changed within the heartbeat interval: the card is its own sign of life.
+    assert await consumer.request_cardkit_rollover(quiet_after=60) == "live"
+    assert adapter.seals() == []
+    # Static for a whole interval: seal it with the progress footer.
+    assert await consumer.request_cardkit_rollover(quiet_after=0.05) == "rolled"
+    footer = adapter.seals()[0]["footer"]
+    assert "继续 ↓" in footer and "轮" not in footer
+
+    consumer.finish()
+    await asyncio.wait_for(task, 3)
+
+
+class FailingEditsTransport(RolloverCardTransport):
+    """The first card send works; later stream edits fail (non-rate-limit)
+    and the turn-final full-card update is not committed."""
+
+    def __init__(self):
+        super().__init__()
+        self.plain_sends = []
+        self.fail_edits = False
+
+    async def send(self, **kwargs):
+        if self.sent:
+            self.plain_sends.append(kwargs["content"])
+            return SimpleNamespace(success=True, message_id=f"plain-{len(self.plain_sends)}")
+        return await super().send(**kwargs)
+
+    async def edit_message(self, **kwargs):
+        if self.fail_edits:
+            self.edits.append(kwargs)
+            return SimpleNamespace(success=False, message_id=None, error="CardKit stream failed")
+        return await super().edit_message(**kwargs)
+
+    async def finalize_streaming_message(self, message_id, final_text="", **kwargs):
+        self.finalized.append({"message_id": message_id, "content": final_text, **kwargs})
+        return False
+
+
+@pytest.mark.asyncio
+async def test_fallback_after_a_failed_counter_edit_sends_only_the_unseen_tail():
+    adapter = FailingEditsTransport()
+    consumer = consumer_for(adapter)
+    consumer.on_delta("Checking the build before I answer.")
+    consumer.on_delta(None)
+    consumer.on_progress("\n> terminal: make test\n")
+    task = asyncio.create_task(consumer.run())
+    await asyncio.wait_for(adapter.first_send.wait(), 3)
+    await asyncio.sleep(0.1)
+
+    adapter.fail_edits = True
+    consumer.on_progress("\n> terminal: make test\n")  # counted in place, edit fails
+    await asyncio.sleep(0.1)
+    consumer.on_delta("All green.")
+    consumer.finish("All green.")
+    await asyncio.wait_for(task, 3)
+
+    # The frozen card already shows the first two lines: only the rest follows.
+    assert adapter.plain_sends == ["> terminal: make test (×2)\nAll green."]
+
+
+@pytest.mark.asyncio
+async def test_repeat_key_keeps_alike_previews_of_different_commands_apart():
+    adapter = RolloverCardTransport()
+    consumer = consumer_for(adapter)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_progress("\n> terminal: git pull\n", key="cd ~/web-pages && git pull")
+    consumer.on_progress("\n> terminal: git pull\n", key="cd ~/web-server && git pull")
+    consumer.on_progress("\n> terminal: git pull\n", key="cd ~/web-server && git pull")
+    consumer.finish()
+    await asyncio.wait_for(task, 3)
+
+    assert last_card(adapter) == "> terminal: git pull\n\n> terminal: git pull (×2)"

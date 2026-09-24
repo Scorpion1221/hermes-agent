@@ -93,11 +93,9 @@ class TestOnToolProgress:
     def test_enqueues_sentinel(self):
         consumer = _make_consumer()
         consumer.on_tool_progress("🔍 Searching...")
-        item = consumer._queue.get_nowait()
-        assert isinstance(item, tuple)
-        assert len(item) == 2
-        assert item[0] is _TOOL_PROGRESS
-        assert item[1] == "🔍 Searching..."
+        consumer.on_tool_progress("🔍 Searching... (×2)", replace_last=True)
+        assert consumer._queue.get_nowait() == (_TOOL_PROGRESS, "🔍 Searching...", False)
+        assert consumer._queue.get_nowait() == (_TOOL_PROGRESS, "🔍 Searching... (×2)", True)
 
     def test_empty_line_not_enqueued(self):
         consumer = _make_consumer()

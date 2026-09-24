@@ -92,7 +92,7 @@ class FollowupReceipt:
 # API/tool iterations (for example: "I'll inspect the repo first.").
 _COMMENTARY = object()
 # Sentinel for tool-progress lines injected into the native stream bubble.
-# Enqueued as ``(_TOOL_PROGRESS, line_text)`` by ``on_tool_progress()``.
+# Enqueued as ``(_TOOL_PROGRESS, line_text, replace_last)`` by ``on_tool_progress()``.
 _TOOL_PROGRESS = object()
 # Authoritative turn-final payload, enqueued by ``finish(final_text=...)``
 # just before ``_DONE``.  Carries the completed ``final_response`` —
@@ -305,9 +305,11 @@ class GatewayStreamConsumer:
     # gateway heartbeat (request_cardkit_rollover), this age cap, and an edit
     # that reports the window already closed.
     _cardkit_max_card_age = 540.0
-    # Heartbeat rollovers leave young or small cards alone, so a slow turn
-    # does not splinter into one-line cards: a card is rolled over once it is
-    # at least a minute old and has some substance, or is five minutes old.
+    # Heartbeat rollovers leave young cards and cards that visibly changed
+    # since the previous heartbeat alone; a busy card is rolled only by the
+    # age cap / expired window / size limit. Without that liveness signal
+    # (no quiet_after) a card is rolled once it is at least a minute old and
+    # has some substance, or is five minutes old.
     _cardkit_min_rollover_age = 60.0
     _cardkit_rollover_min_chars = 300
     _cardkit_small_card_max_age = 300.0
@@ -457,6 +459,14 @@ class GatewayStreamConsumer:
         self._cardkit_authoritative_final = ""
         # Commentary folded into CardKit cards (not separate messages).
         self._cardkit_folded_commentary: list[str] = []
+        # Last progress line appended to the card: (repeat key, text as
+        # first appended, text currently shown, count). Only a repeat that
+        # arrives while the card still ends with it is collapsed into "(×N)".
+        self._cardkit_last_progress: tuple[str, str, str, int] = ("", "", "", 0)
+        # Earliest offset in ``_accumulated`` where a "(×N)" counter rewrote
+        # a possibly visible line in place; the fallback continuation resends
+        # from there instead of the whole card.
+        self._cardkit_counter_rewrite_at: Optional[int] = None
         # When the card's visible text last changed (heartbeat liveness).
         self._last_visible_change_ts = 0.0
         self._started_wall = time.time()
@@ -606,7 +616,7 @@ class GatewayStreamConsumer:
         """
         return self._use_native_streaming
 
-    def on_tool_progress(self, line: str) -> None:
+    def on_tool_progress(self, line: str, *, replace_last: bool = False) -> None:
         """Inject a tool-progress status line into the native stream bubble.
 
         Thread-safe (called from agent worker thread via queue.Queue). Only
@@ -615,9 +625,11 @@ class GatewayStreamConsumer:
 
         The line is displayed as an overlay until the next text delta arrives,
         at which point real content overwrites the tool-progress lines.
+        ``replace_last`` rewrites the latest line (e.g. a repeat counter)
+        instead of adding one.
         """
         if line:
-            self._queue.put((_TOOL_PROGRESS, line))
+            self._queue.put((_TOOL_PROGRESS, line, replace_last))
 
     def _compose_frame_content(self) -> str:
         """Compose the current frame content for native streaming.
@@ -940,10 +952,14 @@ class GatewayStreamConsumer:
         """Finalize the current stream segment and start a fresh message."""
         self._queue.put(_NEW_SEGMENT)
 
-    def on_progress(self, text: str) -> None:
-        """Queue visible CardKit progress outside the assistant segment."""
+    def on_progress(self, text: str, *, key: Optional[str] = None) -> None:
+        """Queue visible CardKit progress outside the assistant segment.
+
+        ``key`` identifies the call for repeat counting (default: the text),
+        so previews that look alike but ran different commands stay apart.
+        """
         if text:
-            self._queue.put((_PROGRESS, text))
+            self._queue.put((_PROGRESS, text, key or text))
 
     def on_progress_boundary(self) -> None:
         """Flush CardKit display state without splitting assistant text."""
@@ -1040,8 +1056,6 @@ class GatewayStreamConsumer:
     async def request_cardkit_rollover(
         self,
         *,
-        iteration: Optional[int] = None,
-        max_iterations: Optional[int] = None,
         quiet_after: Optional[float] = None,
         timeout: float = 8.0,
     ) -> str:
@@ -1053,9 +1067,8 @@ class GatewayStreamConsumer:
           next content opens a new card below it.
         - ``"annotated"``: no live card; the last rolled-over card's footer
           was refreshed instead.
-        - ``"live"``: the live card is young, or changed within the last
-          ``quiet_after`` seconds while small or mid-paragraph — it is its
-          own sign of life.
+        - ``"live"``: the live card is young, or visibly changed within the
+          last ``quiet_after`` seconds — it is its own sign of life.
         - ``"finishing"``: the turn is completing.
         - ``"pending"``: the request is still queued after ``timeout``.
         - ``"no_card"`` / ``"deferred"`` / ``"failed"`` / ``"unsupported"``:
@@ -1069,9 +1082,7 @@ class GatewayStreamConsumer:
             # No run loop will drain the request (it never started, or it
             # died): let the caller post its own status message.
             return "no_card"
-        footer_parts = {
-            "iteration": iteration, "max_iterations": max_iterations, "quiet_after": quiet_after,
-        }
+        footer_parts = {"quiet_after": quiet_after}
         future = asyncio.get_running_loop().create_future()
         self._queue.put((_ROLLOVER, (footer_parts, future)))
         try:
@@ -1245,6 +1256,7 @@ class GatewayStreamConsumer:
         self._message_id = None
         self._message_created_ts = None
         self._accumulated = ""
+        self._cardkit_counter_rewrite_at = None
         self._stream_ledger = ""
         self._last_sent_text = ""
         self._fallback_final_send = False
@@ -1747,22 +1759,17 @@ class GatewayStreamConsumer:
         except (TypeError, ValueError):
             return False
 
-    def _cardkit_footer(
-        self, *, iteration: Optional[int] = None, max_iterations: Optional[int] = None,
-    ) -> str:
+    def _cardkit_footer(self) -> str:
+        # Stays true on a sealed card after the turn ends: no spinner glyph,
+        # no agent-loop counters.
         elapsed = max(0, int(time.time() - self._started_wall))
-        parts = [f"⏳ 已运行 {elapsed // 60} 分钟" if elapsed >= 60 else f"⏳ 已运行 {elapsed} 秒"]
-        if iteration is not None and max_iterations:
-            parts.append(f"第 {iteration}/{max_iterations} 轮")
-        parts.append("继续 ↓")
-        return " · ".join(parts)
+        ran = f"已运行 {elapsed // 60} 分钟" if elapsed >= 60 else f"已运行 {elapsed} 秒"
+        return f"{ran} · 继续 ↓"
 
     async def _handle_cardkit_rollover(
         self,
         *,
         reason: str,
-        iteration: Optional[int] = None,
-        max_iterations: Optional[int] = None,
         quiet_after: Optional[float] = None,
     ) -> str:
         """Seal the live CardKit card and continue in a new one.
@@ -1774,7 +1781,7 @@ class GatewayStreamConsumer:
             return "unsupported"
         if reason == "heartbeat" and self._finish_requested:
             return "finishing"
-        footer = self._cardkit_footer(iteration=iteration, max_iterations=max_iterations)
+        footer = self._cardkit_footer()
         message_id = self._message_id
         if message_id and message_id != "__no_edit__":
             if not self._edit_supported and not self._cardkit_stream_expired:
@@ -1791,6 +1798,12 @@ class GatewayStreamConsumer:
                 if reason == "heartbeat":
                     if age < self._cardkit_min_rollover_age:
                         return "live"
+                    if quiet_after is not None and recently_changed:
+                        # Busy card: its own updates are the sign of life.
+                        # The age cap seals it when more content arrives, a
+                        # later heartbeat once it goes quiet; a card past
+                        # Feishu's window still takes the full-card seal.
+                        return "live"
                     if (
                         recently_changed
                         and len(self._clean_for_display(self._accumulated).strip())
@@ -1806,8 +1819,8 @@ class GatewayStreamConsumer:
                         if cut is None:
                             return "deferred"
                     else:
-                        # Visibly streaming right now (the TTL path still
-                        # seals it before Feishu's cutoff).
+                        # Visibly streaming right now (the age cap seals it
+                        # when more content arrives).
                         return "live"
                 # An accepted follow-up receipt becomes the next reply card
                 # at its handoff; a rollover card would sit below it.
@@ -2234,7 +2247,7 @@ class GatewayStreamConsumer:
                                 continue
                             commentary_text = item[1]
                             break
-                        if isinstance(item, tuple) and len(item) == 2 and item[0] is _PROGRESS:
+                        if isinstance(item, tuple) and len(item) == 3 and item[0] is _PROGRESS:
                             # CardKit displays progress in the same cumulative
                             # card, but it is not model-authored final-answer
                             # text. Keep it out of the exact final segment used
@@ -2242,10 +2255,23 @@ class GatewayStreamConsumer:
                             # trusted gateway output, so append it directly;
                             # feeding it through the model think-tag filter can
                             # corrupt a partial tag buffered across LLM deltas.
-                            progress_text = item[1]
+                            progress_text, key = item[1], item[2]
+                            last_key, first, shown, count = self._cardkit_last_progress
+                            if key == last_key and shown and self._accumulated.endswith(shown):
+                                # Back-to-back repeat: count it on the line
+                                # itself instead of stacking another line.
+                                body = first.rstrip("\n")
+                                counted = f"{body} (×{count + 1}){first[len(body):]}"
+                                self._accumulated = self._accumulated[: -len(shown)] + counted
+                                self._cardkit_last_progress = (key, first, counted, count + 1)
+                                at = len(self._accumulated) - len(counted)
+                                if self._cardkit_counter_rewrite_at is None or at < self._cardkit_counter_rewrite_at:
+                                    self._cardkit_counter_rewrite_at = at
+                                continue
                             if not self._accumulated:
                                 progress_text = progress_text.lstrip("\n\r")
                             self._accumulated += progress_text
+                            self._cardkit_last_progress = (key, progress_text, progress_text, 1)
                             continue
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _FLUSH:
                             # Flush barrier: finalize the current segment like a
@@ -2255,12 +2281,15 @@ class GatewayStreamConsumer:
                             got_segment_break = True
                             flush_event = item[1]
                             break
-                        if isinstance(item, tuple) and len(item) == 2 and item[0] is _TOOL_PROGRESS:
+                        if isinstance(item, tuple) and len(item) == 3 and item[0] is _TOOL_PROGRESS:
                             # Tool-progress overlay: accumulate the status line.
                             # Only effective in native-streaming mode (callers
                             # gate before enqueue via accepts_tool_progress).
                             if self._use_native_streaming:
-                                self._tool_progress_lines.append(item[1])
+                                if item[2] and self._tool_progress_lines:
+                                    self._tool_progress_lines[-1] = item[1]
+                                else:
+                                    self._tool_progress_lines.append(item[1])
                                 self._tool_progress_active = True
                             continue  # continue draining to batch simultaneous progress lines
                         if self._cardkit_pending_fence and not self._accumulated:
@@ -3197,6 +3226,11 @@ class GatewayStreamConsumer:
         prefix = self._fallback_prefix or self._visible_prefix()
         if prefix and final_text.startswith(prefix):
             return final_text[len(prefix):].lstrip()
+        at = self._cardkit_counter_rewrite_at
+        if prefix and at and prefix.startswith(final_text[:at]):
+            # A repeat counter rewrote an already-visible line in place:
+            # resend from that line, not the whole card.
+            return final_text[at:].lstrip()
         return final_text
 
     @staticmethod

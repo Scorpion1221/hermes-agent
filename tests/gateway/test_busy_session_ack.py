@@ -402,6 +402,41 @@ class TestBusySessionAck:
         assert "terminal" in content  # current tool
         assert "10 min" in content  # elapsed
 
+    @pytest.mark.asyncio
+    async def test_status_detail_omits_denominator_for_unlimited_turns(self, monkeypatch):
+        import sys
+
+        import gateway.run as _gr
+
+        monkeypatch.setattr(
+            _gr,
+            "_load_gateway_config",
+            lambda: {"display": {"platforms": {"telegram": {"busy_ack_detail": True}}}},
+        )
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter()
+        event = _make_event(text="yo")
+        sk = build_session_key(event.source)
+        agent = MagicMock()
+        agent.get_activity_summary.return_value = {
+            "api_call_count": 21,
+            "max_iterations": sys.maxsize,
+            "current_tool": "terminal",
+            "last_activity_ts": time.time(),
+            "last_activity_desc": "terminal",
+            "seconds_since_activity": 0.5,
+        }
+        runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time() - 600
+        runner.adapters[event.source.platform] = adapter
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "iteration 21" in content
+        assert str(sys.maxsize) not in content and "21/" not in content
+
 
 class TestBusySessionOnboardingHint:
     """First-touch hint appended to the busy-ack the first time it fires."""

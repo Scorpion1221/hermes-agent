@@ -2647,7 +2647,8 @@ async def test_cardkit_heartbeat_rolls_long_reply_into_new_card(monkeypatch, tmp
     assert _heartbeat_texts(adapter) == []
     seal_id, seal_text, seal_footer = adapter.finalized[0]
     assert (seal_id, seal_text.strip()) == ("card-1", LongRunningCardKitAgent.FIRST.strip())
-    assert "第 7/90 轮" in seal_footer and "继续 ↓" in seal_footer
+    # Agent-loop counters stay out of the user-facing card footer.
+    assert "7/90" not in seal_footer and "继续 ↓" in seal_footer
     assert any(update[0] == "card-1" and "继续 ↓" in (update[2] or "") for update in adapter.sealed_updates)
     # The rest of the reply landed in a new card, once, and is not resent.
     last_id, last_text, last_footer = adapter.finalized[-1]
@@ -2679,3 +2680,166 @@ async def test_cardkit_heartbeat_before_first_card_still_posts_status(monkeypatc
     # Nothing on screen yet: the usual status message keeps the user informed.
     assert _heartbeat_texts(adapter)
     assert result.get("already_sent") is True
+
+
+class UnlimitedSilentStartCardKitAgent(SilentStartCardKitAgent):
+    def get_activity_summary(self):
+        return {**super().get_activity_summary(), "max_iterations": sys.maxsize}
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_status_omits_the_denominator_for_unlimited_turns(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0.3")
+    monkeypatch.setattr(GatewayStreamConsumer, "_cardkit_min_rollover_age", 60.0)
+
+    adapter, _result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        UnlimitedSilentStartCardKitAgent,
+        session_id="sess-heartbeat-unlimited",
+        config_data={"streaming": {"enabled": True}},
+        platform=Platform.FEISHU,
+        chat_id="oc_cardkit",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=RolloverCardKitAdapter,
+    )
+
+    texts = _heartbeat_texts(adapter)
+    assert texts and all("iteration 7" in t for t in texts)
+    assert not any(str(sys.maxsize) in t or "iteration 7/" in t for t in texts)
+
+
+class SteppedDeployCardKitAgent:
+    """Distinct `cd ~ && swp ...` steps narrated by commentary, then a poll pair."""
+
+    STEPS = [f"cd ~ && swp web-pages next --release r-20260924 --step {n}" for n in (2, 3)]
+    POLL = "cd ~ && swp web-pages status --release r-20260924"
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.interim_assistant_callback = None
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        for n, cmd in enumerate(self.STEPS, start=2):
+            self.tool_progress_callback("tool.started", "terminal", cmd, {"command": cmd})
+            self.interim_assistant_callback(f"Step {n} done.")
+        for _ in range(2):
+            self.tool_progress_callback("tool.started", "terminal", self.POLL, {"command": self.POLL})
+        time.sleep(0.35)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+@pytest.mark.asyncio
+async def test_feishu_cardkit_repeat_counter_counts_only_back_to_back_calls(monkeypatch, tmp_path):
+    import tools.terminal_tool  # noqa: F401 - register terminal emoji
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SteppedDeployCardKitAgent,
+        session_id="sess-feishu-cardkit-repeat-counter",
+        config_data={
+            "display": {"tool_progress": "all", "interim_assistant_messages": True},
+            "streaming": {"enabled": True},
+        },
+        platform=Platform.FEISHU,
+        chat_id="oc_cardkit",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=CardKitProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    card = max((c["content"] for c in adapter.sent + adapter.edits), key=len)
+    # Commentary separates the two `next` steps: neither is a repeat.
+    assert card.count('swp web-pages next') == 2
+    assert card.count("(×") == 1
+    # The back-to-back poll pair is one line, counted in place.
+    assert card.count("swp web-pages status") == 1 and "(×2)" in card
+    # The `cd ~ &&` boilerplate is not spent on the short preview.
+    assert "cd ~ &&" not in card
+
+
+class TwoRepoPullCardKitAgent:
+    """Same command in two directories, then a line-continued command."""
+
+    COMMANDS = [
+        "cd ~/web-pages && git pull --ff-only",
+        "cd ~/web-server && git pull --ff-only",
+        "cd /repo && \\\n  python -m pytest -q",
+    ]
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        for cmd in self.COMMANDS:
+            self.tool_progress_callback("tool.started", "terminal", cmd, {"command": cmd})
+        time.sleep(0.35)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+@pytest.mark.asyncio
+async def test_feishu_cardkit_cd_previews_stay_distinct_and_readable(monkeypatch, tmp_path):
+    import tools.terminal_tool  # noqa: F401 - register terminal emoji
+
+    adapter, _result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TwoRepoPullCardKitAgent,
+        session_id="sess-feishu-cardkit-cd-previews",
+        config_data={"display": {"tool_progress": "all"}, "streaming": {"enabled": True}},
+        platform=Platform.FEISHU,
+        chat_id="oc_cardkit",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=CardKitProgressCaptureAdapter,
+    )
+
+    card = max((c["content"] for c in adapter.sent + adapter.edits), key=len)
+    # Two repos pulled: two lines, not one "ran twice" line.
+    assert card.count("git pull --ff-only") == 2 and "(×" not in card
+    # A continued command keeps its directory instead of a bare "\ ...".
+    assert '"cd /repo && \\ ..."' in card
+
+
+class IdleUnlimitedAgent:
+    """Stuck in a tool with the default unlimited turn cap."""
+
+    def __init__(self, **kwargs):
+        self.tools = []
+        self._stop = threading.Event()
+
+    def get_activity_summary(self):
+        return {
+            "last_activity_ts": time.time() - 9999,
+            "last_activity_desc": "executing tool: terminal",
+            "seconds_since_activity": 9999.0,
+            "current_tool": "terminal",
+            "api_call_count": 12,
+            "max_iterations": sys.maxsize,
+        }
+
+    def interrupt(self, msg=None):
+        self._stop.set()
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self._stop.wait(20)
+        return {"final_response": "late", "messages": [], "api_calls": 12}
+
+
+@pytest.mark.asyncio
+async def test_inactivity_timeout_message_omits_the_unlimited_denominator(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "1")
+    monkeypatch.setenv("HERMES_AGENT_TIMEOUT_WARNING", "0")
+
+    _adapter, result = await _run_with_agent(
+        monkeypatch, tmp_path, IdleUnlimitedAgent, session_id="sess-idle-unlimited",
+    )
+
+    text = result.get("final_response") or ""
+    assert "iteration 12)" in text
+    assert str(sys.maxsize) not in text and "12/" not in text
