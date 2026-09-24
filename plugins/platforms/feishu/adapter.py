@@ -104,6 +104,8 @@ ReplyMessageRequest = None  # type: ignore[assignment]
 ReplyMessageRequestBody = None  # type: ignore[assignment]
 UpdateMessageRequest = None  # type: ignore[assignment]
 UpdateMessageRequestBody = None  # type: ignore[assignment]
+PatchMessageRequest = None  # type: ignore[assignment]
+PatchMessageRequestBody = None  # type: ignore[assignment]
 AccessTokenType = None  # type: ignore[assignment]
 HttpMethod = None  # type: ignore[assignment]
 FEISHU_DOMAIN = None  # type: ignore[assignment]
@@ -168,6 +170,9 @@ from gateway.platforms.feishu_inbound import (
 )
 from gateway.platforms.feishu_inbound import parse as feishu_parse
 from gateway.platforms.feishu_inbound.cardkit import (
+    CARDKIT_RATE_LIMITED,
+    CARDKIT_SEQUENCE_CONFLICT,
+    CARDKIT_STREAM_EXPIRED_CODES,
     CardKitState,
     build_card_id_message_content,
     build_final_card_body,
@@ -176,6 +181,7 @@ from gateway.platforms.feishu_inbound.cardkit import (
     render_markdown_for_card,
     set_card_streaming_mode,
     stream_card_element,
+    stream_card_element_result,
     update_card as cardkit_update_card,
 )
 from gateway.status import acquire_scoped_lock, release_scoped_lock
@@ -270,6 +276,8 @@ _VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".3gp"}
 _DOCUMENT_MIME_TO_EXT = {mime: ext for ext, mime in SUPPORTED_DOCUMENT_TYPES.items()}
 _FEISHU_IMAGE_UPLOAD_TYPE = "message"
 _FEISHU_FILE_UPLOAD_TYPE = "stream"
+# Bound for the per-adapter CardKit bookkeeping (sealed cards, card-entity ids).
+_CARDKIT_REGISTRY_LIMIT = 256
 _FEISHU_OPUS_UPLOAD_EXTENSIONS = {".ogg", ".opus"}
 _FEISHU_MEDIA_UPLOAD_EXTENSIONS = {".mp4", ".mov", ".avi", ".m4v"}
 _FEISHU_DOC_UPLOAD_TYPES = {
@@ -1552,6 +1560,7 @@ def _load_lark_oapi() -> bool:
                 P2ImMessageMessageReadV1,
                 ReplyMessageRequest, ReplyMessageRequestBody,
                 UpdateMessageRequest, UpdateMessageRequestBody,
+                PatchMessageRequest, PatchMessageRequestBody,
             )
             from lark_oapi.core import AccessTokenType, HttpMethod
             from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
@@ -1581,6 +1590,8 @@ def _load_lark_oapi() -> bool:
             "ReplyMessageRequestBody": ReplyMessageRequestBody,
             "UpdateMessageRequest": UpdateMessageRequest,
             "UpdateMessageRequestBody": UpdateMessageRequestBody,
+            "PatchMessageRequest": PatchMessageRequest,
+            "PatchMessageRequestBody": PatchMessageRequestBody,
             "AccessTokenType": AccessTokenType,
             "HttpMethod": HttpMethod,
             "FEISHU_DOMAIN": FEISHU_DOMAIN,
@@ -1686,6 +1697,12 @@ class FeishuAdapter(BasePlatformAdapter):
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
         self._card_action_tokens: Dict[str, float] = {}  # token → first_seen_time
         self._streaming_cards: Dict[str, CardKitState] = {}
+        # Streaming cards sealed with a full-card update. Kept (LRU-bounded)
+        # so a rolled-over reply can still restatus its last sealed card.
+        self._sealed_cards: "OrderedDict[str, CardKitState]" = OrderedDict()
+        # Message ids that reference a CardKit card entity. IM edits cannot
+        # rewrite those, so edit_message never PATCHes them.
+        self._cardkit_message_ids: "OrderedDict[str, None]" = OrderedDict()
         _st_raw = str(
             getattr(self._settings, "streaming_transport", "") or (config.extra or {}).get("streaming_transport", "")
         ).strip().lower()
@@ -2299,7 +2316,13 @@ class FeishuAdapter(BasePlatformAdapter):
         *,
         finalize: bool = False,
     ) -> SendResult:
-        """Edit a previously sent Feishu text/post message."""
+        """Edit a previously sent Feishu message.
+
+        Live CardKit cards stream through the card element API. Outbound
+        messages are interactive Card 2.0 cards, which the PUT update API
+        cannot edit, so they are PATCHed; PUT remains the fallback for
+        messages that went out as text.
+        """
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
@@ -2310,6 +2333,17 @@ class FeishuAdapter(BasePlatformAdapter):
         content = self.format_message(content)
         try:
             msg_type, payload = self._build_outbound_payload(content)
+            if msg_type == "interactive" and message_id not in self._cardkit_message_ids:
+                patch_request = self._build_patch_message_request(message_id=message_id, content=payload)
+                patch_response = await self._run_blocking(self._client.im.v1.message.patch, patch_request)
+                patch_result = self._finalize_send_result(patch_response, "patch failed")
+                if patch_result.success:
+                    patch_result.message_id = message_id
+                    return patch_result
+                logger.debug(
+                    "[Feishu] Card PATCH rejected for %s (%s); trying PUT update",
+                    message_id, patch_result.error,
+                )
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=body)
             response = await self._run_blocking(self._client.im.v1.message.update, request)
@@ -2346,6 +2380,7 @@ class FeishuAdapter(BasePlatformAdapter):
         card_id = await create_streaming_card(self._client)
         if not card_id:
             return None
+        created_at = time.time()
         payload = build_card_id_message_content(card_id)
         try:
             response = await self._feishu_send_with_retry(
@@ -2354,11 +2389,18 @@ class FeishuAdapter(BasePlatformAdapter):
             )
             result = self._finalize_send_result(response, "streaming card send failed")
             if result.success and result.message_id:
+                elapsed_origin = 0.0
+                try:
+                    elapsed_origin = float((metadata or {}).get("cardkit_elapsed_origin") or 0.0)
+                except (TypeError, ValueError):
+                    elapsed_origin = 0.0
                 state = CardKitState(
                     card_id=card_id, message_id=result.message_id, sequence=1,
                     started_at=time.time(), reply_to_message_id=reply_to or "",
+                    created_at=created_at, elapsed_origin=elapsed_origin,
                 )
                 self._streaming_cards[result.message_id] = state
+                self._remember_cardkit_message(result.message_id)
                 await stream_card_element(
                     self._client, card_id=card_id, element_id=state.element_id,
                     content=content, sequence=state.sequence,
@@ -2369,27 +2411,83 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] Streaming card send failed, will fall back: %s", exc)
             return None
 
+    def _remember_cardkit_message(self, message_id: str) -> None:
+        self._cardkit_message_ids[message_id] = None
+        self._cardkit_message_ids.move_to_end(message_id)
+        while len(self._cardkit_message_ids) > _CARDKIT_REGISTRY_LIMIT:
+            self._cardkit_message_ids.popitem(last=False)
+
+    @staticmethod
+    def _cardkit_expired_result(state: CardKitState, code: Optional[int] = None) -> SendResult:
+        # Contract with GatewayStreamConsumer: ``cardkit_stream_expired``
+        # means the card is intact but its streaming window closed, so the
+        # consumer seals it and continues in a new card instead of dropping
+        # into permanent edit fallback. Keep the error text free of
+        # "rate"/"flood"/"retry after" (the consumer's flood heuristic).
+        return SendResult(
+            success=False,
+            error="CardKit streaming window closed",
+            raw_response={"cardkit_stream_expired": True, "code": code, "card_id": state.card_id},
+        )
+
     async def _edit_streaming_card(self, state: CardKitState, content: str) -> SendResult:
         if state.stopped:
             return SendResult(success=True, message_id=state.message_id)
+        if state.expired:
+            return self._cardkit_expired_result(state)
         state.sequence += 1
         state.last_content = content
-        ok = await stream_card_element(
+        result = await stream_card_element_result(
             self._client, card_id=state.card_id, element_id=state.element_id,
             content=content, sequence=state.sequence,
         )
-        if not ok:
+        if not result.ok and result.code == CARDKIT_SEQUENCE_CONFLICT:
+            # A number consumed by a failed or reordered call is never reused;
+            # take the next one and retry once.
+            state.sequence += 1
+            result = await stream_card_element_result(
+                self._client, card_id=state.card_id, element_id=state.element_id,
+                content=content, sequence=state.sequence,
+            )
+        if not result.ok and result.code in CARDKIT_STREAM_EXPIRED_CODES:
+            state.expired = True
+            logger.info(
+                "[Feishu] CardKit streaming window closed for %s (code=%s, age=%.0fs)",
+                state.card_id, result.code,
+                time.time() - (state.created_at or state.started_at or time.time()),
+            )
+            return self._cardkit_expired_result(state, result.code)
+        if not result.ok:
             state.failed = True
             return SendResult(success=False, error="CardKit stream failed")
+        if result.code == CARDKIT_RATE_LIMITED:
+            # The frame was skipped; the card is fine. Tell the consumer so it
+            # resends on its next tick instead of treating it as shown.
+            return SendResult(
+                success=True, message_id=state.message_id,
+                raw_response={"cardkit_rate_limited": True},
+            )
         return SendResult(success=True, message_id=state.message_id)
 
-    async def finalize_streaming_message(self, message_id: str, final_text: str = "", *, stopped: bool = False, status: str = "") -> bool:
+    def _cardkit_elapsed(self, state: CardKitState) -> float:
+        origin = state.elapsed_origin or state.started_at
+        return time.time() - origin if origin else 0.0
+
+    async def finalize_streaming_message(
+        self,
+        message_id: str,
+        final_text: str = "",
+        *,
+        stopped: bool = False,
+        status: str = "",
+        footer: Optional[str] = None,
+    ) -> bool:
         state = self._streaming_cards.get(message_id)
         if not state:
             return False
         if state.stopped:
             return False
-        elapsed = time.time() - state.started_at if state.started_at else 0.0
+        elapsed = self._cardkit_elapsed(state)
         logger.info("[Feishu] Finalizing streaming card %s (seq=%d, elapsed=%.1fs, stopped=%s)", state.card_id, state.sequence, elapsed, stopped)
         state.sequence += 1
         streaming_closed = await set_card_streaming_mode(
@@ -2400,13 +2498,18 @@ class FeishuAdapter(BasePlatformAdapter):
             state.card_id,
             streaming_closed,
         )
-        if not streaming_closed:
+        if not streaming_closed and not (state.expired and final_text):
+            # An expired card has already left streaming mode; its full-card
+            # update below is still authoritative.
             raise RuntimeError(f"CardKit streaming close failed for {state.card_id}")
         if final_text:
             state.sequence += 1
             final_card_updated = await cardkit_update_card(
                 self._client, card_id=state.card_id,
-                card_body=build_final_card_body(final_text, elapsed_seconds=elapsed, stopped=stopped, status=status), sequence=state.sequence,
+                card_body=build_final_card_body(
+                    final_text, elapsed_seconds=elapsed, stopped=stopped, status=status, footer=footer,
+                ),
+                sequence=state.sequence,
             )
             logger.info(
                 "[Feishu] Final card updated for %s: %s",
@@ -2415,8 +2518,51 @@ class FeishuAdapter(BasePlatformAdapter):
             )
             if not final_card_updated:
                 raise RuntimeError(f"CardKit final card update failed for {state.card_id}")
+            state.sealed_text = final_text
+            if footer is not None:
+                # A rolled-over card: the reply may still restatus it.
+                self._remember_sealed_card(message_id, state)
         self._streaming_cards.pop(message_id, None)
         return True
+
+    async def update_sealed_streaming_message(
+        self,
+        message_id: str,
+        content: str = "",
+        *,
+        footer: Optional[str] = None,
+        stopped: bool = False,
+        status: str = "",
+    ) -> bool:
+        """Replace a sealed CardKit card's body/footer (e.g. restatus it).
+
+        Returns the literal True only after CardKit accepted the update.
+        """
+        state = self._sealed_cards.get(message_id)
+        if not state:
+            return False
+        text = content or state.sealed_text
+        if not text:
+            return False
+        state.sequence += 1
+        updated = await cardkit_update_card(
+            self._client, card_id=state.card_id,
+            card_body=build_final_card_body(
+                text, elapsed_seconds=self._cardkit_elapsed(state),
+                stopped=stopped, status=status, footer=footer,
+            ),
+            sequence=state.sequence,
+        )
+        if updated:
+            state.sealed_text = text
+            self._remember_sealed_card(message_id, state)
+        return updated is True
+
+    def _remember_sealed_card(self, message_id: str, state: CardKitState) -> None:
+        self._sealed_cards[message_id] = state
+        self._sealed_cards.move_to_end(message_id)
+        while len(self._sealed_cards) > _CARDKIT_REGISTRY_LIMIT:
+            self._sealed_cards.popitem(last=False)
 
     async def stop_all_streaming_cards(self) -> None:
         to_stop = list(self._streaming_cards.items())
@@ -6158,6 +6304,17 @@ class FeishuAdapter(BasePlatformAdapter):
                 .build()
             )
         return SimpleNamespace(msg_type=msg_type, content=content)
+
+    @staticmethod
+    def _build_patch_message_request(*, message_id: str, content: str) -> Any:
+        if PatchMessageRequest is not None and PatchMessageRequestBody is not None:
+            return (
+                PatchMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(PatchMessageRequestBody.builder().content(content).build())
+                .build()
+            )
+        return SimpleNamespace(message_id=message_id, request_body=SimpleNamespace(content=content))
 
     @staticmethod
     def _build_update_message_request(message_id: str, request_body: Any) -> Any:

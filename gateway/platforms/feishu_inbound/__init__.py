@@ -66,6 +66,7 @@ from .cardkit import (
     create_streaming_card,
     set_card_streaming_mode,
     stream_card_element,
+    stream_card_element_result,
     update_card as cardkit_update_card,
 )
 from .user_name_cache import (

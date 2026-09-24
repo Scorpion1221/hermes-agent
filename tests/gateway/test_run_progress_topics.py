@@ -2557,3 +2557,125 @@ async def test_matrix_buffered_transformation_sends_authoritative_text_once(monk
     assert result.get("already_sent") is True
     assert [message["content"] for message in adapter.sent] == ["original answer\n\n[plugin appended this]"]
     assert adapter.edits == []
+
+
+class RolloverCardKitAdapter(MetadataEditProgressCaptureAdapter):
+    """CardKit adapter speaking the rollover contract, one id per card."""
+
+    def __init__(self, platform=Platform.FEISHU):
+        super().__init__(platform=platform)
+        self._use_cardkit_streaming = True
+        self.finalized = []
+        self.sealed_updates = []
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self.sent.append(
+            {"chat_id": chat_id, "content": content, "reply_to": reply_to, "metadata": metadata}
+        )
+        return SendResult(success=True, message_id=f"card-{len(self.sent)}")
+
+    async def finalize_streaming_message(
+        self, message_id, final_text="", *, stopped=False, status="", footer=None,
+    ):
+        self.finalized.append((message_id, final_text, footer))
+        return True
+
+    async def update_sealed_streaming_message(
+        self, message_id, content="", *, footer=None, stopped=False, status="",
+    ):
+        self.sealed_updates.append((message_id, content, footer))
+        return True
+
+
+class LongRunningCardKitAgent:
+    FIRST = "I'll check the deployment."
+    SECOND = "The deployment is healthy."
+    FINAL = SECOND
+    LEADING_SILENCE = 0.0
+
+    def __init__(self, **kwargs):
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def get_activity_summary(self):
+        return {"api_call_count": 7, "max_iterations": 90, "current_tool": None, "last_activity_desc": "thinking"}
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        time.sleep(self.LEADING_SILENCE)
+        self.stream_delta_callback(self.FIRST)
+        self.stream_delta_callback(None)  # tool call
+        # Several heartbeat intervals of silence (the model is thinking).
+        time.sleep(1.0)
+        self.stream_delta_callback(self.SECOND)
+        time.sleep(0.2)
+        return {"final_response": self.FINAL, "messages": [], "api_calls": 7}
+
+
+class SilentStartCardKitAgent(LongRunningCardKitAgent):
+    LEADING_SILENCE = 0.5
+
+
+def _heartbeat_texts(adapter):
+    return [
+        entry["content"]
+        for entry in [*adapter.sent, *adapter.edits]
+        if "Working" in entry["content"]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cardkit_heartbeat_rolls_long_reply_into_new_card(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0.3")
+    monkeypatch.setattr(GatewayStreamConsumer, "_cardkit_min_rollover_age", 0.0)
+    monkeypatch.setattr(GatewayStreamConsumer, "_cardkit_rollover_min_chars", 0)
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        LongRunningCardKitAgent,
+        session_id="sess-cardkit-heartbeat-rollover",
+        config_data={"streaming": {"enabled": True}},
+        platform=Platform.FEISHU,
+        chat_id="oc_cardkit",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=RolloverCardKitAdapter,
+    )
+
+    # The heartbeat sealed the live card instead of posting a status bubble,
+    # and refreshed that card's footer while nothing new streamed.
+    assert _heartbeat_texts(adapter) == []
+    seal_id, seal_text, seal_footer = adapter.finalized[0]
+    assert (seal_id, seal_text.strip()) == ("card-1", LongRunningCardKitAgent.FIRST.strip())
+    assert "第 7/90 轮" in seal_footer and "继续 ↓" in seal_footer
+    assert any(update[0] == "card-1" and "继续 ↓" in (update[2] or "") for update in adapter.sealed_updates)
+    # The rest of the reply landed in a new card, once, and is not resent.
+    last_id, last_text, last_footer = adapter.finalized[-1]
+    assert last_id == "card-2" and last_footer is None
+    assert last_text == LongRunningCardKitAgent.SECOND
+    assert result.get("already_sent") is True
+    answer_sends = [s for s in adapter.sent if LongRunningCardKitAgent.FINAL in s["content"]]
+    assert len(answer_sends) == 1 and answer_sends[0]["metadata"].get("streaming") is True
+
+
+@pytest.mark.asyncio
+async def test_cardkit_heartbeat_before_first_card_still_posts_status(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0.3")
+    monkeypatch.setattr(GatewayStreamConsumer, "_cardkit_min_rollover_age", 60.0)
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SilentStartCardKitAgent,
+        session_id="sess-cardkit-heartbeat-no-card",
+        config_data={"streaming": {"enabled": True}},
+        platform=Platform.FEISHU,
+        chat_id="oc_cardkit",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=RolloverCardKitAdapter,
+    )
+
+    # Nothing on screen yet: the usual status message keeps the user informed.
+    assert _heartbeat_texts(adapter)
+    assert result.get("already_sent") is True

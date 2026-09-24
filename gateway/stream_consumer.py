@@ -65,6 +65,12 @@ _PROGRESS_BOUNDARY = object()
 # fresh bubble below the prompt.
 _USER_INPUT_BOUNDARY = object()
 
+# CardKit card rollover request, enqueued as ``(_ROLLOVER, (footer_parts, future))``
+# by ``request_cardkit_rollover``.  FIFO behind earlier content: everything
+# queued before the marker lands in the sealed card, everything after it in
+# the next card.
+_ROLLOVER = object()
+
 
 @dataclass
 class FollowupReceipt:
@@ -77,6 +83,9 @@ class FollowupReceipt:
     message_id: Optional[str] = None
     accepted: bool = False
     consumed: bool = False
+    # time.monotonic() just before the receipt card was sent; its CardKit
+    # streaming window runs from here, not from the later handoff.
+    card_created_monotonic: Optional[float] = None
 
 
 # Queue marker for a completed assistant commentary message emitted between
@@ -120,6 +129,36 @@ _REOPEN_SEED = object()
 # accumulated yet.  Callers may override per-boundary (e.g. clarify passes its
 # own) via close_for_approval_prompt(placeholder=...).
 _DEFAULT_BOUNDARY_PLACEHOLDER = "⏸ 等待审批中..."
+
+
+_FENCE_LINE_RE = re.compile(r"^[ ]{0,3}```", re.MULTILINE)
+
+
+def _has_open_code_fence(text: str) -> bool:
+    """True when ``text`` ends inside an unterminated ``` code block.
+
+    Only line-leading fences count, so inline mentions (e.g. a quoted
+    ``grep '```'`` progress line) don't look like an open block.
+    """
+    return len(_FENCE_LINE_RE.findall(text)) % 2 == 1
+
+
+def _match_prefix_ignoring_whitespace(text: str, prefix: str) -> Optional[int]:
+    """Return the index in ``text`` just past ``prefix``, or None.
+
+    Whitespace runs may differ between the two (streamed deltas are
+    lstripped at card starts; the authoritative final is not).
+    """
+    i = 0
+    for ch in prefix:
+        if ch.isspace():
+            continue
+        while i < len(text) and text[i].isspace():
+            i += 1
+        if i >= len(text) or text[i] != ch:
+            return None
+        i += 1
+    return i
 
 
 def escape_code_fences_for_display(text: str) -> str:
@@ -239,6 +278,19 @@ class GatewayStreamConsumer:
     # After this many consecutive flood-control failures, permanently disable
     # progressive edits for the remainder of the stream.
     _MAX_FLOOD_STRIKES = 3
+
+    # Feishu closes a CardKit card's streaming mode ~600 s after creation, so
+    # long replies roll over: the live card is sealed (full-card update with a
+    # "继续 ↓" footer) and later content opens a new card. Triggers: the
+    # gateway heartbeat (request_cardkit_rollover), this age cap, and an edit
+    # that reports the window already closed.
+    _cardkit_max_card_age = 540.0
+    # Heartbeat rollovers leave young or small cards alone, so a slow turn
+    # does not splinter into one-line cards: a card is rolled over once it is
+    # at least a minute old and has some substance, or is five minutes old.
+    _cardkit_min_rollover_age = 60.0
+    _cardkit_rollover_min_chars = 300
+    _cardkit_small_card_max_age = 300.0
 
     # Reasoning/thinking tags that models emit inline in content.
     # Must stay in sync with cli.py _OPEN_TAGS/_CLOSE_TAGS and
@@ -364,6 +416,22 @@ class GatewayStreamConsumer:
         self._cardkit_turn_final_text = ""
         # Assistant text already sealed before a clarify/steer boundary.
         self._cardkit_boundary_prefix = ""
+        # CardKit rollover state (see _cardkit_max_card_age).
+        self._cardkit_stream_expired = False
+        self._cardkit_rollover_retry_at = 0.0
+        self._cardkit_rollovers = 0
+        # Part of the current assistant segment sealed into earlier cards;
+        # stripped from the authoritative final so it is not repeated.
+        self._cardkit_rollover_head = ""
+        # Head of the previous segment, for runtimes that emit a trailing
+        # segment boundary right before the final text.
+        self._cardkit_prev_rollover_head = ""
+        # (message_id, sealed_text) of the most recent rollover seal.
+        self._cardkit_last_sealed: Optional[tuple[str, str]] = None
+        self._started_wall = time.time()
+        self._run_started = False
+        self._finish_requested = False
+        self._consecutive_failures = 0
         self._followups: list[FollowupReceipt] = []
         self._followup_lock = threading.Lock()
         self._closed = False
@@ -556,6 +624,9 @@ class GatewayStreamConsumer:
         meta = dict(self.metadata) if self.metadata else {}
         if self._initial_reply_to_id:
             meta["reply_to_message_id"] = self._initial_reply_to_id
+        if self._cardkit_mode and self._cardkit_rollovers:
+            # Continuation cards report the whole reply's elapsed time.
+            meta["cardkit_elapsed_origin"] = self._started_wall
         if expect_edits:
             meta["expect_edits"] = True
         if final:
@@ -701,8 +772,25 @@ class GatewayStreamConsumer:
         # Some providers return the whole turn across a steer boundary. The
         # prefix is already visible in a detached card; only update the tail.
         prefix = self._cardkit_boundary_prefix
-        if prefix and authoritative.startswith(prefix) and authoritative[len(prefix):].strip():
-            authoritative = authoritative[len(prefix):].lstrip()
+        if prefix.strip():
+            # Whitespace-tolerant: cards strip leading newlines at their start.
+            end = _match_prefix_ignoring_whitespace(authoritative, prefix)
+            if end is not None and authoritative[end:].strip():
+                authoritative = authoritative[end:].lstrip()
+        # Rolled-over cards already show the head of this assistant segment;
+        # only the unsealed rest belongs in the live card.
+        head = self._cardkit_rollover_head
+        if not head and not self._cardkit_turn_final_text.strip():
+            head = self._cardkit_prev_rollover_head
+        if head.strip():
+            end = _match_prefix_ignoring_whitespace(authoritative, head)
+            if end is None:
+                logger.debug("CardKit final does not extend the rolled-over head; appending whole")
+            else:
+                authoritative = authoritative[end:].lstrip()
+                if not self._clean_for_display(authoritative).strip():
+                    self._cardkit_turn_final_text = original
+                    return
         target = self._clean_for_display(authoritative).strip()
         if not target:
             return
@@ -723,6 +811,27 @@ class GatewayStreamConsumer:
                 if delivered and target.startswith(delivered):
                     candidate = delivered
                     break
+
+        if (
+            not accumulated.strip()
+            and self._message_id is None
+            and self._cardkit_last_sealed
+        ):
+            # A rollover sealed the card that already shows this final (or
+            # the segment it extends); only an unseen remainder may open a
+            # new card.
+            sealed = self._clean_for_display(self._cardkit_last_sealed[1]).strip()
+            if sealed.endswith(target):
+                self._cardkit_turn_final_text = original
+                return
+            if candidate and sealed.endswith(candidate):
+                end = _match_prefix_ignoring_whitespace(authoritative, candidate)
+                if end is not None:
+                    rest = authoritative[end:].lstrip()
+                    if self._clean_for_display(rest).strip():
+                        self._accumulated = rest
+                    self._cardkit_turn_final_text = original
+                    return
 
         if candidate and accumulated.endswith(candidate):
             self._accumulated = accumulated[:-len(candidate)] + authoritative
@@ -809,6 +918,7 @@ class GatewayStreamConsumer:
     async def acknowledge_followup(self, receipt: FollowupReceipt) -> None:
         """The receipt becomes the next reply card, but owns no output yet."""
         receipt.accepted = True
+        sent_at = time.monotonic()
         try:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
@@ -818,6 +928,7 @@ class GatewayStreamConsumer:
             )
             if result and result.success and result.message_id:
                 receipt.message_id = str(result.message_id)
+                receipt.card_created_monotonic = sent_at
         except Exception:
             logger.warning("Follow-up receipt failed; create its reply after handoff", exc_info=True)
         finally:
@@ -879,6 +990,44 @@ class GatewayStreamConsumer:
                 receipt.consumed = True
         self._queue.put((_USER_INPUT_BOUNDARY, (completed, receipts)))
         return completed
+
+    async def request_cardkit_rollover(
+        self,
+        *,
+        iteration: Optional[int] = None,
+        max_iterations: Optional[int] = None,
+        timeout: float = 8.0,
+    ) -> str:
+        """Ask the run loop to roll the live CardKit card over (heartbeat).
+
+        Must be awaited on the consumer's event loop. Returns a verdict:
+
+        - ``"rolled"``: the live card was sealed with a progress footer; the
+          next content opens a new card below it.
+        - ``"annotated"``: no live card; the last rolled-over card's footer
+          was refreshed instead.
+        - ``"live"``: the live card is young, still small, mid-paragraph, or
+          about to be created — its own streaming indicator suffices.
+        - ``"finishing"``: the turn is completing.
+        - ``"pending"``: the request is still queued after ``timeout``.
+        - ``"no_card"`` / ``"failed"`` / ``"unsupported"``: the caller should
+          fall back to its own status message.
+        """
+        if not self._cardkit_mode or not self._cardkit_rollover_supported():
+            return "unsupported"
+        if self._finish_requested:
+            return "finishing"
+        if self._closed or not self._run_started:
+            # No run loop will drain the request (it never started, or it
+            # died): let the caller post its own status message.
+            return "no_card"
+        footer_parts = {"iteration": iteration, "max_iterations": max_iterations}
+        future = asyncio.get_running_loop().create_future()
+        self._queue.put((_ROLLOVER, (footer_parts, future)))
+        try:
+            return await asyncio.wait_for(asyncio.shield(future), timeout)
+        except asyncio.TimeoutError:
+            return "pending"
 
     def close_for_approval_prompt(
         self,
@@ -1247,6 +1396,7 @@ class GatewayStreamConsumer:
         (live finding #11).  Callers that cannot know the final yet
         (interrupt/error paths) call ``finish()`` bare — legacy behavior.
         """
+        self._finish_requested = True
         if final_text is not None:
             self._queue.put((_FINAL_TEXT, final_text))
         self._queue.put(_DONE)
@@ -1463,7 +1613,10 @@ class GatewayStreamConsumer:
                 return
 
             self._last_sent_text = final_text
-            self._cardkit_boundary_prefix += self._cardkit_turn_final_text
+            self._cardkit_boundary_prefix += self._cardkit_rollover_head + self._cardkit_turn_final_text
+            self._cardkit_rollover_head = ""
+            self._cardkit_last_sealed = None
+            self._cardkit_stream_expired = False
             self._reset_segment_state(preserve_no_edit=True)
             if receipts:
                 for receipt in receipts[:-1]:
@@ -1482,7 +1635,7 @@ class GatewayStreamConsumer:
                 }
                 self._message_id = receipt.message_id
                 if receipt.message_id:
-                    self._message_created_ts = time.monotonic()
+                    self._message_created_ts = receipt.card_created_monotonic or time.monotonic()
                     self._preview_message_ids.add(receipt.message_id)
                     self._segment_preview_message_ids.add(receipt.message_id)
                 self._notify_new_message()
@@ -1533,8 +1686,236 @@ class GatewayStreamConsumer:
             self._cardkit_boundary_prefix += self._cardkit_turn_final_text
         self._reset_segment_state(preserve_no_edit=True)
 
+    def _cardkit_rollover_supported(self) -> bool:
+        # Class-level lookup so MagicMock adapters never opt in.
+        finalize = getattr(type(self.adapter), "finalize_streaming_message", None)
+        if finalize is None:
+            return False
+        try:
+            return "footer" in inspect.signature(finalize).parameters
+        except (TypeError, ValueError):
+            return False
+
+    def _cardkit_footer(
+        self, *, iteration: Optional[int] = None, max_iterations: Optional[int] = None,
+    ) -> str:
+        elapsed = max(0, int(time.time() - self._started_wall))
+        parts = [f"⏳ 已运行 {elapsed // 60} 分钟" if elapsed >= 60 else f"⏳ 已运行 {elapsed} 秒"]
+        if iteration is not None and max_iterations:
+            parts.append(f"第 {iteration}/{max_iterations} 轮")
+        parts.append("继续 ↓")
+        return " · ".join(parts)
+
+    async def _handle_cardkit_rollover(
+        self,
+        *,
+        reason: str,
+        iteration: Optional[int] = None,
+        max_iterations: Optional[int] = None,
+    ) -> str:
+        """Seal the live CardKit card and continue in a new one.
+
+        ``reason`` is ``"heartbeat"``, ``"age"`` (proactive cap) or
+        ``"expired"`` (Feishu already closed the streaming window).
+        """
+        if not self._cardkit_mode or not self._cardkit_rollover_supported():
+            return "unsupported"
+        if reason == "heartbeat" and self._finish_requested:
+            return "finishing"
+        footer = self._cardkit_footer(iteration=iteration, max_iterations=max_iterations)
+        message_id = self._message_id
+        if message_id and message_id != "__no_edit__":
+            if not self._edit_supported and not self._cardkit_stream_expired:
+                # Permanent (non-TTL) edit failure: keep the legacy fallback.
+                return "failed"
+            cut = self._cardkit_rollover_cut()
+            if reason != "expired":
+                age = time.monotonic() - (self._message_created_ts or time.monotonic())
+                if reason == "heartbeat" and (
+                    age < self._cardkit_min_rollover_age
+                    or (
+                        len(self._clean_for_display(self._accumulated).strip())
+                        < self._cardkit_rollover_min_chars
+                        and age < self._cardkit_small_card_max_age
+                    )
+                ):
+                    # The live card is recent or still small; its own
+                    # streaming indicator is enough of a heartbeat.
+                    return "live"
+                if cut is None:
+                    # Mid-paragraph with no clean cut; the live card is
+                    # visibly streaming right now (the TTL path still seals).
+                    return "live"
+                # An accepted follow-up receipt becomes the next reply card
+                # at its handoff; a rollover card would sit below it.
+                with self._followup_lock:
+                    if any(r.accepted and not r.consumed for r in self._followups):
+                        return "live"
+            if await self._seal_and_detach_cardkit_card(
+                footer, cut=len(self._accumulated) if cut is None else cut,
+            ):
+                return "rolled"
+            return "failed"
+        if message_id is None and self._clean_for_display(self._accumulated).strip():
+            return "live"
+        if reason == "heartbeat" and self._cardkit_last_sealed and message_id is None:
+            # Nothing new since the last seal (e.g. the model is thinking):
+            # refresh that card's footer instead of posting a status bubble.
+            sealed_id, sealed_text = self._cardkit_last_sealed
+            if await self._update_sealed_cardkit_card(sealed_id, sealed_text, footer=footer):
+                return "annotated"
+            return "failed"
+        return "no_card"
+
+    def _cardkit_rollover_cut(self, *, limit: Optional[int] = None) -> Optional[int]:
+        """Where the live card can be cut without breaking Markdown.
+
+        Returns an index into ``_accumulated``: everything before it is
+        sealed, the rest (an unfinished paragraph, table or code block of the
+        current assistant text) is carried into the next card. ``None`` means
+        only a mid-paragraph cut is possible. With ``limit`` the sealed part
+        must fit in that many characters (card size limit).
+        """
+        acc = self._accumulated
+        if limit is not None and len(acc) > limit:
+            for sep in ("\n\n", "\n"):
+                pos = limit
+                while pos > 0:
+                    idx = acc.rfind(sep, 0, pos)
+                    if idx <= 0:
+                        break
+                    cut = idx + len(sep)
+                    if not _has_open_code_fence(acc[:cut]):
+                        return cut
+                    pos = idx
+            return None
+        turn = self._cardkit_turn_final_text
+        if not turn or not acc.endswith(turn):
+            # The card ends with complete progress lines.
+            return len(acc)
+        start = len(acc) - len(turn)
+        pos = len(acc)
+        while pos > start:
+            idx = acc.rfind("\n\n", start, pos)
+            if idx < 0:
+                break
+            cut = idx + 2
+            prev = acc.rfind("\n\n", start, idx)
+            before = acc[(prev + 2 if prev >= 0 else start):idx].strip()
+            if before.startswith("#") and "\n" not in before:
+                # Keep a heading with the paragraph it introduces.
+                pos = idx
+                continue
+            if cut > start and not _has_open_code_fence(acc[:cut]):
+                return cut
+            pos = idx
+        if start > 0 and acc[start - 1] == "\n" and not _has_open_code_fence(acc[:start]):
+            return start
+        return None
+
+    async def _seal_and_detach_cardkit_card(self, footer: str, *, cut: Optional[int] = None) -> bool:
+        """Seal the live card with ``footer``; only a literal True ACK detaches.
+
+        ``_accumulated[cut:]`` (part of the current assistant text) moves to
+        the next card instead of being sealed.
+        """
+        message_id = self._message_id
+        acc = self._accumulated
+        cut = len(acc) if cut is None else max(0, min(cut, len(acc)))
+        carry = acc[cut:]
+        sealed = ensure_closed_code_fences(
+            self._clean_for_display(acc[:cut] or self._last_sent_text or "")
+        ).rstrip()
+        if not message_id or not sealed.strip():
+            return False
+        committed = False
+        for attempt in range(2):
+            try:
+                committed = await self.adapter.finalize_streaming_message(
+                    message_id, sealed, footer=footer,
+                ) is True
+            except Exception:
+                logger.warning("CardKit rollover seal failed (attempt %s)", attempt + 1, exc_info=True)
+            if committed:
+                break
+            if attempt == 0:
+                await asyncio.sleep(0.25)
+        if not committed:
+            # Content stays in the live card; the turn-final finalize still
+            # lands everything there. Don't retry on every tick.
+            self._cardkit_rollover_retry_at = time.monotonic() + 5.0
+            return False
+        logger.info(
+            "CardKit card %s rolled over after %.0fs (%d chars sealed, %d carried)",
+            message_id,
+            time.monotonic() - (self._message_created_ts or time.monotonic()),
+            len(sealed),
+            len(carry),
+        )
+        turn = self._cardkit_turn_final_text
+        carried_turn = ""
+        if carry and turn:
+            if turn.endswith(carry):
+                carried_turn = carry
+            elif carry.endswith(turn):
+                carried_turn = turn
+        self._cardkit_rollover_head += turn[: len(turn) - len(carried_turn)]
+        self._cardkit_last_sealed = (message_id, sealed)
+        self._cardkit_rollovers += 1
+        self._last_sent_text = sealed
+        self._reset_segment_state(preserve_no_edit=True)
+        # Transport state is per card: the new card starts healthy.
+        self._already_sent = False
+        self._edit_supported = True
+        self._consecutive_failures = 0
+        self._flood_strikes = 0
+        self._current_edit_interval = self.cfg.edit_interval
+        self._last_edit_overflowed = False
+        self._cardkit_stream_expired = False
+        self._cardkit_rollover_retry_at = 0.0
+        if carry:
+            self._accumulated = carry
+            self._stream_ledger = carry
+            self._cardkit_turn_final_text = carried_turn
+        return True
+
+    async def _update_sealed_cardkit_card(
+        self, message_id: str, text: str, *, footer: Optional[str] = None, stopped: bool = False,
+    ) -> bool:
+        update = getattr(type(self.adapter), "update_sealed_streaming_message", None)
+        if update is None:
+            return False
+        try:
+            return await self.adapter.update_sealed_streaming_message(
+                message_id, text, footer=footer, stopped=stopped,
+            ) is True
+        except Exception:
+            logger.warning("CardKit sealed-card update failed for %s", message_id, exc_info=True)
+            return False
+
+    async def _complete_on_last_sealed_card(self) -> None:
+        """Turn ended right after a rollover: the reply already sits in the
+        last sealed card, so restatus it as complete instead of opening an
+        empty card (and don't let the gateway resend the answer)."""
+        sealed_id, sealed_text = self._cardkit_last_sealed
+        # The content itself was ACKed by the rollover seal; commit delivery
+        # before the cosmetic restatus so a cancellation can't undo it.
+        self._message_id = sealed_id
+        self._already_sent = True
+        self._final_response_sent = True
+        self._final_content_delivered = True
+        self._record_turn_final_payload(sealed_text)
+        if not await self._update_sealed_cardkit_card(sealed_id, sealed_text):
+            logger.info("CardKit card %s keeps its rollover footer (restatus failed)", sealed_id)
+        if getattr(type(self.adapter), "on_streaming_message_complete", None) is not None:
+            try:
+                await self.adapter.on_streaming_message_complete(sealed_id)
+            except Exception as exc:
+                logger.warning("on_streaming_message_complete failed: %s", exc)
+
     async def run(self) -> None:
         """Async task that drains the queue and edits the platform message."""
+        self._run_started = True
         # Platform message length limit — leave room for cursor + formatting.
         # Use the adapter's length function (e.g. utf16_len for Telegram) so
         # overflow detection matches what the platform actually enforces.
@@ -1616,6 +1997,7 @@ class GatewayStreamConsumer:
                 got_segment_break = False
                 preserve_cardkit_final_segment = False
                 user_input_boundary_done = None
+                rollover_request = None
                 got_flush = False
                 flush_event = None
                 got_approval_boundary = False
@@ -1643,6 +2025,9 @@ class GatewayStreamConsumer:
                         ):
                             user_input_boundary_done = item[1]
                             break
+                        if isinstance(item, tuple) and len(item) == 2 and item[0] is _ROLLOVER:
+                            rollover_request = item[1]
+                            break
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _FINAL_TEXT:
                             # Authoritative turn-final payload (see finish()).
                             # Adopt it as the finalize content so the seal /
@@ -1661,6 +2046,7 @@ class GatewayStreamConsumer:
                                 self._accumulated
                                 or self._message_id
                                 or self._last_sent_text
+                                or self._cardkit_rollovers
                             )
                             if self._cardkit_mode:
                                 if _streamed_something:
@@ -1711,6 +2097,17 @@ class GatewayStreamConsumer:
                             approval_boundary_cancelled = item[2]
                             break
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
+                            if self._cardkit_mode:
+                                # CardKit keeps one cumulative card: show the
+                                # commentary in it (like progress, outside the
+                                # final-answer segment) instead of dropping it.
+                                note = self._clean_for_display(item[1]).strip()
+                                if note:
+                                    if self._accumulated:
+                                        self._accumulated += "\n" if self._accumulated.endswith("\n") else "\n\n"
+                                    self._accumulated += note + "\n"
+                                    self._delivered_commentary_texts.append(note)
+                                continue
                             commentary_text = item[1]
                             break
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _PROGRESS:
@@ -1759,6 +2156,42 @@ class GatewayStreamConsumer:
                         boundary_event.set()
                     await asyncio.sleep(0.05)
                     continue
+
+                if rollover_request is not None:
+                    footer_parts, rollover_future = rollover_request
+                    verdict = "failed"
+                    try:
+                        verdict = await self._handle_cardkit_rollover(
+                            reason="heartbeat", **footer_parts,
+                        )
+                    finally:
+                        if not rollover_future.done():
+                            rollover_future.set_result(verdict)
+                    await asyncio.sleep(0.05)
+                    continue
+
+                # CardKit streaming window: seal before Feishu's ~600 s cutoff
+                # (age), or right after it hit (expired), and keep streaming
+                # into a fresh card. Never on got_done — the final full-card
+                # replacement still works on an expired card.
+                if (
+                    self._cardkit_mode
+                    and not got_done
+                    and not self._finish_requested
+                    and self._message_id not in (None, "__no_edit__")
+                    and time.monotonic() >= self._cardkit_rollover_retry_at
+                ):
+                    _card_age = time.monotonic() - (self._message_created_ts or time.monotonic())
+                    _rollover_reason = None
+                    if self._cardkit_stream_expired:
+                        _rollover_reason = "expired"
+                    elif (
+                        _card_age >= self._cardkit_max_card_age
+                        and self._accumulated != self._last_sent_text
+                    ):
+                        _rollover_reason = "age"
+                    if _rollover_reason:
+                        await self._handle_cardkit_rollover(reason=_rollover_reason)
 
                 # Handle approval boundary: close current stream, reset for new turn.
                 # Must happen before got_done/segment_break processing since it
@@ -1873,7 +2306,13 @@ class GatewayStreamConsumer:
                             # it's a debounce heuristic ("send updates roughly
                             # every N visible characters"), not a platform-limit
                             # check. _len_fn is reserved for overflow detection.
-                            or len(self._accumulated) >= self.cfg.buffer_threshold
+                            # CardKit sends the whole card on every edit, so a
+                            # size trigger would fire on every tick once the
+                            # card passes the threshold; pace it by time only.
+                            or (
+                                not self._cardkit_mode
+                                and len(self._accumulated) >= self.cfg.buffer_threshold
+                            )
                         )
 
                 current_update_visible = False
@@ -1904,6 +2343,20 @@ class GatewayStreamConsumer:
                 ):
                     should_edit = False
                 if should_edit and (self._accumulated or (self._use_native_streaming and self._tool_progress_active)):
+                    # CardKit: a card that outgrows the element limit is
+                    # sealed at a clean boundary and continued in a new card
+                    # (the legacy split below never seals its head cards).
+                    if (
+                        self._cardkit_mode
+                        and self._message_id not in (None, "__no_edit__")
+                        and _len_fn(self._accumulated) > _safe_limit
+                        and self._cardkit_rollover_supported()
+                    ):
+                        _overflow_cut = self._cardkit_rollover_cut(limit=_safe_limit)
+                        if _overflow_cut:
+                            await self._seal_and_detach_cardkit_card(
+                                self._cardkit_footer(), cut=_overflow_cut,
+                            )
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
                     # Native streaming bypasses this entirely — the adapter's
@@ -2075,6 +2528,9 @@ class GatewayStreamConsumer:
                         and self._use_draft_streaming
                         and self._message_id is None
                     )
+                    # Edits already known to be skipped (permanent fallback)
+                    # make no API call and must not back off.
+                    _edit_skipped = self._message_id is not None and not self._edit_supported
                     current_update_visible = await self._send_or_edit(
                         display_text,
                         finalize=(got_done or got_segment_break),
@@ -2085,10 +2541,14 @@ class GatewayStreamConsumer:
                     self._last_edit_time = time.monotonic()
                     # Backoff on failed edits to avoid hammering the API
                     # (especially CardKit streaming which can hit SSL errors).
+                    # Never on the got_done tick: the finalize must start well
+                    # inside the gateway's 5 s join, or the turn is cancelled
+                    # into a stopped card and the answer is resent separately.
                     if not current_update_visible:
-                        self._consecutive_failures = getattr(self, "_consecutive_failures", 0) + 1
-                        _backoff = min(0.5 * self._consecutive_failures, 5.0)
-                        await asyncio.sleep(_backoff)
+                        if not (got_done or _edit_skipped or self._cardkit_stream_expired):
+                            self._consecutive_failures += 1
+                            _backoff = min(0.5 * self._consecutive_failures, 5.0)
+                            await asyncio.sleep(_backoff)
                     else:
                         self._consecutive_failures = 0
                     # Reset tool_progress_active flag after frame delivery —
@@ -2099,6 +2559,15 @@ class GatewayStreamConsumer:
                         self._tool_progress_active = False
 
                 if got_done:
+                    if (
+                        self._cardkit_mode
+                        and self._message_id is None
+                        and self._cardkit_last_sealed
+                        and not self._clean_for_display(self._accumulated).strip()
+                    ):
+                        await self._notify_before_finalize()
+                        await self._complete_on_last_sealed_card()
+                        return
                     if self._accumulated or self._message_id is not None or self._already_sent:
                         await self._notify_before_finalize()
                     # Final edit without cursor. If progressive editing failed
@@ -2392,9 +2861,19 @@ class GatewayStreamConsumer:
                         finalized = self._clean_for_display(
                             self._cardkit_turn_final_text
                         ).strip()
+                        if self._cardkit_rollover_head:
+                            # The segment spans rolled-over cards; keep it
+                            # whole for has_delivered_text().
+                            whole = self._clean_for_display(
+                                self._cardkit_rollover_head + self._cardkit_turn_final_text
+                            ).strip()
+                            if whole and whole != finalized:
+                                self._delivered_segment_texts.append(whole)
                         if finalized:
                             self._delivered_segment_texts.append(finalized)
                         self._cardkit_turn_final_text = ""
+                        self._cardkit_prev_rollover_head = self._cardkit_rollover_head
+                        self._cardkit_rollover_head = ""
 
                 # Flush barrier satisfied: the buffered segment (if any) has now
                 # been finalized and delivered above, so wake the thread blocked
@@ -2423,6 +2902,11 @@ class GatewayStreamConsumer:
                     )
                 except Exception:
                     pass
+            elif self._message_id is None and self._cardkit_mode and self._cardkit_last_sealed:
+                # Stopped right after a rollover: don't leave the last card
+                # promising "继续 ↓".
+                _sealed_id, _sealed_text = self._cardkit_last_sealed
+                await self._update_sealed_cardkit_card(_sealed_id, _sealed_text, stopped=True)
             elif self._message_id is None:
                 # Native draft path deliberately keeps _message_id=None, so
                 # the best-effort edit above never runs for it — the stream
@@ -2491,6 +2975,9 @@ class GatewayStreamConsumer:
                         self._signal_flush(item[1])
                     elif isinstance(item, tuple) and len(item) == 2 and item[0] is _USER_INPUT_BOUNDARY:
                         item[1][0].set()
+                    elif isinstance(item, tuple) and len(item) == 2 and item[0] is _ROLLOVER:
+                        if not item[1][1].done():
+                            item[1][1].set_result("finishing")
             except queue.Empty:
                 pass
             except Exception:
@@ -3854,7 +4341,12 @@ class GatewayStreamConsumer:
                             self._message_created_ts = time.monotonic()
                             self._last_sent_text = ""
                             self._notify_new_message()
-                        else:
+                        elif not (
+                            isinstance(getattr(result, "raw_response", None), dict)
+                            and result.raw_response.get("cardkit_rate_limited")
+                        ):
+                            # (A rate-limited CardKit frame was skipped; leave
+                            # _last_sent_text so the next tick resends it.)
                             self._last_sent_text = text
                         # Successful edit — reset flood strike counter
                         self._flood_strikes = 0
@@ -3886,6 +4378,17 @@ class GatewayStreamConsumer:
                             # duplicate #45517 fixed (#36965 / #25349).
                             self._record_turn_final_payload(text)
                         raw_response = getattr(result, "raw_response", None)
+                        if (
+                            self._cardkit_mode
+                            and isinstance(raw_response, dict)
+                            and raw_response.get("cardkit_stream_expired")
+                        ):
+                            # Feishu closed this card's streaming window. The
+                            # card is intact: the run loop seals it and keeps
+                            # streaming into a new card (never permanent
+                            # fallback, which froze long replies until the end).
+                            self._cardkit_stream_expired = True
+                            return False
                         if isinstance(raw_response, dict) and raw_response.get("partial_overflow"):
                             # Telegram edited/sent one or more overflow chunks,
                             # but not the complete response.  Preserve the
@@ -3971,7 +4474,7 @@ class GatewayStreamConsumer:
                         # turn-final Telegram flood skips this cosmetic edit:
                         # another edit would consume the same flood budget and
                         # delay the fallback send that carries the answer.
-                        if not immediate_final_fallback:
+                        if not immediate_final_fallback and not self._cardkit_mode:
                             await self._try_strip_cursor()
                         return False
                 else:

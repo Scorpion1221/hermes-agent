@@ -266,16 +266,20 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
                          "extra_ua_tags must be ['channel'] to enable group event routing")
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_edit_message_updates_existing_feishu_message(self):
+    def test_edit_message_patches_interactive_card(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        captured = {}
+        captured = {"patch": [], "update": []}
 
         class _MessageAPI:
+            def patch(self, request):
+                captured["patch"].append(request)
+                return SimpleNamespace(success=lambda: True)
+
             def update(self, request):
-                captured["request"] = request
+                captured["update"].append(request)
                 return SimpleNamespace(success=lambda: True)
 
         adapter._client = SimpleNamespace(
@@ -300,10 +304,12 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(result.message_id, "om_progress")
-        self.assertEqual(captured["request"].message_id, "om_progress")
-        # All outbound messages are now Feishu Card 2.0 (interactive).
-        self.assertEqual(captured["request"].request_body.msg_type, "interactive")
-        card = json.loads(captured["request"].request_body.content)
+        # Outbound messages are Card 2.0 (interactive); the PUT update API
+        # cannot edit cards, so they are PATCHed with the full card JSON.
+        self.assertEqual(captured["update"], [])
+        request = captured["patch"][0]
+        self.assertEqual(request.message_id, "om_progress")
+        card = json.loads(request.request_body.content)
         self.assertEqual(card["schema"], "2.0")
         self.assertEqual(
             card["body"]["elements"],
@@ -311,14 +317,19 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_edit_message_falls_back_to_text_when_card_update_is_rejected(self):
+    def test_edit_message_falls_back_to_put_when_patch_is_rejected(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        captured = {"calls": []}
+        captured = {"patch": [], "calls": []}
 
         class _MessageAPI:
+            def patch(self, request):
+                # e.g. the message went out as a text fallback
+                captured["patch"].append(request)
+                return SimpleNamespace(success=lambda: False, code=230001, msg="not a card")
+
             def update(self, request):
                 captured["calls"].append(request)
                 if len(captured["calls"]) == 1:
@@ -350,12 +361,48 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
+        self.assertEqual(len(captured["patch"]), 1)
         self.assertEqual(captured["calls"][0].request_body.msg_type, "interactive")
         self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
         self.assertEqual(
             captured["calls"][1].request_body.content,
             json.dumps({"text": "可以用 粗体 和 斜体。"}, ensure_ascii=False),
         )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_edit_message_never_patches_cardkit_card_messages(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._remember_cardkit_message("om_card")
+        captured = {"patch": [], "update": []}
+
+        class _MessageAPI:
+            def patch(self, request):
+                captured["patch"].append(request)
+                return SimpleNamespace(success=lambda: True)
+
+            def update(self, request):
+                captured["update"].append(request)
+                return SimpleNamespace(success=lambda: False, code=230001, msg="unsupported")
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.edit_message(chat_id="oc_chat", message_id="om_card", content="final")
+            )
+
+        # A plain card JSON would replace the CardKit card entity; leave the
+        # message alone and report the failure as before.
+        self.assertEqual(captured["patch"], [])
+        self.assertFalse(result.success)
 
 
 class TestAdapterModule(unittest.TestCase):

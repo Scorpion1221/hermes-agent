@@ -13,6 +13,18 @@ logger = logging.getLogger(__name__)
 
 STREAMING_ELEMENT_ID = "streaming_content"
 LOADING_ELEMENT_ID = "streaming_loading"
+
+# CardKit response codes the streaming path reacts to.
+CARDKIT_RATE_LIMITED = 230020
+# Feishu closes a card's streaming mode ~600 s after the card is created. The
+# next element update then fails with 200850 ("card streaming timeout"), and
+# later ones with 300309 ("streaming mode is closed"). The card itself stays
+# valid: settings + full card.update still succeed, so the content can be
+# sealed and the rest of the reply continued in a fresh card.
+CARDKIT_STREAMING_TIMEOUT = 200850
+CARDKIT_STREAMING_CLOSED = 300309
+CARDKIT_STREAM_EXPIRED_CODES = frozenset({CARDKIT_STREAMING_TIMEOUT, CARDKIT_STREAMING_CLOSED})
+CARDKIT_SEQUENCE_CONFLICT = 300317
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,}).*$")
 _MARKDOWN_ATX_HEADING_RE = re.compile(
     r"^(?P<indent>[ ]{0,3})(?P<marks>#{1,6})(?P<rest>(?:[ \t]+.*)?)$"
@@ -42,6 +54,22 @@ class CardKitState:
     last_content: str = ""
     stopped: bool = False
     reply_to_message_id: str = ""
+    # Wall clock right after card.create — the streaming TTL counts from here.
+    created_at: float = 0.0
+    # Feishu closed the streaming window (CARDKIT_STREAM_EXPIRED_CODES).
+    expired: bool = False
+    # Origin for the "耗时" footer. Cards that continue a rolled-over reply
+    # measure from the reply's start instead of their own creation.
+    elapsed_origin: float = 0.0
+    # Raw text of the last full-card update, for later footer-only updates.
+    sealed_text: str = ""
+
+
+@dataclass
+class CardKitCallResult:
+    ok: bool
+    code: Optional[int] = None
+    msg: str = ""
 
 
 def _split_line_ending(line: str) -> tuple[str, str]:
@@ -177,7 +205,14 @@ def build_streaming_card_body() -> dict:
     }
 
 
-def build_final_card_body(content: str, *, elapsed_seconds: float = 0.0, stopped: bool = False, status: str = "") -> dict:
+def build_final_card_body(
+    content: str,
+    *,
+    elapsed_seconds: float = 0.0,
+    stopped: bool = False,
+    status: str = "",
+    footer: Optional[str] = None,
+) -> dict:
     elements: list[dict] = [
         {
             "tag": "markdown",
@@ -186,7 +221,16 @@ def build_final_card_body(content: str, *, elapsed_seconds: float = 0.0, stopped
             "text_size": "normal_v2",
         },
     ]
-    if elapsed_seconds > 0 or status:
+    if footer is not None:
+        # Verbatim footer, e.g. a rolled-over card's "继续 ↓" line.
+        if footer:
+            elements.append({
+                "tag": "markdown",
+                "content": footer,
+                "text_size": "notation",
+                "text_align": "left",
+            })
+    elif elapsed_seconds > 0 or status:
         if elapsed_seconds >= 60:
             mins = int(elapsed_seconds // 60)
             secs = int(elapsed_seconds % 60)
@@ -269,6 +313,15 @@ async def create_streaming_card(client: Any) -> Optional[str]:
 async def stream_card_element(
     client: Any, *, card_id: str, element_id: str, content: str, sequence: int,
 ) -> bool:
+    result = await stream_card_element_result(
+        client, card_id=card_id, element_id=element_id, content=content, sequence=sequence,
+    )
+    return result.ok
+
+
+async def stream_card_element_result(
+    client: Any, *, card_id: str, element_id: str, content: str, sequence: int,
+) -> CardKitCallResult:
     # Render raw streaming text only at the Feishu CardKit API boundary.  Do not
     # write this card-specific Markdown back to CardKitState or conversation
     # state; doing so would make a later final render downshift headings again.
@@ -294,15 +347,22 @@ async def stream_card_element(
 
     response = await asyncio.to_thread(client.cardkit.v1.card_element.content, request)
     if not response or not getattr(response, "success", lambda: False)():
-        code = getattr(response, "code", 0)
-        if code == 230020:
-            return True
+        raw_code = getattr(response, "code", 0)
+        try:
+            code = int(raw_code)
+        except (TypeError, ValueError):
+            code = None
+        msg = str(getattr(response, "msg", "?"))
+        if code == CARDKIT_RATE_LIMITED:
+            # Every call carries the full content, so a skipped frame is
+            # repaired by the next one.
+            return CardKitCallResult(ok=True, code=code, msg=msg)
         logger.info(
             "[CardKit] Stream content failed: code=%s msg=%s",
-            code, getattr(response, "msg", "?"),
+            raw_code, msg,
         )
-        return False
-    return True
+        return CardKitCallResult(ok=False, code=code, msg=msg)
+    return CardKitCallResult(ok=True)
 
 
 async def update_card(
@@ -382,12 +442,19 @@ def build_card_id_message_content(card_id: str) -> str:
 __all__ = [
     "STREAMING_ELEMENT_ID",
     "LOADING_ELEMENT_ID",
+    "CARDKIT_RATE_LIMITED",
+    "CARDKIT_STREAMING_TIMEOUT",
+    "CARDKIT_STREAMING_CLOSED",
+    "CARDKIT_STREAM_EXPIRED_CODES",
+    "CARDKIT_SEQUENCE_CONFLICT",
+    "CardKitCallResult",
     "CardKitState",
     "build_streaming_card_body",
     "build_final_card_body",
     "render_markdown_for_card",
     "create_streaming_card",
     "stream_card_element",
+    "stream_card_element_result",
     "update_card",
     "set_card_streaming_mode",
     "build_card_id_message_content",

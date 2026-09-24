@@ -445,3 +445,167 @@ async def test_successful_cardkit_finalize_suppresses_generic_fallback_after_edi
     assert consumer.final_response_sent is True
     assert consumer.final_content_delivered is True
     adapter.on_streaming_message_complete.assert_awaited_once_with("om_1")
+
+
+# ── Streaming-window expiry and card rollover (adapter side) ───────────────
+
+
+def _content_client(responses):
+    """Fake lark client whose card_element.content replies from ``responses``."""
+    calls = []
+
+    def content(req):
+        calls.append(req)
+        return responses[min(len(calls), len(responses)) - 1]
+
+    client = SimpleNamespace(
+        cardkit=SimpleNamespace(v1=SimpleNamespace(card_element=SimpleNamespace(content=content))),
+    )
+    return client, calls
+
+
+def _ok():
+    return SimpleNamespace(success=lambda: True)
+
+
+def _fail(code, msg="error"):
+    return SimpleNamespace(success=lambda: False, code=code, msg=msg)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [200850, 300309])
+async def test_closed_streaming_window_is_reported_without_disabling_the_card(code):
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client, calls = _content_client([_fail(code, "card streaming timeout")])
+    state = CardKitState(card_id="ck_1", message_id="om_1", sequence=5, created_at=time.time() - 600)
+    adapter._streaming_cards["om_1"] = state
+
+    first = await adapter.edit_message("oc_chat", "om_1", "more text")
+    second = await adapter.edit_message("oc_chat", "om_1", "even more text")
+
+    for result in (first, second):
+        assert result.success is False
+        assert result.raw_response["cardkit_stream_expired"] is True
+    assert state.expired is True
+    # Not ``failed``: that would reroute later edits to the IM update API.
+    assert state.failed is False
+    # Known-closed windows are not retried against the API.
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_sequence_conflict_retries_once_with_the_next_number():
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client, calls = _content_client([_fail(300317, "sequence number compare failed"), _ok()])
+    state = CardKitState(card_id="ck_1", message_id="om_1", sequence=5)
+    adapter._streaming_cards["om_1"] = state
+
+    result = await adapter.edit_message("oc_chat", "om_1", "text")
+
+    assert result.success is True
+    assert [c.request_body.sequence for c in calls] == [6, 7]
+    assert state.failed is False
+
+
+@pytest.mark.asyncio
+async def test_other_stream_failures_still_mark_the_card_failed():
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client, _calls = _content_client([_fail(99991, "internal error")])
+    state = CardKitState(card_id="ck_1", message_id="om_1", sequence=5)
+    adapter._streaming_cards["om_1"] = state
+
+    result = await adapter.edit_message("oc_chat", "om_1", "text")
+
+    assert result.success is False
+    assert not result.raw_response
+    assert state.failed is True
+
+
+@pytest.mark.asyncio
+async def test_rollover_seal_uses_verbatim_footer_and_card_stays_updatable():
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client = object()
+    state = CardKitState(card_id="ck_1", message_id="om_1", sequence=7, started_at=time.time() - 300)
+    adapter._streaming_cards["om_1"] = state
+    calls = []
+
+    async def close_stream(_client, **kwargs):
+        calls.append(("close", kwargs))
+        return True
+
+    async def update_card_body(_client, **kwargs):
+        calls.append(("update", kwargs))
+        return True
+
+    with (
+        patch("plugins.platforms.feishu.adapter.set_card_streaming_mode", side_effect=close_stream),
+        patch("plugins.platforms.feishu.adapter.cardkit_update_card", side_effect=update_card_body),
+    ):
+        sealed = await adapter.finalize_streaming_message(
+            "om_1", "part one", footer="⏳ 已运行 5 分钟 · 继续 ↓",
+        )
+        restatused = await adapter.update_sealed_streaming_message(
+            "om_1", footer="⏳ 已运行 8 分钟 · 仍在处理…",
+        )
+        completed = await adapter.update_sealed_streaming_message("om_1", "part one")
+
+    assert (sealed, restatused, completed) == (True, True, True)
+    assert "om_1" not in adapter._streaming_cards
+    bodies = [kwargs for name, kwargs in calls if name == "update"]
+    assert [b["sequence"] for b in bodies] == [9, 10, 11]
+    footers = [b["card_body"]["body"]["elements"][-1]["content"] for b in bodies]
+    assert footers[0] == "⏳ 已运行 5 分钟 · 继续 ↓"
+    assert footers[1] == "⏳ 已运行 8 分钟 · 仍在处理…"
+    assert footers[2].startswith("已完成 · 耗时 5m")
+    # The sealed text is reused for footer-only updates.
+    assert all(b["card_body"]["body"]["elements"][0]["content"] == "part one" for b in bodies)
+
+
+@pytest.mark.asyncio
+async def test_expired_card_seals_even_if_settings_call_is_rejected():
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client = object()
+    state = CardKitState(card_id="ck_1", message_id="om_1", sequence=7, expired=True)
+    adapter._streaming_cards["om_1"] = state
+
+    with (
+        patch("plugins.platforms.feishu.adapter.set_card_streaming_mode", new=AsyncMock(return_value=False)),
+        patch("plugins.platforms.feishu.adapter.cardkit_update_card", new=AsyncMock(return_value=True)),
+    ):
+        assert await adapter.finalize_streaming_message("om_1", "content", footer="继续 ↓") is True
+
+
+@pytest.mark.asyncio
+async def test_continuation_card_reports_the_whole_reply_elapsed_time():
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client = object()
+    started = time.time() - 700
+    state = CardKitState(
+        card_id="ck_2", message_id="om_2", sequence=3,
+        started_at=time.time() - 30, elapsed_origin=started,
+    )
+    adapter._streaming_cards["om_2"] = state
+    update = AsyncMock(return_value=True)
+
+    with (
+        patch("plugins.platforms.feishu.adapter.set_card_streaming_mode", new=AsyncMock(return_value=True)),
+        patch("plugins.platforms.feishu.adapter.cardkit_update_card", new=update),
+    ):
+        await adapter.finalize_streaming_message("om_2", "the end")
+
+    footer = update.await_args.kwargs["card_body"]["body"]["elements"][-1]["content"]
+    assert footer.startswith("已完成 · 耗时 11m")
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_frame_is_reported_as_skipped():
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client, _calls = _content_client([_fail(230020, "rate limited")])
+    state = CardKitState(card_id="ck_1", message_id="om_1", sequence=5)
+    adapter._streaming_cards["om_1"] = state
+
+    result = await adapter.edit_message("oc_chat", "om_1", "text")
+
+    assert result.success is True
+    assert result.raw_response == {"cardkit_rate_limited": True}
+    assert state.failed is False and state.expired is False

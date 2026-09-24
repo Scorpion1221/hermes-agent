@@ -31261,6 +31261,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # who want it can opt in per platform.
                 _agent_ref = agent_holder[0]
                 _status_detail = ""
+                _hb_iteration = None
+                _hb_max_iterations = None
                 _want_iteration_detail = bool(
                     resolve_display_setting(
                         user_config,
@@ -31277,6 +31279,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _parts.append(
                                 f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
                             )
+                            _hb_iteration = _a.get("api_call_count")
+                            _hb_max_iterations = _a.get("max_iterations")
                         _action = _a.get("current_tool") or _a.get("last_activity_desc")
                         if _action:
                             _parts.append(str(_action))
@@ -31289,6 +31293,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _long_running_mode == "generic"
                     else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
                 )
+                # Feishu CardKit: instead of stacking a status bubble under a
+                # long reply, seal the live card with a progress footer and
+                # continue in a new card. Short-lived cards also stay inside
+                # Feishu's ~10 min streaming window.
+                _hb_consumer = stream_consumer_holder[0]
+                if (
+                    _hb_consumer is not None
+                    and getattr(_hb_consumer, "cardkit_mode", False) is True
+                    and callable(getattr(type(_hb_consumer), "request_cardkit_rollover", None))
+                ):
+                    try:
+                        _hb_verdict = await _hb_consumer.request_cardkit_rollover(
+                            iteration=_hb_iteration,
+                            max_iterations=_hb_max_iterations,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.debug("CardKit heartbeat rollover failed", exc_info=True)
+                        _hb_verdict = "failed"
+                    if _hb_verdict in {"rolled", "annotated", "live", "finishing", "pending"}:
+                        continue
                 try:
                     _notify_res = None
                     if _heartbeat_msg_id:
