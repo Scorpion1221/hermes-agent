@@ -125,3 +125,24 @@ class TestVolcEngineXmlPollution:
         # rest of the pipeline (fuzzy match at 0.7 cutoff) can still
         # recover the obvious target.
         assert repair('"terminal"') == "terminal"
+
+
+class TestProxyCloakSuffix:
+    """Proxies that cloak tool names for Claude OAuth (9router appends
+    ``_ide``) can leak the suffix; once a leaked name is replayed it is
+    suffixed again, so the model emits stacked suffixes."""
+
+    @pytest.mark.parametrize("name,expected", [
+        ("terminal_ide", "terminal"),
+        ("terminal_ide_ide", "terminal"),
+        ("execute_code_ide_ide_ide", "execute_code"),
+        ("patch_ide_ide", "patch"),
+        ("read_file-ide", "read_file"),
+        ("Browser_Click_IDE_ide", "browser_click"),
+    ])
+    def test_stacked_cloak_suffixes_are_stripped(self, repair, name, expected):
+        assert repair(name) == expected
+
+    def test_suffix_strip_only_accepts_real_tools(self, repair):
+        # No real tool behind the suffixes: don't invent one.
+        assert repair("zzqx_ide_ide") is None

@@ -3759,7 +3759,12 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
        Claude-style models sometimes tack on (TodoTool_tool ->
        TodoTool -> Todo -> todo). Applied twice so double-tacked
        suffixes like ``TodoTool_tool`` reduce all the way.
-    5. Fuzzy match (difflib, cutoff=0.7).
+    5. Strip every trailing ``_ide`` / ``-ide``: proxies that cloak tool
+       names for Claude OAuth accounts (e.g. 9router) append ``_ide`` to
+       each tool and to past calls in history. A leaked name that gets
+       replayed is suffixed again, so the model starts emitting
+       ``terminal_ide_ide`` — beyond the fuzzy cutoff.
+    6. Fuzzy match (difflib, cutoff=0.7).
 
     See #14784 for the original reports (TodoTool_tool, Patch_tool,
     BrowserClick_tool were all returning "Unknown tool" before).
@@ -3806,6 +3811,10 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
                 return s[: -len(suffix)].rstrip("_-")
         return None
 
+    def _strip_cloak_suffix(s: str) -> str | None:
+        stripped = re.sub(r"(?:[_-]ide)+$", "", s, flags=re.IGNORECASE)
+        return stripped if stripped and stripped != s else None
+
     # Cheap fast-paths first — these cover the common case.
     lowered = tool_name.lower()
     if lowered in agent.valid_tool_names:
@@ -3816,6 +3825,10 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
 
     # Build the full candidate set for class-like emissions.
     cands: set[str] = {tool_name, lowered, normalized, _camel_snake(tool_name)}
+    for c in list(cands):
+        uncloaked = _strip_cloak_suffix(c)
+        if uncloaked:
+            cands |= {uncloaked, _norm(uncloaked), _camel_snake(uncloaked)}
     # Strip trailing tool-suffix up to twice — TodoTool_tool needs it.
     for _ in range(2):
         extra: set[str] = set()
