@@ -689,6 +689,26 @@ def _estimate_chunk_bytes(chunk: Any) -> int:
     return size
 
 
+def _set_watchdog_timeout(result: dict, message: str, *, owns_error: bool = True) -> None:
+    """Record a watchdog kill as a TimeoutError.
+
+    The kill aborted a call that was still running, so for a Responses
+    stream any transport error the worker raised afterwards (e.g. "peer
+    closed connection") is our own doing. Surfacing that error instead
+    would misclassify the failure (a disconnect on a large session reads as
+    context overflow and triggers compression); the worker's error is kept
+    as the cause. ``owns_error=False`` keeps a worker error that already
+    arrived (legacy non-streaming behavior).
+    """
+    if result["response"] is not None:
+        return
+    if result["error"] is not None and not owns_error:
+        return
+    error = TimeoutError(message)
+    error.__cause__ = result["error"]
+    result["error"] = error
+
+
 def _codex_wait_notice_recovery(
     *,
     stale_timeout: float,
@@ -711,6 +731,10 @@ def _codex_wait_notice_recovery(
         deadlines.append(max(0.0, last_event_ts - call_start) + idle_timeout)
     if not deadlines or min(deadlines) <= elapsed:
         return ""
+    if last_event_ts is not None:
+        # The streaming notice counts silence since the last event, so a
+        # call-relative "at Ns" would be misread; say how long is left.
+        return f"; auto-reconnect in {int(min(deadlines) - elapsed)}s"
     return f"; auto-reconnect at {int(min(deadlines))}s"
 
 
@@ -1630,6 +1654,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _stale_timeout,
             _codex_hard_timeout if _codex_hard_timeout > 0 else float("inf"),
         )
+        # An active run budget still bounds a single call, streaming or not.
+        _budget_cap_fn = getattr(agent, "_run_budget_stale_cap", None)
+        _budget_cap = _budget_cap_fn() if callable(_budget_cap_fn) else None
+        if isinstance(_budget_cap, (int, float)):
+            _streaming_stale_timeout = min(_streaming_stale_timeout, max(_stale_timeout, _budget_cap))
+            _codex_idle_timeout = min(_codex_idle_timeout, _streaming_stale_timeout)
 
     if _codex_watchdog_enabled:
         # Reset before the worker starts so a marker left over from a previous
@@ -1740,17 +1770,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
             )
             # Wait briefly for the worker to notice the closed connection.
             t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
-                if _silent_hint:
-                    result["error"] = TimeoutError(
-                        f"Codex stream produced no bytes within {int(_elapsed)}s "
-                        f"(TTFB threshold: {int(_ttfb_timeout)}s). {_silent_hint}"
-                    )
-                else:
-                    result["error"] = TimeoutError(
-                        f"Codex stream produced no bytes within {int(_elapsed)}s "
-                        f"(TTFB threshold: {int(_ttfb_timeout)}s)"
-                    )
+            _set_watchdog_timeout(
+                result,
+                f"Codex stream produced no bytes within {int(_elapsed)}s "
+                f"(TTFB threshold: {int(_ttfb_timeout)}s)"
+                + (f". {_silent_hint}" if _silent_hint else ""),
+            )
             break
 
         # Stream-idle detector: the Codex backend emitted at least one SSE
@@ -1781,15 +1806,21 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 _close_request_client_once("codex_stream_idle_kill")
             except Exception:
                 pass
+            if not _openai_codex_backend:
+                # Circuit breaker (#58962): these backends now get the stream
+                # detector's (longer) patience, so count the kill like it does
+                # — a backend that keeps dying after its first event must trip
+                # the give-up instead of burning that budget every attempt.
+                _bump_stale_streak(agent)
             agent._touch_activity(
                 f"codex stream killed after {int(_event_stale_elapsed)}s with no SSE events"
             )
             t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
-                result["error"] = TimeoutError(
-                    f"Codex stream produced no SSE events for {int(_event_stale_elapsed)}s "
-                    f"after first byte (threshold: {int(_codex_idle_timeout)}s)"
-                )
+            _set_watchdog_timeout(
+                result,
+                f"Codex stream produced no SSE events for {int(_event_stale_elapsed)}s "
+                f"after first byte (threshold: {int(_codex_idle_timeout)}s)",
+            )
             break
 
         # Stale-call detector: kill the connection if no response
@@ -1820,18 +1851,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _touch_stale_kill_activity(agent, _elapsed)
             # Wait briefly for the thread to notice the closed connection.
             t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
-                if _silent_hint:
-                    result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s). "
-                        f"{_silent_hint}"
-                    )
-                else:
-                    result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s)"
-                    )
+            _set_watchdog_timeout(
+                result,
+                f"Non-streaming API call timed out after {int(_elapsed)}s "
+                f"with no response (threshold: {int(_stale_timeout)}s)"
+                + (f". {_silent_hint}" if _silent_hint else ""),
+                owns_error=_codex_watchdog_enabled,
+            )
             break
 
         if agent._interrupt_requested:

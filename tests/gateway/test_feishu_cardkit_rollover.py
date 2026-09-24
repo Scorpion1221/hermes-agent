@@ -668,3 +668,196 @@ async def test_heading_stays_with_its_paragraph_across_a_rollover():
 
     consumer.finish()
     await asyncio.wait_for(task, 3)
+
+
+class SmallCardTransport(RolloverCardTransport):
+    MAX_MESSAGE_LENGTH = 700  # -> 600-char safe limit per card
+
+
+def _all_cards_closed(adapter):
+    return {s["message_id"] for s in adapter.sent} <= {f["message_id"] for f in adapter.finalized}
+
+
+@pytest.mark.asyncio
+async def test_oversized_code_block_is_split_across_sealed_cards_with_fences_reopened():
+    adapter = SmallCardTransport()
+    consumer = consumer_for(adapter)
+    task = asyncio.create_task(consumer.run())
+    code_lines = [f"line_{i} = {i}  # " + "x" * 30 for i in range(40)]
+    final = "Here:\n\n```python\n" + "\n".join(code_lines) + "\n```\n\nDone."
+    consumer.on_delta("Here:\n\n```python\n")
+    await asyncio.wait_for(adapter.first_send.wait(), 3)
+    for line in code_lines:
+        consumer.on_delta(line + "\n")
+        await asyncio.sleep(0.005)
+    consumer.on_delta("```\n\nDone.")
+    consumer.finish(final)
+    await asyncio.wait_for(task, 5)
+
+    assert len(adapter.seals()) >= 2
+    assert _all_cards_closed(adapter), "no card may be left streaming"
+    for f in adapter.finalized:
+        assert f["content"].count("```") % 2 == 0, "every card renders balanced code"
+    body = "\n".join(f["content"] for f in adapter.finalized)
+    for line in code_lines:
+        assert body.count(line) == 1
+    assert adapter.finalized[-1]["content"].endswith("Done.")
+    assert consumer.delivered_final_matches(final) is True
+
+
+@pytest.mark.asyncio
+async def test_size_rollover_on_the_final_tick_still_records_the_whole_answer():
+    adapter = SmallCardTransport()
+    consumer = consumer_for(adapter, edit_interval=999)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("Start.")
+    await asyncio.wait_for(adapter.first_send.wait(), 3)
+    # The rest arrives only with the final (e.g. a verifier footer).
+    final = "Start.\n\n" + "\n\n".join(f"Paragraph {i}: " + "word " * 30 for i in range(5))
+    consumer.finish(final)
+    await asyncio.wait_for(task, 5)
+
+    assert adapter.seals()
+    assert _all_cards_closed(adapter)
+    assert consumer.delivered_final_matches(final) is True
+
+
+@pytest.mark.asyncio
+async def test_failed_size_seal_never_falls_back_to_unsealed_split_cards():
+    adapter = SmallCardTransport(seal_failures=99)
+    consumer = consumer_for(adapter)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("Intro.")
+    await asyncio.wait_for(adapter.first_send.wait(), 3)
+    for i in range(6):
+        consumer.on_delta(f"\n\nParagraph {i}: " + "word " * 30)
+        await asyncio.sleep(0.02)
+    consumer.finish()
+    await asyncio.wait_for(task, 5)
+
+    # Seals kept failing: everything stays in the one live card (no orphan
+    # streaming cards from the legacy split).
+    assert [s["message_id"] for s in adapter.sent] == ["card-1"]
+    assert "Paragraph 5" in adapter.finalized[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_expired_window_inside_a_code_block_reopens_the_block_in_the_next_card():
+    adapter = RolloverCardTransport(expire_after_first_send=True)
+    consumer = consumer_for(adapter)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("```bash\necho one\n")
+    await asyncio.wait_for(adapter.first_send.wait(), 3)
+    consumer.on_delta("echo two\n")
+    await wait_for(lambda: adapter.seals())
+    consumer.on_delta("echo three\n```\n\nAll done.")
+    final = "```bash\necho one\necho two\necho three\n```\n\nAll done."
+    consumer.finish(final)
+    await asyncio.wait_for(task, 5)
+
+    assert adapter.seals()[0]["content"].count("```") % 2 == 0
+    last = adapter.finalized[-1]["content"]
+    assert last.startswith("```bash\n")
+    assert last.endswith("All done.")
+    assert last.count("```") % 2 == 0
+    body = "\n".join(f["content"] for f in adapter.finalized)
+    for cmd in ("echo one", "echo two", "echo three"):
+        assert body.count(cmd) == 1
+
+
+@pytest.mark.asyncio
+async def test_final_equal_to_folded_commentary_is_not_repeated():
+    adapter = RolloverCardTransport()
+    consumer = consumer_for(adapter)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_commentary("Everything is configured.")
+    consumer.on_progress("\n> memory: saved\n")
+    consumer.finish("Everything is configured.")
+    await asyncio.wait_for(task, 3)
+
+    assert adapter.finalized[-1]["content"].count("Everything is configured.") == 1
+    assert consumer.delivered_final_matches("Everything is configured.") is True
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_rolls_a_small_card_that_has_not_changed():
+    adapter = RolloverCardTransport()
+    consumer = consumer_for(adapter, min_chars=300)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("Checking.")
+    consumer.on_delta(None)
+    await asyncio.wait_for(adapter.first_send.wait(), 3)
+    await asyncio.sleep(0.1)
+
+    # Moving recently (within the heartbeat interval): the card is its own
+    # sign of life.
+    assert await consumer.request_cardkit_rollover(quiet_after=60) == "live"
+    # Static for a whole interval: seal it so the footer shows progress.
+    assert await consumer.request_cardkit_rollover(quiet_after=0.05) == "rolled"
+
+    consumer.finish()
+    await asyncio.wait_for(task, 3)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_seals_complete_lines_of_a_stalled_paragraph():
+    adapter = RolloverCardTransport()
+    consumer = consumer_for(adapter)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("First line of a long paragraph\nsecond line still being")
+    await asyncio.wait_for(adapter.first_send.wait(), 3)
+    await asyncio.sleep(0.1)
+
+    assert await consumer.request_cardkit_rollover(quiet_after=0.05) == "rolled"
+    assert adapter.seals()[0]["content"] == "First line of a long paragraph"
+
+    consumer.finish()
+    await asyncio.wait_for(task, 3)
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_first_frame_of_a_card_is_resent():
+    class FirstFrameLimited(RolloverCardTransport):
+        async def send(self, **kwargs):
+            result = await super().send(**kwargs)
+            result.raw_response = {"cardkit_rate_limited": True}
+            return result
+
+    adapter = FirstFrameLimited()
+    consumer = consumer_for(adapter)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("Hello there.")
+    # No new content: only the retry of the skipped first frame edits it.
+    await wait_for(lambda: any(e["content"] == "Hello there." for e in adapter.edits))
+
+    consumer.finish()
+    await asyncio.wait_for(task, 3)
+
+
+@pytest.mark.asyncio
+async def test_unsplittable_oversized_line_does_not_spin():
+    adapter = SmallCardTransport()
+    consumer = consumer_for(adapter)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("```\n")
+    await asyncio.wait_for(adapter.first_send.wait(), 3)
+    consumer.on_delta("x" * 2000)  # one line, no clean or line cut
+    consumer.finish()
+    # Must terminate (no endless seal loop), with nothing dropped.
+    await asyncio.wait_for(task, 3)
+    assert "x" * 2000 in "".join(f["content"] for f in adapter.finalized)
+
+
+@pytest.mark.asyncio
+async def test_size_cut_keeps_a_heading_with_its_paragraph():
+    adapter = SmallCardTransport()
+    consumer = consumer_for(adapter)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("Intro " + "word " * 100)
+    await asyncio.wait_for(adapter.first_send.wait(), 3)
+    consumer.on_delta("\n\n## Details\n\n" + "more " * 60)
+    await wait_for(lambda: adapter.seals())
+    consumer.finish()
+    await asyncio.wait_for(task, 3)
+
+    assert not adapter.seals()[0]["content"].rstrip().endswith("## Details")

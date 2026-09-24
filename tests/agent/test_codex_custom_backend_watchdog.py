@@ -189,3 +189,77 @@ def test_abort_marks_the_request_client(tmp_path, monkeypatch):
     agent._abort_request_openai_client(client, reason="codex_stream_idle_kill")
 
     assert client._hermes_abort_reason == "codex_stream_idle_kill"
+
+
+def test_idle_kill_surfaces_timeout_not_the_aborted_transport_error(tmp_path, monkeypatch):
+    """The worker's post-abort transport error must not replace the watchdog
+    verdict: 'peer closed connection' on a large session would be classified
+    as context overflow and trigger compression instead of a reconnect."""
+    from agent import chat_completion_helpers as h
+
+    agent = _proxy_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "0.6")
+    aborted = {"flag": False}
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: SimpleNamespace())
+    monkeypatch.setattr(agent, "_abort_request_openai_client", lambda c, reason=None: aborted.update(flag=True))
+    monkeypatch.setattr(agent, "_close_request_openai_client", lambda c, reason=None: None)
+
+    def quiet_then_dropped(api_kwargs, client=None, on_first_delta=None):
+        agent._codex_stream_last_event_ts = time.time()  # response.created
+        while not aborted["flag"]:
+            time.sleep(0.02)
+        raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", quiet_then_dropped)
+
+    with pytest.raises(TimeoutError) as excinfo:
+        h.interruptible_api_call(agent, {"model": CLAUDE_VIA_PROXY, "input": "hi"})
+    assert "no SSE events" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, httpx.RemoteProtocolError)
+    # Counted towards the stale give-up like the stream detector's kills.
+    assert agent._consecutive_stale_streams == 1
+
+
+def test_run_budget_still_bounds_a_streaming_proxy_call(tmp_path, monkeypatch):
+    from agent import chat_completion_helpers as h
+
+    agent = _proxy_agent(tmp_path, monkeypatch)
+    monkeypatch.setattr(agent, "_compute_non_stream_stale_timeout", lambda *a, **k: 0.5)
+    monkeypatch.setattr(agent, "_run_budget_stale_cap", lambda: 1.0)
+    closes = _wire_fake_clients(agent, monkeypatch)
+    stop = {"flag": False}
+
+    def endless_events(api_kwargs, client=None, on_first_delta=None):
+        while not stop["flag"] and not agent._interrupt_requested:
+            agent._codex_stream_last_event_ts = time.time()
+            time.sleep(0.05)
+        raise RuntimeError("connection closed")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", endless_events)
+
+    started = time.time()
+    try:
+        with pytest.raises(TimeoutError):
+            h.interruptible_api_call(agent, {"model": CLAUDE_VIA_PROXY, "input": "hi"})
+        assert time.time() - started < 10
+        assert "stale_call_kill" in closes
+    finally:
+        stop["flag"] = True
+
+
+def test_streaming_wait_notice_says_how_long_until_reconnect():
+    from agent import chat_completion_helpers as h
+
+    recovery = h._codex_wait_notice_recovery(
+        stale_timeout=1500.0,
+        ttfb_enabled=True,
+        ttfb_timeout=120.0,
+        last_event_ts=1000.0 + 600,
+        call_start=1000.0,
+        idle_enabled=True,
+        idle_timeout=240.0,
+        elapsed=630.0,
+    )
+
+    # Silence is shown since the last event, so the deadline is relative too.
+    assert recovery == "; auto-reconnect in 210s"

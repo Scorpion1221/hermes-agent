@@ -31307,6 +31307,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _hb_verdict = await _hb_consumer.request_cardkit_rollover(
                             iteration=_hb_iteration,
                             max_iterations=_hb_max_iterations,
+                            quiet_after=_NOTIFY_INTERVAL,
                         )
                     except asyncio.CancelledError:
                         raise

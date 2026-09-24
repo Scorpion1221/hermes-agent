@@ -2401,11 +2401,15 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
                 self._streaming_cards[result.message_id] = state
                 self._remember_cardkit_message(result.message_id)
-                await stream_card_element(
+                first_frame = await stream_card_element_result(
                     self._client, card_id=card_id, element_id=state.element_id,
                     content=content, sequence=state.sequence,
                 )
                 state.sequence += 1
+                if first_frame.code == CARDKIT_RATE_LIMITED:
+                    # The card exists but its first frame was skipped; let
+                    # the consumer resend it instead of treating it as shown.
+                    result.raw_response = {"cardkit_rate_limited": True}
             return result
         except Exception as exc:
             logger.warning("[Feishu] Streaming card send failed, will fall back: %s", exc)

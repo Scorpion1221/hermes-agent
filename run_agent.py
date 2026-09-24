@@ -1542,15 +1542,25 @@ class AIAgent:
         # 900s eval ceiling. NEVER raises the timeout above what it would
         # otherwise be, and an explicit user-configured stale_timeout_seconds
         # (or env var) still wins untouched.
-        run_budget = getattr(self, "run_budget_seconds", None)
-        if run_budget and not self._stale_timeout_is_explicit():
-            started = getattr(self, "_run_budget_started_at", None)
-            if started:
-                remaining = float(run_budget) - (time.time() - started)
-                deadline_cap = max(60.0, remaining * 0.5)
-                if deadline_cap < timeout:
-                    timeout = deadline_cap
+        deadline_cap = self._run_budget_stale_cap()
+        if deadline_cap is not None and deadline_cap < timeout:
+            timeout = deadline_cap
         return timeout
+
+    def _run_budget_stale_cap(self) -> Optional[float]:
+        """Longest a single provider call may take under the active run budget.
+
+        ``None`` when no run budget is active or the stale timeout was set
+        explicitly by the user.
+        """
+        run_budget = getattr(self, "run_budget_seconds", None)
+        if not run_budget or self._stale_timeout_is_explicit():
+            return None
+        started = getattr(self, "_run_budget_started_at", None)
+        if not started:
+            return None
+        remaining = float(run_budget) - (time.time() - started)
+        return max(60.0, remaining * 0.5)
 
     def _stale_timeout_is_explicit(self) -> bool:
         """True when the user explicitly configured the non-stream stale timeout.
