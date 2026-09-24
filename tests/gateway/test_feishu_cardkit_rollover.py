@@ -933,3 +933,42 @@ async def test_fallback_sends_never_open_another_streaming_card():
     assert fallback, "the unseen tail is delivered"
     assert all(not (s["metadata"] or {}).get("streaming") for s in fallback)
 
+
+# ── /stop and /new: the turn goes stale without a DONE ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_stale_turn_seals_the_live_card_as_stopped():
+    adapter = RolloverCardTransport()
+    current = {"value": True}
+    consumer = consumer_for(adapter)
+    consumer._run_still_current = lambda: current["value"]
+    task = asyncio.create_task(consumer.run())
+
+    consumer.on_delta("正在部署 client，")
+    await asyncio.wait_for(adapter.first_send.wait(), 3)
+    current["value"] = False  # /stop bumped the run generation
+    await asyncio.wait_for(task, 3)
+
+    assert adapter.finalized == [
+        {"message_id": "card-1", "content": "正在部署 client，", "footer": None, "stopped": True}
+    ]
+    # Abandoned, not delivered: the gateway still owns what happens next.
+    assert consumer.final_response_sent is False
+
+
+@pytest.mark.asyncio
+async def test_stale_turn_right_after_a_rollover_restatuses_the_sealed_card():
+    adapter = RolloverCardTransport()
+    current = {"value": True}
+    consumer = consumer_for(adapter)
+    consumer._run_still_current = lambda: current["value"]
+    consumer._cardkit_last_sealed = ("card-1", "part one")
+    task = asyncio.create_task(consumer.run())
+    await asyncio.sleep(0.1)
+    current["value"] = False
+    await asyncio.wait_for(task, 3)
+
+    assert adapter.sealed_updates[-1:] == [
+        {"message_id": "card-1", "content": "part one", "footer": None, "stopped": True}
+    ]

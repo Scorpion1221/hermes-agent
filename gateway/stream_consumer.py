@@ -2113,6 +2113,7 @@ class GatewayStreamConsumer:
                 # delivered after the user has already moved on.
                 if not self._run_still_current():
                     await self._abandon_native_stream()
+                    await self._abandon_cardkit_card()
                     return
 
                 # Drain all available items from the queue
@@ -3744,6 +3745,29 @@ class GatewayStreamConsumer:
             )
         except Exception as e:
             logger.debug("abandon_open_draft failed (best-effort): %s", e)
+
+    async def _abandon_cardkit_card(self) -> None:
+        """Seal the live CardKit card as stopped when the turn goes stale.
+
+        /stop and /new bump the run generation and the loop exits without a
+        DONE; the card would otherwise stay in streaming mode ("…") until
+        Feishu times it out. Like ``_abandon_native_stream`` this keeps what
+        is on screen and sets no delivery flags.
+        """
+        if not self._cardkit_mode:
+            return
+        try:
+            if self._message_id:
+                await self.adapter.finalize_streaming_message(
+                    self._message_id,
+                    self._last_sent_text or self._clean_for_display(self._accumulated),
+                    stopped=True,
+                )
+            elif self._cardkit_last_sealed:
+                sealed_id, sealed_text = self._cardkit_last_sealed
+                await self._update_sealed_cardkit_card(sealed_id, sealed_text, stopped=True)
+        except Exception as e:
+            logger.debug("Sealing abandoned CardKit card failed (best-effort): %s", e)
 
     async def _flush_segment_tail_on_edit_failure(self) -> None:
         """Deliver un-sent tail content before a segment-break reset.
