@@ -139,14 +139,19 @@ def parse_feishu_post_payload(payload: Any) -> FeishuPostParseResult:
         raw_key = attachment.get("file_key") or attachment.get("key")
         file_key = raw_key.strip() if isinstance(raw_key, str) else ""
         file_name = _first_non_empty_text(attachment.get("file_name"), attachment.get("name"))
-        if _to_boolean(attachment.get("is_folder")):
-            parts.append(f"[Folder attachment: {file_name or file_key or 'folder'}; not downloaded — send as ZIP]")
-            continue
         if not file_key or file_key in seen_file_keys:
             continue
         seen_file_keys.add(file_key)
-        media_refs.append(FeishuPostMediaRef(file_key=file_key, file_name=file_name))
-        parts.append(_attachment_placeholder(file_name))
+        is_folder = _to_boolean(attachment.get("is_folder"))
+        media_refs.append(FeishuPostMediaRef(
+            file_key=file_key,
+            file_name=file_name,
+            resource_type="folder" if is_folder else "file",
+        ))
+        parts.append(
+            f"[Folder attachment: {file_name or file_key}]"
+            if is_folder else _attachment_placeholder(file_name)
+        )
 
     return FeishuPostParseResult(
         text_content="\n".join(parts).strip() or FALLBACK_POST_TEXT,
@@ -190,9 +195,12 @@ def normalize_feishu_message(*, message_type: str, raw_content: str) -> FeishuNo
             image_keys=[image_key] if image_key else [],
             relation_kind="image",
         )
-    if normalized_type in {"file", "audio", "media"}:
+    if normalized_type in {"file", "folder", "audio", "media"}:
         media_ref = _build_media_ref_from_payload(payload, resource_type=normalized_type)
-        placeholder = _attachment_placeholder(media_ref.file_name)
+        placeholder = (
+            f"[Folder attachment: {media_ref.file_name or media_ref.file_key or 'folder'}]"
+            if normalized_type == "folder" else _attachment_placeholder(media_ref.file_name)
+        )
         return FeishuNormalizedMessage(
             raw_type=normalized_type,
             text_content="",
@@ -1036,7 +1044,7 @@ def _build_media_ref_from_payload(payload: dict[str, Any], *, resource_type: str
         payload.get("title"),
         payload.get("text"),
     )
-    effective_type = resource_type if resource_type in {"audio", "video"} else "file"
+    effective_type = resource_type if resource_type in {"folder", "audio", "video"} else "file"
     return FeishuPostMediaRef(file_key=file_key, file_name=file_name, resource_type=effective_type)
 
 

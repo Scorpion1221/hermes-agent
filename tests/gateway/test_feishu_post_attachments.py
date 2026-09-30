@@ -88,15 +88,16 @@ def test_post_inline_and_attachment_zone_duplicate_downloads_only_once(normalize
     assert len(build_resource_descriptors(result)) == 1
 
 
-def test_post_folder_attachment_is_explicitly_not_downloaded(normalize):
+def test_post_folder_attachment_is_preserved_for_folder_download(normalize):
     result = normalize({
         "content": [[{"tag": "text", "text": "Review this folder."}]],
         "files": [{"file_key": "file_folder", "file_name": "source", "is_folder": True}],
     })
     assert result.text_content.startswith("Review this folder.\n")
     assert "source" in result.text_content
-    assert "not downloaded" in result.text_content
-    assert build_resource_descriptors(result) == ()
+    assert [(ref.type, ref.file_key) for ref in build_resource_descriptors(result)] == [
+        ("folder", "file_folder"),
+    ]
 
 
 def test_malformed_post_attachment_zone_does_not_create_invalid_resources(normalize):

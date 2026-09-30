@@ -133,6 +133,8 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_bytes,
     cache_image_from_bytes,
+    get_inbound_media_max_bytes,
+    validate_inbound_media_size,
 )
 from gateway.platforms.feishu_inbound import (
     FeishuMessageContext,
@@ -315,6 +317,9 @@ _DEFAULT_WEBHOOK_PATH = "/feishu/webhook"
 _FEISHU_DEDUP_TTL_SECONDS = 24 * 60 * 60          # 24 hours — matches openclaw
 _FEISHU_SENDER_NAME_TTL_SECONDS = 10 * 60          # 10 minutes sender-name cache
 _FEISHU_WEBHOOK_MAX_BODY_BYTES = 1 * 1024 * 1024   # 1 MB body limit
+_FEISHU_FOLDER_MAX_ENTRIES = 200
+_FEISHU_FOLDER_MAX_FILES = 100
+_FEISHU_FOLDER_MAX_DEPTH = 20
 _FEISHU_WEBHOOK_RATE_WINDOW_SECONDS = 60            # sliding window for rate limiter
 _FEISHU_WEBHOOK_RATE_LIMIT_MAX = 120               # max requests per window per IP — matches openclaw
 _FEISHU_WEBHOOK_RATE_MAX_KEYS = 4096               # max tracked keys (prevents unbounded growth)
@@ -808,14 +813,19 @@ def parse_feishu_post_payload(
         raw_key = attachment.get("file_key") or attachment.get("key")
         file_key = raw_key.strip() if isinstance(raw_key, str) else ""
         file_name = _first_non_empty_text(attachment.get("file_name"), attachment.get("name"))
-        if _to_boolean(attachment.get("is_folder")):
-            parts.append(f"[Folder attachment: {file_name or file_key or 'folder'}; not downloaded — send as ZIP]")
-            continue
         if not file_key or file_key in seen_file_keys:
             continue
         seen_file_keys.add(file_key)
-        media_refs.append(FeishuPostMediaRef(file_key=file_key, file_name=file_name))
-        parts.append(_attachment_placeholder(file_name))
+        is_folder = _to_boolean(attachment.get("is_folder"))
+        media_refs.append(FeishuPostMediaRef(
+            file_key=file_key,
+            file_name=file_name,
+            resource_type="folder" if is_folder else "file",
+        ))
+        parts.append(
+            f"[Folder attachment: {file_name or file_key}]"
+            if is_folder else _attachment_placeholder(file_name)
+        )
 
     return FeishuPostParseResult(
         text_content="\n".join(parts).strip() or FALLBACK_POST_TEXT,
@@ -1038,9 +1048,12 @@ def normalize_feishu_message(
             relation_kind="image",
             mentions=mention_refs,
         )
-    if normalized_type in {"file", "audio", "media"}:
+    if normalized_type in {"file", "folder", "audio", "media"}:
         media_ref = _build_media_ref_from_payload(payload, resource_type=normalized_type)
-        placeholder = _attachment_placeholder(media_ref.file_name)
+        placeholder = (
+            f"[Folder attachment: {media_ref.file_name or media_ref.file_key or 'folder'}]"
+            if normalized_type == "folder" else _attachment_placeholder(media_ref.file_name)
+        )
         return FeishuNormalizedMessage(
             raw_type=normalized_type,
             text_content="",
@@ -1301,7 +1314,7 @@ def _build_media_ref_from_payload(payload: Dict[str, Any], *, resource_type: str
         payload.get("title"),
         payload.get("text"),
     )
-    effective_type = resource_type if resource_type in {"audio", "video"} else "file"
+    effective_type = resource_type if resource_type in {"folder", "audio", "video"} else "file"
     return FeishuPostMediaRef(file_key=file_key, file_name=file_name, resource_type=effective_type)
 
 
@@ -4805,7 +4818,7 @@ class FeishuAdapter(BasePlatformAdapter):
             if not file_key:
                 continue
             mapped_type = str(getattr(media_ref, "resource_type", "file") or "file").strip().lower()
-            if mapped_type not in {"audio", "video"}:
+            if mapped_type not in {"audio", "video", "folder"}:
                 mapped_type = "file"
             descriptors.append(
                 FeishuResourceDescriptor(
@@ -4923,6 +4936,7 @@ class FeishuAdapter(BasePlatformAdapter):
         file_key: str,
         resource_type: str,
         fallback_filename: str,
+        max_bytes: Optional[int] = None,
     ) -> tuple[str, str]:
         if not self._client or not message_id:
             return "", ""
@@ -4934,6 +4948,8 @@ class FeishuAdapter(BasePlatformAdapter):
         for request_type in request_types:
             cached_entry = get_feishu_media_index_entry(message_id, file_key)
             if cached_entry is not None:
+                if max_bytes is not None and max_bytes > 0 and Path(cached_entry.cached_path).stat().st_size > max_bytes:
+                    return "", ""
                 return cached_entry.cached_path, cached_entry.content_type or self._guess_media_type_from_filename(cached_entry.cached_path)
             try:
                 request = self._build_message_resource_request(
@@ -4954,8 +4970,12 @@ class FeishuAdapter(BasePlatformAdapter):
                     continue
 
                 raw_bytes = self._read_binary_response(response)
-                if not raw_bytes:
+                if not raw_bytes and not (
+                    max_bytes is not None and getattr(response, "file", None) is not None
+                ):
                     continue
+                if max_bytes is not None:
+                    validate_inbound_media_size(len(raw_bytes), media_type="folder file", max_bytes=max_bytes)
                 content_type = self._get_response_header(response, "Content-Type")
                 response_filename = getattr(response, "file_name", None) or ""
                 filename = response_filename or fallback_filename or f"{request_type}_{file_key}"
@@ -5443,6 +5463,13 @@ class FeishuAdapter(BasePlatformAdapter):
         media_types: List[str] = []
 
         for descriptor in descriptors:
+            if descriptor.type == "folder":
+                paths, types = await self._download_feishu_folder(
+                    message_id=message_id, descriptor=descriptor,
+                )
+                media_urls.extend(paths)
+                media_types.extend(types)
+                continue
             if descriptor.type == "image":
                 cached_path, media_type = await self._download_feishu_image(
                     message_id=message_id,
@@ -5461,6 +5488,127 @@ class FeishuAdapter(BasePlatformAdapter):
                 media_types.append(media_type)
 
         return media_urls, media_types
+
+    async def _download_feishu_folder(
+        self, *, message_id: str, descriptor: FeishuResourceDescriptor,
+    ) -> tuple[List[str], List[str]]:
+        """Expand an IM folder and retain its hierarchy in a cached manifest.
+
+        Leaf files use the same message-scoped SDK download/cache as ordinary
+        uploads. Never materialize remote folder names as local directories.
+        Partial failures remain visible to the agent, including empty folders.
+        """
+        root_name = re.sub(r"[\x00-\x1f\x7f/\\]", "_", descriptor.file_name or "folder").strip()
+        if root_name in {"", ".", ".."}:
+            root_name = "folder"
+        manifest: Dict[str, Any] = {
+            "folder_name": root_name, "status": "failed",
+            "files": [], "directories": [root_name], "errors": [],
+        }
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        try:
+            from lark_oapi.core.enum import AccessTokenType, HttpMethod
+            from lark_oapi.core.model import BaseRequest
+            from tools.credential_files import to_agent_visible_cache_path
+
+            request = (
+                BaseRequest.builder().http_method(HttpMethod.GET)
+                .uri("/open-apis/im/v1/files/:file_key/folder")
+                .paths({"file_key": descriptor.file_key})
+                .queries([("srctype", "message"), ("srcid", message_id), ("recursive", "true")])
+                .token_types({AccessTokenType.TENANT}).build()
+            )
+            response = await self._run_blocking(self._client.request, request)
+            if not response or not response.success():
+                raise ValueError(f"Folder enumeration failed (API code {getattr(response, 'code', 'unavailable')})")
+            raw = getattr(getattr(response, "raw", None), "content", b"")
+            if len(raw) > 4 * 1024 * 1024:
+                raise ValueError("Folder listing exceeds the 4 MiB safety limit")
+            payload = json.loads(raw)
+            if payload.get("code") != 0:
+                raise ValueError(f"Folder enumeration failed (API code {payload.get('code')})")
+            data = payload.get("data")
+            if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+                raise ValueError("Folder enumeration returned an invalid listing")
+            if data.get("has_more") or data.get("page_token"):
+                manifest["errors"].append("Folder listing is incomplete")
+            # all_count includes the root on some API versions; it is not a
+            # page-size/truncation signal for a recursively expanded tree.
+            pending = [(item, root_name, 1) for item in reversed(data["items"])]
+            seen = {descriptor.file_key}
+            visited = attempts = total_bytes = 0
+            byte_limit = max(0, get_inbound_media_max_bytes())
+            while pending:
+                if visited >= _FEISHU_FOLDER_MAX_ENTRIES:
+                    manifest["errors"].append(f"Folder listing exceeds {_FEISHU_FOLDER_MAX_ENTRIES} entries; remaining entries skipped")
+                    break
+                item, parent, depth = pending.pop()
+                visited += 1
+                if not isinstance(item, dict) or not isinstance(item.get("file_key"), str) or not item["file_key"].strip():
+                    manifest["errors"].append("Invalid folder entry skipped")
+                    continue
+                key = item["file_key"].strip()
+                if key in seen:
+                    continue
+                seen.add(key)
+                name = re.sub(r"[\x00-\x1f\x7f/\\]", "_", str(item.get("name") or key)).strip()
+                if name in {"", ".", ".."}:
+                    name = "file"
+                relative_path = f"{parent}/{name}"
+                if depth > _FEISHU_FOLDER_MAX_DEPTH:
+                    manifest["errors"].append(f"Depth limit exceeded: {relative_path}")
+                    continue
+                if _to_boolean(item.get("is_folder")):
+                    manifest["directories"].append(relative_path)
+                    children = item.get("children", [])
+                    if not isinstance(children, list):
+                        manifest["errors"].append(f"Invalid folder children: {relative_path}")
+                        continue
+                    try:
+                        child_count = int(item.get("children_count", len(children)))
+                    except (ValueError, TypeError):
+                        child_count = len(children)
+                    if child_count > len(children):
+                        manifest["errors"].append(f"Incomplete folder children: {relative_path}")
+                    pending.extend((child, relative_path, depth + 1) for child in reversed(children))
+                    continue
+                entry = {"relative_path": relative_path, "status": "skipped"}
+                manifest["files"].append(entry)
+                if attempts >= _FEISHU_FOLDER_MAX_FILES:
+                    manifest["errors"].append(f"File count limit exceeded: {relative_path}")
+                    continue
+                attempts += 1
+                try:
+                    size = max(0, int(item.get("size", 0)))
+                except (ValueError, TypeError):
+                    size = 0
+                remaining = max(0, byte_limit - total_bytes) if byte_limit else 0
+                if byte_limit and (not remaining or size > remaining):
+                    manifest["errors"].append(f"Folder byte limit exceeded: {relative_path}")
+                    continue
+                path, media_type = await self._download_feishu_message_resource(
+                    message_id=message_id, file_key=key, resource_type="file",
+                    fallback_filename=name, max_bytes=remaining,
+                )
+                if not path:
+                    entry["status"] = "failed"
+                    manifest["errors"].append(f"File download failed or exceeded byte limit: {relative_path}")
+                    continue
+                total_bytes += Path(path).stat().st_size
+                entry.update(status="downloaded", local_path=to_agent_visible_cache_path(path), content_type=media_type)
+                media_urls.append(path)
+                media_types.append(media_type)
+            manifest["status"] = "partial" if manifest["errors"] else "complete"
+        except Exception as exc:
+            logger.warning("[Feishu] Folder download failed for %s/%s", message_id, descriptor.file_key, exc_info=True)
+            manifest["status"] = "partial" if media_urls else "failed"
+            manifest["errors"].append(f"Unable to read folder: {type(exc).__name__}: {exc}")
+        manifest_path = cache_document_from_bytes(
+            json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+            "feishu-folder-manifest.json",
+        )
+        return [manifest_path, *media_urls], ["application/json", *media_types]
 
     async def _fetch_quoted_context(
         self, message_id: str, *, _depth: int = 0

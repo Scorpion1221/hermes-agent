@@ -67,7 +67,7 @@ def build_resource_descriptors(normalized: Any) -> tuple[FeishuResourceDescripto
         if not file_key:
             continue
         resource_type = str(getattr(media_ref, "resource_type", "file") or "file").strip().lower()
-        mapped_type = resource_type if resource_type in {"image", "file", "audio", "video", "sticker"} else "file"
+        mapped_type = resource_type if resource_type in {"image", "file", "folder", "audio", "video", "sticker"} else "file"
         out.append(
             FeishuResourceDescriptor(
                 type=mapped_type,  # type: ignore[arg-type]
@@ -271,6 +271,11 @@ async def build_feishu_quoted_context(
     media_urls, media_types = await download_resources(message_id, ctx.resource_descriptors)
     display_sender = sender_name or ctx.sender_name
     display_text = _normalize_sender_name(display_sender, ctx.content or "").strip()
+    metadata = dict(ctx.metadata or {})
+    if any(descriptor.type == "folder" for descriptor in ctx.resource_descriptors):
+        metadata["folder_manifest_paths"] = [
+            path for path in media_urls if path.endswith("_feishu-folder-manifest.json")
+        ]
     return FeishuQuotedContext(
         message_id=message_id,
         kind=ctx.relation_kind or ctx.content_type or "plain",
@@ -280,5 +285,5 @@ async def build_feishu_quoted_context(
         media_urls=tuple(media_urls),
         media_types=tuple(media_types),
         stable_ref=f"feishu:{message_id}",
-        metadata=dict(ctx.metadata or {}),
+        metadata=metadata,
     )

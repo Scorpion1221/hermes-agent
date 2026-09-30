@@ -75,4 +75,10 @@ def _render_one(
         lines.append(f"sender: {ctx.sender_name}")
     if summary:
         lines.append(f"summary: {summary}")
+    folder_manifests = ctx.metadata.get("folder_manifest_paths", [])
+    if folder_manifests:
+        from tools.credential_files import to_agent_visible_cache_path
 
+        # Keep the hierarchy's entry point outside history-summary truncation.
+        for path in folder_manifests:
+            lines.append(f"folder_manifest: {to_agent_visible_cache_path(path)}")
