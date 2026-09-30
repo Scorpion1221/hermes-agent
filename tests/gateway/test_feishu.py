@@ -13,7 +13,20 @@ from types import SimpleNamespace
 from typing import Dict
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
 from gateway.platforms.base import ProcessingOutcome
+
+
+@pytest.fixture(autouse=True)
+def _isolate_runtime_status(tmp_path, monkeypatch):
+    # Several tests clear os.environ (including HOME/HERMES_HOME). Keep
+    # adapter lifecycle status writes away from the operator's gateway.
+    monkeypatch.setattr(
+        "gateway.status._get_runtime_status_path",
+        lambda: tmp_path / "gateway_state.json",
+    )
+
 
 try:
     import lark_oapi

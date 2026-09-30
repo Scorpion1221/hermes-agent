@@ -37,6 +37,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
+from tools.interrupt import is_interrupted
+
 logger = logging.getLogger(__name__)
 
 
@@ -105,10 +107,10 @@ def register(
 
 
 def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
-    """Block on the entry's event until resolved or timeout fires.
+    """Block on the entry's event until resolved, interrupted, or timed out.
 
-    Polls in 1-second slices so the agent's inactivity heartbeat keeps
-    firing — without this, ``Event.wait(timeout=600)`` blocks the thread
+    Polls in short slices to honor agent interrupts and keep its inactivity
+    heartbeat firing — without this, ``Event.wait(timeout=600)`` blocks the thread
     for 10 minutes with zero activity touches and the gateway's inactivity
     watchdog kills the agent while the user is still typing.
 
@@ -116,7 +118,7 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
     heartbeat still fires each slice so inactivity watchdogs don't kill a live
     prompt.
 
-    Returns the resolved response string, or ``None`` on timeout.
+    Returns the resolved response string, or ``None`` on timeout/interrupt.
     """
     with _lock:
         entry = _entries.get(clarify_id)
@@ -128,18 +130,22 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
     except Exception:  # pragma: no cover - optional
         touch_activity_if_due = None
 
-    # 0 / negative → unlimited: no deadline, poll forever in 1s slices.
+    # 0 / negative → unlimited: no deadline, but still honor agent interrupts.
     unlimited = timeout is None or float(timeout) <= 0.0
     deadline = None if unlimited else time.monotonic() + float(timeout)
     activity_state = {"last_touch": time.monotonic(), "start": time.monotonic()}
     while True:
+        # Already-accepted answers win a concurrent interrupt. The signal is
+        # thread-scoped, so stopping one agent cannot release another session.
+        if entry.event.is_set() or is_interrupted():
+            break
         if deadline is None:
-            slice_s = 1.0
+            slice_s = 0.2
         else:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            slice_s = min(1.0, remaining)
+            slice_s = min(0.2, remaining)
         if entry.event.wait(timeout=slice_s):
             break
         if touch_activity_if_due is not None:

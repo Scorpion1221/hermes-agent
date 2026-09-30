@@ -799,6 +799,24 @@ def parse_feishu_post_payload(
         if row_text:
             parts.append(row_text)
 
+    # Attachment-zone entries are siblings of content, not inline nodes.
+    # Keep this normalization aligned with the shared inbound parser.
+    seen_file_keys = {ref.file_key for ref in media_refs}
+    for attachment in resolved.get("files", []):
+        if not isinstance(attachment, dict):
+            continue
+        raw_key = attachment.get("file_key") or attachment.get("key")
+        file_key = raw_key.strip() if isinstance(raw_key, str) else ""
+        file_name = _first_non_empty_text(attachment.get("file_name"), attachment.get("name"))
+        if _to_boolean(attachment.get("is_folder")):
+            parts.append(f"[Folder attachment: {file_name or file_key or 'folder'}; not downloaded — send as ZIP]")
+            continue
+        if not file_key or file_key in seen_file_keys:
+            continue
+        seen_file_keys.add(file_key)
+        media_refs.append(FeishuPostMediaRef(file_key=file_key, file_name=file_name))
+        parts.append(_attachment_placeholder(file_name))
+
     return FeishuPostParseResult(
         text_content="\n".join(parts).strip() or FALLBACK_POST_TEXT,
         image_keys=image_keys,
@@ -815,6 +833,8 @@ def _resolve_post_payload(payload: Any) -> Dict[str, Any]:
     wrapped = payload.get("post")
     wrapped_direct = _resolve_locale_payload(wrapped)
     if wrapped_direct:
+        if isinstance(payload.get("files"), list):
+            wrapped_direct["files"] = payload["files"] + wrapped_direct["files"]
         return wrapped_direct
     return _resolve_locale_payload(payload)
 
@@ -829,10 +849,14 @@ def _resolve_locale_payload(payload: Any) -> Dict[str, Any]:
     for key in _PREFERRED_LOCALES:
         candidate = _to_post_payload(payload.get(key))
         if candidate:
+            if isinstance(payload.get("files"), list):
+                candidate["files"] = payload["files"] + candidate["files"]
             return candidate
     for value in payload.values():
         candidate = _to_post_payload(value)
         if candidate:
+            if isinstance(payload.get("files"), list):
+                candidate["files"] = payload["files"] + candidate["files"]
             return candidate
     return {}
 
@@ -846,6 +870,7 @@ def _to_post_payload(candidate: Any) -> Dict[str, Any]:
     return {
         "title": str(candidate.get("title", "") or ""),
         "content": content,
+        "files": candidate["files"] if isinstance(candidate.get("files"), list) else [],
     }
 
 

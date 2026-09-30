@@ -1169,8 +1169,10 @@ def _clarify_send_then_wait(fut, *, clarify_id: str, session_key: str, clarify_m
     timeout = clarify_mod.get_clarify_timeout()
     response = clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
     if response is None or response == "":
-        # Timeout or session-boundary cancellation
-        return f"[user did not respond within {int(timeout / 60)}m]"
+        # Use the tool's existing cancellation/timeout sentinel: legacy batch
+        # callbacks must stop here instead of opening the next stale question.
+        from tools.clarify_tool import TIMEOUT_RESPONSE
+        return TIMEOUT_RESPONSE
     return response
 
 
@@ -6547,8 +6549,11 @@ class TurnRunner:
         # ------------------------------------------------------------------
         def _clarify_callback_sync(question: str, choices, multi_select: bool = False) -> str:
             from tools import clarify_gateway as _clarify_mod
+            from tools.clarify_tool import TIMEOUT_RESPONSE
             import uuid as _uuid
 
+            if getattr(agent, "_interrupt_requested", False) or not ctx._run_still_current():
+                return TIMEOUT_RESPONSE
             if not ctx._status_adapter:
                 return ""
 
@@ -6636,11 +6641,14 @@ class TurnRunner:
                 clarify_mod=_clarify_mod,
             )
             # Only re-arm typing when the user actually answered — the
-            # undeliverable sentinel and the timeout/cancellation strings
-            # start with '[' and must pass through untouched.
+            # undeliverable and timeout/cancellation sentinels must pass
+            # through untouched.
             if not (
-                isinstance(_clarify_response, str)
-                and _clarify_response.startswith("[")
+                _clarify_response == TIMEOUT_RESPONSE
+                or (
+                    isinstance(_clarify_response, str)
+                    and _clarify_response.startswith("[")
+                )
             ):
                 # User answered.  Reopen the typing indicator IMMEDIATELY —
                 # don't wait for the LLM's first post-answer token.  On native
@@ -11146,6 +11154,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         busy_text_mode = self._effective_busy_text_mode(event.source)
         if (
             event.message_type == MessageType.TEXT
+            and not event.media_urls
+            and not event.media_types
             and busy_text_mode == "queue"
             and effective_mode != "steer"
         ):
@@ -11222,6 +11232,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _steer_media_urls = getattr(event, "media_urls", None) or []
             _steer_all_voice = bool(_steer_media_urls) and (
                 len(self._pending_event_audio_paths(event)) == len(_steer_media_urls)
+                and all(
+                    _event_media_is_audio(event, i)
+                    for i in range(len(_steer_media_urls))
+                )
             )
             can_steer = (
                 steer_text
@@ -18644,6 +18658,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # to the second option). Slash
         # commands still bypass this path so /stop and friends keep working.
         _clarify_mod = None
+        _clarify_attachment_followup = False
         try:
             from tools import clarify_gateway as _clarify_mod
             _pending_clarify = _clarify_mod.get_pending_for_session(
@@ -18656,8 +18671,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and _pending_clarify is not None
             and _clarify_mod is not None
         ):
-            _clarify_has_audio = bool(self._pending_event_audio_paths(event))
-            _raw_clarify_reply = await self._prepare_clarify_reply_text(event)
+            _clarify_audio_paths = self._pending_event_audio_paths(event)
+            _clarify_media_urls = event.media_urls or []
+            _clarify_has_audio = bool(_clarify_audio_paths)
+            _clarify_attachment = (
+                bool(_clarify_media_urls or event.media_types)
+                or event.message_type in {
+                    MessageType.PHOTO, MessageType.VIDEO, MessageType.AUDIO,
+                    MessageType.DOCUMENT, MessageType.STICKER,
+                }
+            ) and not (
+                _clarify_has_audio
+                and len(_clarify_audio_paths) == len(_clarify_media_urls)
+                and all(
+                    _event_media_is_audio(event, i)
+                    for i in range(len(_clarify_media_urls))
+                )
+            )
+            if _clarify_attachment and not event.is_command():
+                # Captions/placeholders are not the uploaded file's contents.
+                # Release this wait, then route the complete event normally;
+                # otherwise an empty upload deadlocks or its caption swallows
+                # the media as an open-ended/"Other" clarify answer.
+                _clarify_mod.resolve_gateway_clarify(_pending_clarify.clarify_id, "")
+                _clarify_attachment_followup = True
+                _raw_clarify_reply = ""
+                _clarify_has_audio = False
+            else:
+                _raw_clarify_reply = await self._prepare_clarify_reply_text(event)
             if _clarify_has_audio and not _raw_clarify_reply:
                 logger.info(
                     "Gateway retained pending clarify after voice transcription "
@@ -19004,9 +19045,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
             # Adapter busy callbacks and the runner's priority path must use
             # the same Feishu handoff/receipt contract (including /steer).
+            # Clarify attachments bypassed the adapter guard, so reuse its
+            # full-event queue/interrupt path on every platform too.
             from gateway.stream_consumer import GatewayStreamConsumer
             consumer = getattr(running_agent, "_gateway_stream_consumer", None)
-            if source.platform == Platform.FEISHU and isinstance(consumer, GatewayStreamConsumer) and consumer.cardkit_mode:
+            if _clarify_attachment_followup or (
+                source.platform == Platform.FEISHU
+                and isinstance(consumer, GatewayStreamConsumer)
+                and consumer.cardkit_mode
+            ):
                 if await self._handle_active_session_busy_message(event, _quick_key):
                     return None
             if effective_busy_input_mode == "steer":
