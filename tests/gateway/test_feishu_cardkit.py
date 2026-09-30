@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -11,6 +13,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms.base import SendResult
 from gateway.platforms.feishu_inbound.cardkit import (
     STREAMING_ELEMENT_ID,
+    LOADING_ELEMENT_ID,
     CardKitState,
     build_card_id_message_content,
     build_final_card_body,
@@ -311,6 +314,44 @@ async def test_finalize_failure_is_reported_and_state_is_retained():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("expired", [False, True])
+async def test_finalize_empty_stopped_card_removes_loading_and_has_stopped_footer(expired):
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client = object()
+    state = CardKitState(card_id="ck_1", message_id="om_1", expired=expired)
+    adapter._streaming_cards["om_1"] = state
+    update = AsyncMock(return_value=True)
+    with (
+        patch("plugins.platforms.feishu.adapter.set_card_streaming_mode", new=AsyncMock(return_value=not expired)),
+        patch("plugins.platforms.feishu.adapter.cardkit_update_card", new=update),
+    ):
+        assert await adapter.finalize_streaming_message("om_1", "", stopped=True) is True
+
+    body = update.await_args.kwargs["card_body"]
+    assert body["config"]["streaming_mode"] is False
+    assert body["body"]["elements"][0]["content"] == ""
+    assert LOADING_ELEMENT_ID not in {element.get("element_id") for element in body["body"]["elements"]}
+    assert body["body"]["elements"][-1]["content"] == "已停止"
+    assert "om_1" not in adapter._streaming_cards
+
+
+@pytest.mark.asyncio
+async def test_finalize_empty_stopped_card_update_failure_retains_state():
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client = object()
+    state = CardKitState(card_id="ck_1", message_id="om_1")
+    adapter._streaming_cards["om_1"] = state
+    with (
+        patch("plugins.platforms.feishu.adapter.set_card_streaming_mode", new=AsyncMock(return_value=True)),
+        patch("plugins.platforms.feishu.adapter.cardkit_update_card", new=AsyncMock(return_value=False)),
+        pytest.raises(RuntimeError, match="final card update failed"),
+    ):
+        await adapter.finalize_streaming_message("om_1", "", stopped=True)
+    assert adapter._streaming_cards["om_1"] is state
+    assert state.stopped is False
+
+
+@pytest.mark.asyncio
 async def test_stop_all_closes_stream_before_replacing_stopped_card():
     adapter = FeishuAdapter(PlatformConfig())
     adapter._client = object()
@@ -352,11 +393,206 @@ async def test_stop_all_closes_stream_before_replacing_stopped_card():
     assert state.stopped is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_at", ["message_send", "first_frame"])
+async def test_cancelled_initial_send_seals_its_card_before_propagating_cancel(
+    cancel_at, tmp_path, monkeypatch,
+):
+    """SDK threads can deliver a card after the consumer's send was cancelled."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = FeishuAdapter(PlatformConfig(extra={"streaming_transport": "cardkit"}))
+    entered = threading.Event()
+    release = threading.Event()
+    late_returned = threading.Event()
+    calls = []
+    remote_card = {"streaming": True, "sequence": 0}
+
+    def create_card(request):
+        calls.append(("create", request))
+        return SimpleNamespace(success=lambda: True, data=SimpleNamespace(card_id="ck_1"))
+
+    def send_message(request):
+        calls.append(("send", request))
+        if cancel_at == "message_send":
+            entered.set()
+            assert release.wait(3)
+            late_returned.set()
+        return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_1"))
+
+    def content(request):
+        calls.append(("content", request))
+        if cancel_at == "first_frame":
+            entered.set()
+            assert release.wait(3)
+            late_returned.set()
+        # Model CardKit's monotonic sequence contract: a late SDK frame
+        # cannot overtake the later stopped-card replacement.
+        if request.request_body.sequence <= remote_card["sequence"]:
+            return _fail(300317, "sequence conflict")
+        remote_card["sequence"] = request.request_body.sequence
+        return _ok()
+
+    def settings(request):
+        calls.append(("close", request))
+        remote_card["sequence"] = request.request_body.sequence
+        remote_card["streaming"] = json.loads(request.request_body.settings)["config"]["streaming_mode"]
+        return _ok()
+
+    def update(request):
+        calls.append(("update", request))
+        remote_card["sequence"] = request.request_body.sequence
+        remote_card["body"] = json.loads(request.request_body.card.data)
+        remote_card["streaming"] = remote_card["body"]["config"]["streaming_mode"]
+        return _ok()
+
+    adapter._client = SimpleNamespace(
+        im=SimpleNamespace(v1=SimpleNamespace(message=SimpleNamespace(create=send_message))),
+        cardkit=SimpleNamespace(v1=SimpleNamespace(
+            card=SimpleNamespace(create=create_card, settings=settings, update=update),
+            card_element=SimpleNamespace(content=content),
+        )),
+    )
+    task = asyncio.create_task(adapter._send_streaming_card(
+        chat_id="oc_chat", content="partial response", reply_to=None,
+        metadata={"streaming": True},
+    ))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+    finally:
+        release.set()
+        await asyncio.to_thread(late_returned.wait, 2)
+        adapter._shutdown_sdk_executor()
+
+    assert [name for name, _request in calls if name in {"close", "update"}] == ["close", "update"]
+    assert remote_card["streaming"] is False
+    assert remote_card["body"]["body"]["elements"][0]["content"] == ""
+    assert remote_card["body"]["body"]["elements"][-1]["content"].startswith("已停止")
+    assert adapter._streaming_cards == {}
+
+
+@pytest.mark.asyncio
+async def test_initial_frame_exception_seals_card_before_send_fallback():
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client = object()
+    adapter._feishu_send_with_retry = AsyncMock(return_value=SimpleNamespace(
+        success=lambda: True, data=SimpleNamespace(message_id="om_1"),
+    ))
+    close = AsyncMock(return_value=True)
+    update = AsyncMock(return_value=True)
+    with (
+        patch("plugins.platforms.feishu.adapter.create_streaming_card", new=AsyncMock(return_value="ck_1")),
+        patch.object(adapter, "_stream_card_content", new=AsyncMock(side_effect=RuntimeError("connection reset"))),
+        patch("plugins.platforms.feishu.adapter.set_card_streaming_mode", new=close),
+        patch("plugins.platforms.feishu.adapter.cardkit_update_card", new=update),
+    ):
+        result = await adapter._send_streaming_card(
+            chat_id="oc_chat", content="partial response", reply_to=None,
+            metadata={"streaming": True},
+        )
+    assert result is None
+    close.assert_awaited_once()
+    update.assert_awaited_once()
+    assert adapter._streaming_cards == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_failure", [False, RuntimeError("connection reset")])
+async def test_initial_send_cancel_retries_seal_without_stopping_other_cards(first_failure):
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client = object()
+    unrelated = CardKitState(card_id="ck_other", message_id="om_other")
+    adapter._streaming_cards["om_other"] = unrelated
+    adapter._feishu_send_with_retry = AsyncMock(return_value=SimpleNamespace(
+        success=lambda: True, data=SimpleNamespace(message_id="om_1"),
+    ))
+    attempts = []
+
+    async def update(_client, **kwargs):
+        attempts.append(kwargs)
+        state = adapter._streaming_cards["om_1"]
+        assert state.stopped is False
+        if len(attempts) == 1:
+            if isinstance(first_failure, Exception):
+                raise first_failure
+            return first_failure
+        return True
+
+    with (
+        patch("plugins.platforms.feishu.adapter.create_streaming_card", new=AsyncMock(return_value="ck_1")),
+        patch.object(adapter, "_stream_card_content", new=AsyncMock(side_effect=asyncio.CancelledError)),
+        patch("plugins.platforms.feishu.adapter.set_card_streaming_mode", new=AsyncMock(return_value=False)),
+        patch("plugins.platforms.feishu.adapter.cardkit_update_card", side_effect=update),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await adapter._send_streaming_card(
+            chat_id="oc_chat", content="partial response", reply_to=None,
+            metadata={"streaming": True},
+        )
+
+    assert [call["sequence"] for call in attempts] == [3, 5]
+    assert all(call["card_id"] == "ck_1" for call in attempts)
+    assert adapter._streaming_cards == {"om_other": unrelated}
+    assert unrelated.stopped is False
+
+
+@pytest.mark.asyncio
+async def test_failed_initial_send_cancel_seal_retains_state_for_targeted_retry(caplog):
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client = object()
+    adapter._feishu_send_with_retry = AsyncMock(return_value=SimpleNamespace(
+        success=lambda: True, data=SimpleNamespace(message_id="om_1"),
+    ))
+    update = AsyncMock(return_value=False)
+    with (
+        patch("plugins.platforms.feishu.adapter.create_streaming_card", new=AsyncMock(return_value="ck_1")),
+        patch.object(adapter, "_stream_card_content", new=AsyncMock(side_effect=asyncio.CancelledError)),
+        patch("plugins.platforms.feishu.adapter.set_card_streaming_mode", new=AsyncMock(side_effect=RuntimeError("unavailable"))),
+        patch("plugins.platforms.feishu.adapter.cardkit_update_card", new=update),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await adapter._send_streaming_card(
+            chat_id="oc_chat", content="partial response", reply_to=None,
+            metadata={"streaming": True},
+        )
+
+    assert update.await_count == 3
+    assert adapter._streaming_cards["om_1"].stopped is False
+    assert "Could not seal aborted initial streaming card ck_1" in caplog.text
+
+
 def test_cardkit_state_defaults():
     state = CardKitState(card_id="ck_1", message_id="om_1")
     assert state.sequence == 1
     assert state.element_id == STREAMING_ELEMENT_ID
     assert state.failed is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", ["", "visible partial"])
+@pytest.mark.parametrize("close_failure", [False, RuntimeError("settings connection reset")])
+async def test_stopped_card_replacement_can_recover_a_rejected_settings_call(content, close_failure):
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client = object()
+    adapter._streaming_cards["om_1"] = CardKitState(card_id="ck_1", message_id="om_1")
+    update = AsyncMock(return_value=True)
+    close = (
+        AsyncMock(side_effect=close_failure) if isinstance(close_failure, Exception)
+        else AsyncMock(return_value=close_failure)
+    )
+    with (
+        patch("plugins.platforms.feishu.adapter.set_card_streaming_mode", new=close),
+        patch("plugins.platforms.feishu.adapter.cardkit_update_card", new=update),
+    ):
+        assert await adapter.finalize_streaming_message("om_1", content, stopped=True) is True
+
+    body = update.await_args.kwargs["card_body"]
+    assert body["config"]["streaming_mode"] is False
+    assert all(e.get("element_id") != LOADING_ELEMENT_ID for e in body["body"]["elements"])
+    assert body["body"]["elements"][0]["content"] == content
+    assert adapter._streaming_cards == {}
 
 
 def test_cardkit_streaming_uses_native_element_limit():

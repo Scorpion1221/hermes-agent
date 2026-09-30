@@ -2384,6 +2384,19 @@ class FeishuAdapter(BasePlatformAdapter):
         if not card_id:
             return None
         created_at = time.time()
+        elapsed_origin = 0.0
+        try:
+            elapsed_origin = float((metadata or {}).get("cardkit_elapsed_origin") or 0.0)
+        except (TypeError, ValueError):
+            pass
+        # Own the card before sending its IM reference. Cancelling an SDK
+        # await does not stop its worker thread; the message can still land
+        # even though no message_id has reached the stream consumer yet.
+        state = CardKitState(
+            card_id=card_id, sequence=1, started_at=created_at,
+            reply_to_message_id=reply_to or "", created_at=created_at,
+            elapsed_origin=elapsed_origin,
+        )
         payload = build_card_id_message_content(card_id)
         try:
             response = await self._feishu_send_with_retry(
@@ -2392,16 +2405,7 @@ class FeishuAdapter(BasePlatformAdapter):
             )
             result = self._finalize_send_result(response, "streaming card send failed")
             if result.success and result.message_id:
-                elapsed_origin = 0.0
-                try:
-                    elapsed_origin = float((metadata or {}).get("cardkit_elapsed_origin") or 0.0)
-                except (TypeError, ValueError):
-                    elapsed_origin = 0.0
-                state = CardKitState(
-                    card_id=card_id, message_id=result.message_id, sequence=1,
-                    started_at=time.time(), reply_to_message_id=reply_to or "",
-                    created_at=created_at, elapsed_origin=elapsed_origin,
-                )
+                state.message_id = result.message_id
                 self._streaming_cards[result.message_id] = state
                 self._remember_cardkit_message(result.message_id)
                 first_frame = await self._stream_card_content(state, content)
@@ -2410,10 +2414,54 @@ class FeishuAdapter(BasePlatformAdapter):
                     # The card exists but its first frame was skipped; let
                     # the consumer resend it instead of treating it as shown.
                     result.raw_response = {"cardkit_rate_limited": True}
+                elif first_frame.ok:
+                    state.last_content = content
+            else:
+                await self._stop_initial_streaming_card(state)
             return result
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
+            # Seal only this send's card, including the pre-message_id
+            # window. Shield cleanup from a second cancellation while the
+            # gateway is draining the consumer, but preserve cancellation
+            # rather than returning None and triggering a fallback send.
+            await asyncio.shield(self._stop_initial_streaming_card(state))
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             logger.warning("[Feishu] Streaming card send failed, will fall back: %s", exc)
             return None
+
+    async def _stop_initial_streaming_card(self, state: CardKitState) -> None:
+        """Seal a send aborted before the consumer acquired its message id."""
+        for attempt in range(3):
+            try:
+                state.sequence += 1
+                await set_card_streaming_mode(
+                    self._client, card_id=state.card_id, enabled=False,
+                    sequence=state.sequence,
+                )
+            except Exception:
+                logger.debug("[Feishu] Closing aborted initial card failed", exc_info=True)
+            # A full-card replacement also disables streaming; try it even
+            # when settings was rejected or its acknowledgement was lost.
+            try:
+                updated = await self._update_card_body(
+                    state, state.last_content, elapsed_seconds=self._cardkit_elapsed(state),
+                    stopped=True, status="已停止",
+                )
+            except Exception:
+                updated = False
+                logger.debug("[Feishu] Replacing aborted initial card failed", exc_info=True)
+            if updated:
+                state.stopped = True
+                if self._streaming_cards.get(state.message_id) is state:
+                    self._streaming_cards.pop(state.message_id, None)
+                return
+            if attempt < 2:
+                await asyncio.sleep(0.25)
+        logger.warning(
+            "[Feishu] Could not seal aborted initial streaming card %s (message=%s)",
+            state.card_id, state.message_id or "unknown",
+        )
 
     def _remember_cardkit_message(self, message_id: str) -> None:
         self._cardkit_message_ids[message_id] = None
@@ -2536,22 +2584,31 @@ class FeishuAdapter(BasePlatformAdapter):
         elapsed = self._cardkit_elapsed(state)
         logger.info("[Feishu] Finalizing streaming card %s (seq=%d, elapsed=%.1fs, stopped=%s)", state.card_id, state.sequence, elapsed, stopped)
         state.sequence += 1
-        streaming_closed = await set_card_streaming_mode(
-            self._client, card_id=state.card_id, enabled=False, sequence=state.sequence,
-        )
+        try:
+            streaming_closed = await set_card_streaming_mode(
+                self._client, card_id=state.card_id, enabled=False, sequence=state.sequence,
+            )
+        except Exception:
+            if not stopped:
+                raise
+            streaming_closed = False
+            logger.debug("[Feishu] Closing stopped card failed; trying full replacement", exc_info=True)
         logger.info(
             "[Feishu] Streaming mode disabled for %s: %s",
             state.card_id,
             streaming_closed,
         )
-        if not streaming_closed and not (state.expired and final_text):
+        if not streaming_closed and not stopped and not (state.expired and final_text):
             # An expired card has already left streaming mode; its full-card
-            # update below is still authoritative.
+            # update below is still authoritative. A stopped replacement also
+            # disables streaming and removes the loading element, so attempt
+            # that recovery even if the separate settings call failed.
             raise RuntimeError(f"CardKit streaming close failed for {state.card_id}")
-        if final_text:
+        if final_text or stopped:
             final_card_updated = await self._update_card_body(
                 state, final_text,
-                elapsed_seconds=elapsed, stopped=stopped, status=status, footer=footer,
+                elapsed_seconds=elapsed, stopped=stopped,
+                status=status or ("已停止" if stopped else ""), footer=footer,
             )
             logger.info(
                 "[Feishu] Final card updated for %s: %s",

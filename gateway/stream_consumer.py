@@ -3053,6 +3053,12 @@ class GatewayStreamConsumer:
                 await asyncio.sleep(0.05)  # Small yield to not busy-loop
 
         except asyncio.CancelledError:
+            if self._cardkit_mode and not self._run_still_current():
+                # /stop may race the stale-run seal (or an in-flight send).
+                # Preserve only what is already visible, not queued deltas,
+                # and never promote an abandoned turn to final delivery.
+                await self._abandon_cardkit_card()
+                return
             # Best-effort final edit on cancellation.  finalize=True so
             # REQUIRES_EDIT_FINALIZE platforms (Telegram) apply final
             # formatting — a plain edit here would leave the entire reply
@@ -3124,6 +3130,7 @@ class GatewayStreamConsumer:
                 self._record_turn_final_payload(self._accumulated)
         except Exception as e:
             logger.error("Stream consumer error: %s", e)
+            await self._abandon_cardkit_card()
         finally:
             self._closed = True
             # Safety net: if run() exits (normal return, cancellation, or
@@ -3790,18 +3797,35 @@ class GatewayStreamConsumer:
         """
         if not self._cardkit_mode:
             return
-        try:
-            if self._message_id:
-                await self.adapter.finalize_streaming_message(
-                    self._message_id,
-                    self._last_sent_text or self._clean_for_display(self._accumulated),
-                    stopped=True,
-                )
-            elif self._cardkit_last_sealed:
-                sealed_id, sealed_text = self._cardkit_last_sealed
-                await self._update_sealed_cardkit_card(sealed_id, sealed_text, stopped=True)
-        except Exception as e:
-            logger.debug("Sealing abandoned CardKit card failed (best-effort): %s", e)
+        if not self._message_id and not self._cardkit_last_sealed:
+            return
+        # A failed close must not silently end the only task that owns the
+        # live card. Match the bounded retry pattern used by handoff/rollover;
+        # only a literal ACK proves the streaming indicator was dismissed.
+        error = "no acknowledgement"
+        for attempt in range(3):
+            try:
+                if self._message_id:
+                    committed = await self.adapter.finalize_streaming_message(
+                        self._message_id,
+                        self._last_sent_text,
+                        stopped=True,
+                    )
+                else:
+                    sealed_id, sealed_text = self._cardkit_last_sealed
+                    committed = await self._update_sealed_cardkit_card(
+                        sealed_id, sealed_text, stopped=True,
+                    )
+                if committed is True:
+                    return
+            except Exception as e:
+                error = str(e)
+            if attempt < 2:
+                await asyncio.sleep(0.25)
+        logger.warning(
+            "Sealing abandoned CardKit card failed after 3 attempts (message=%s): %s",
+            self._message_id or self._cardkit_last_sealed[0], error,
+        )
 
     async def _flush_segment_tail_on_edit_failure(self) -> None:
         """Deliver un-sent tail content before a segment-break reset.

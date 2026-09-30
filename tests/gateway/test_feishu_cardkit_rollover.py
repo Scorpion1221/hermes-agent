@@ -974,6 +974,122 @@ async def test_stale_turn_right_after_a_rollover_restatuses_the_sealed_card():
     ]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [False, RuntimeError("temporary close failure")])
+async def test_stale_turn_retries_a_failed_card_close(failure):
+    class FlakyCloseTransport(RolloverCardTransport):
+        async def finalize_streaming_message(self, *args, **kwargs):
+            result = await super().finalize_streaming_message(*args, **kwargs)
+            if len(self.finalized) == 1:
+                if isinstance(failure, Exception):
+                    raise failure
+                return failure
+            return result
+
+    adapter = FlakyCloseTransport()
+    consumer = consumer_for(adapter)
+    consumer._message_id = "card-1"
+    consumer._last_sent_text = "visible partial"
+    consumer._run_still_current = lambda: False
+
+    await consumer.run()
+
+    assert len(adapter.finalized) == 2
+    assert all(f["content"] == "visible partial" and f["stopped"] for f in adapter.finalized)
+    assert consumer.final_response_sent is False
+    assert consumer.final_content_delivered is False
+
+
+@pytest.mark.asyncio
+async def test_stale_turn_reports_exhausted_card_close(caplog):
+    class FailedCloseTransport(RolloverCardTransport):
+        async def finalize_streaming_message(self, *args, **kwargs):
+            await super().finalize_streaming_message(*args, **kwargs)
+            return False
+
+    adapter = FailedCloseTransport()
+    consumer = consumer_for(adapter)
+    consumer._message_id = "card-1"
+    consumer._last_sent_text = "visible partial"
+    consumer._run_still_current = lambda: False
+
+    with caplog.at_level("WARNING", logger="gateway.stream_consumer"):
+        await consumer.run()
+
+    assert len(adapter.finalized) == 3
+    assert "Sealing abandoned CardKit card failed" in caplog.text
+    assert consumer.final_content_delivered is False
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_stale_close_never_publishes_unseen_content():
+    class BlockedCloseTransport(RolloverCardTransport):
+        close_started = asyncio.Event()
+
+        async def finalize_streaming_message(self, *args, **kwargs):
+            result = await super().finalize_streaming_message(*args, **kwargs)
+            if len(self.finalized) == 1:
+                self.close_started.set()
+                await asyncio.Event().wait()
+            return result
+
+    adapter = BlockedCloseTransport()
+    consumer = consumer_for(adapter)
+    consumer._message_id = "card-1"
+    consumer._last_sent_text = "visible partial"
+    consumer._accumulated = "visible partial plus unseen queued content"
+    consumer._run_still_current = lambda: False
+    task = asyncio.create_task(consumer.run())
+    await asyncio.wait_for(adapter.close_started.wait(), 3)
+    task.cancel()
+    await asyncio.wait_for(task, 3)
+
+    assert adapter.sent == [] and adapter.edits == []
+    assert all(f["content"] == "visible partial" and f["stopped"] for f in adapter.finalized)
+    assert consumer.final_response_sent is False
+    assert consumer.final_content_delivered is False
+
+
+@pytest.mark.asyncio
+async def test_unexpected_consumer_error_seals_the_visible_card(monkeypatch):
+    adapter = RolloverCardTransport()
+    consumer = consumer_for(adapter)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("visible partial")
+    await wait_for(lambda: consumer.message_id is not None)
+
+    def fail_processing(_text):
+        raise RuntimeError("stream processing failed")
+
+    monkeypatch.setattr(consumer, "_filter_and_accumulate", fail_processing)
+    consumer.on_delta("unseen content")
+    await asyncio.wait_for(task, 3)
+
+    assert adapter.finalized == [
+        {"message_id": "card-1", "content": "visible partial", "footer": None, "stopped": True}
+    ]
+    assert consumer.final_response_sent is False
+    assert consumer.final_content_delivered is False
+
+
+@pytest.mark.asyncio
+async def test_stale_card_with_skipped_first_frame_does_not_publish_buffer():
+    adapter = RolloverCardTransport()
+    consumer = consumer_for(adapter)
+    consumer._message_id = "card-1"
+    consumer._last_sent_text = ""  # The first frame was rate-limited, not shown.
+    consumer._accumulated = "unseen buffered content"
+    consumer._run_still_current = lambda: False
+
+    await consumer.run()
+
+    assert adapter.finalized == [
+        {"message_id": "card-1", "content": "", "footer": None, "stopped": True}
+    ]
+    assert adapter.sent == [] and adapter.edits == []
+    assert consumer.final_content_delivered is False
+
+
 def last_card(adapter):
     return adapter.finalized[-1]["content"].rstrip()
 
