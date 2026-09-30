@@ -7,7 +7,7 @@ content into Hermes gateway ``MessageEvent`` objects.
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Optional, Sequence
 
 from gateway.platforms.base import MessageEvent, MessageType
@@ -279,6 +279,7 @@ def build_message_event(
         internal=internal,
         platform_auth_passed=platform_auth_passed,
         timestamp=timestamp or datetime.now(),
+        metadata={"feishu_message_type": extracted.raw_message_type},
     )
 
 
@@ -355,6 +356,22 @@ def build_feishu_message_event(
     platform_auth_passed: bool = False,
     timestamp: Optional[datetime] = None,
 ) -> MessageEvent:
+    # Attachment hydration may take seconds. Preserve Feishu's original
+    # millisecond timestamp rather than presenting download completion as receipt.
+    received_at = None
+    try:
+        create_time_ms = int(str(getattr(message, "create_time", "")))
+        if create_time_ms > 0:
+            received_at = datetime.fromtimestamp(create_time_ms / 1000, timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        pass
+    if received_at is None:
+        # Legacy callers pass datetime.now() (naive server-local time). Normalize
+        # that instant here; new fallbacks are aware UTC from the outset.
+        received_at = (
+            timestamp.astimezone(timezone.utc)
+            if timestamp is not None else datetime.now(timezone.utc)
+        )
     return build_message_event(
         extracted=inbound_content,
         source=source,
@@ -365,7 +382,7 @@ def build_feishu_message_event(
         channel_prompt=channel_prompt,
         internal=internal,
         platform_auth_passed=platform_auth_passed,
-        timestamp=timestamp,
+        timestamp=received_at,
     )
 
 

@@ -3542,6 +3542,18 @@ def _build_media_placeholder(event) -> str:
     return "\n".join(parts)
 
 
+def _is_feishu_file_followup(event: MessageEvent) -> bool:
+    """Keep uploaded image files distinct from Feishu's native photo messages."""
+    return event.source.platform == Platform.FEISHU and bool(event.media_urls) and (
+        event.message_type in {MessageType.TEXT, MessageType.DOCUMENT, MessageType.AUDIO, MessageType.VIDEO}
+        or (event.message_type == MessageType.COMMAND and event.get_command() == "steer")
+        or (
+            event.message_type == MessageType.PHOTO
+            and (event.metadata or {}).get("feishu_message_type") == "file"
+        )
+    )
+
+
 def _build_document_context_note(
     display_name: str,
     agent_path: str,
@@ -11000,6 +11012,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return text
         return (enriched_text or text).strip()
 
+    async def _prepare_busy_attachment_followup(self, event: MessageEvent) -> Optional[str]:
+        """Represent cached Feishu files losslessly for the text-only steer API.
+
+        Do not use normal inbound preparation here: it can stage native image
+        parts for a new turn, which redirect/steer never consumes. Folder
+        manifests and every leaf instead remain readable through cache paths.
+        Voice notes and standalone photos keep their existing media pipeline.
+        """
+        paths = event.media_urls or []
+        if (
+            not _is_feishu_file_followup(event)
+            or len(event.media_types or []) > len(paths)
+            or any(not os.path.isabs(path) or not os.path.isfile(path) for path in paths)
+        ):
+            return None
+
+        from tools.credential_files import to_agent_visible_cache_path
+
+        text = await self._prepare_busy_steer_text(event)
+        if event.get_command() == "steer":
+            text = event.get_command_args().strip()
+        notes = []
+        for i, path in enumerate(paths):
+            basename = os.path.basename(path)
+            parts = basename.split("_", 2)
+            display_name = re.sub(r'[^\w.\- ]', '_', parts[2] if len(parts) >= 3 else basename)
+            agent_path = to_agent_visible_cache_path(path)
+            mtype = _event_media_type_at(event, i)
+            if mtype.startswith(("image/", "audio/", "video/")):
+                notes.append(
+                    f"[The user sent a file attachment: '{display_name}' ({mtype}). "
+                    f"It is saved at: {agent_path}. Its content is not inlined here. "
+                    "Use the available image/audio/video tools to inspect this file "
+                    "before answering questions about its contents.]"
+                )
+            else:
+                notes.append(_build_document_context_note(
+                    display_name, agent_path, mtype, content_inlined=False,
+                ))
+        return "\n\n".join([*notes, text]).strip()
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -11220,11 +11273,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return False
             return followup_consumer.register_followup(
                 text, anchor, self._thread_metadata_for_source(event.source, anchor) or {},
-                requeue_unconsumed,
+                requeue_unconsumed, received_at=event.timestamp,
             )
 
+        attachment_text = None
+        if effective_mode in {"steer", "interrupt"} and event.media_urls:
+            try:
+                attachment_text = await self._prepare_busy_attachment_followup(event)
+            except Exception:
+                logger.warning("Could not prepare attachment follow-up for %s", session_key, exc_info=True)
+
         if effective_mode == "steer":
-            steer_text = event.get_command_args().strip() if explicit_steer else await self._prepare_busy_steer_text(event)
+            steer_text = attachment_text or (
+                event.get_command_args().strip() if explicit_steer else await self._prepare_busy_steer_text(event)
+            )
             # A follow-up qualifies for steering when it is plain text, OR
             # when every attachment is STT-eligible voice media whose
             # transcript was just folded into steer_text — otherwise a voice
@@ -11246,6 +11308,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         and not event.media_types
                     )
                     or _steer_all_voice
+                    or attachment_text is not None
                 )
                 and running_agent is not None
                 and running_agent is not _AGENT_PENDING_SENTINEL
@@ -11270,20 +11333,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 effective_mode = "queue"
         elif (
             effective_mode == "interrupt"
-            and event.message_type == MessageType.TEXT
-            and not event.media_urls
-            and not event.media_types
+            and (
+                (event.message_type == MessageType.TEXT and not event.media_urls and not event.media_types)
+                or attachment_text is not None
+            )
             and running_agent is not None
             and running_agent is not _AGENT_PENDING_SENTINEL
             and getattr(running_agent, "_supports_active_turn_redirect", False) is True
             and hasattr(running_agent, "redirect")
         ):
-            followup_receipt = register_followup((event.text or "").strip())
+            redirect_text = attachment_text or (event.text or "").strip()
+            followup_receipt = register_followup(redirect_text)
             try:
                 if getattr(running_agent, "api_mode", None) == "codex_app_server":
-                    redirected = bool(await asyncio.to_thread(running_agent.redirect, (event.text or "").strip()))
+                    redirected = bool(await asyncio.to_thread(running_agent.redirect, redirect_text))
                 else:
-                    redirected = bool(running_agent.redirect((event.text or "").strip()))
+                    redirected = bool(running_agent.redirect(redirect_text))
             except asyncio.CancelledError:
                 if followup_receipt is not None:
                     followup_consumer.discard_followup(followup_receipt)
@@ -11299,6 +11364,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await followup_consumer.acknowledge_followup(followup_receipt)
                 return True
             followup_consumer.discard_followup(followup_receipt)
+
+        if (
+            not steered and not redirected
+            and _is_feishu_file_followup(event)
+        ):
+            # A missing cache file or a turn-final race must retain the whole
+            # event, not interrupt tools or deliver only its caption.
+            effective_mode = "queue"
 
         # Store the message so it's processed as the next turn after the
         # current run finishes (or is interrupted).  Skip this for a
@@ -18209,7 +18282,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # last tool result's content. No interrupt, no new user turn,
         # no role-alternation violation.
         steer_text = event.get_command_args().strip()
-        if not steer_text:
+        if not steer_text and not _is_feishu_file_followup(event):
             return "Usage: /steer <prompt>"
         _steer_state = self._peek_session_state(quick_key)
         running_agent = _steer_state.turn.agent if _steer_state else None
@@ -18217,19 +18290,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Agent hasn't started yet — queue as turn-boundary fallback.
             adapter = self._adapter_for_source(source)
             if adapter:
-                queued_event = MessageEvent(
+                queued_event = dataclasses.replace(
+                    event,
                     text=steer_text,
                     message_type=MessageType.TEXT,
-                    source=event.source,
-                    message_id=event.message_id,
-                    channel_prompt=event.channel_prompt,
-                    channel_context=event.channel_context,
                 )
                 self._enqueue_fifo(quick_key, queued_event, adapter)
             return "Agent still starting — /steer queued for the next turn."
         from gateway.stream_consumer import GatewayStreamConsumer
         consumer = getattr(running_agent, "_gateway_stream_consumer", None)
-        if source.platform == Platform.FEISHU and isinstance(consumer, GatewayStreamConsumer) and consumer.cardkit_mode:
+        if running_agent is not None and source.platform == Platform.FEISHU and (
+            _is_feishu_file_followup(event)
+            or (isinstance(consumer, GatewayStreamConsumer) and consumer.cardkit_mode)
+        ):
             if await self._handle_active_session_busy_message(event, quick_key):
                 return ""
         if running_agent and hasattr(running_agent, "steer"):
@@ -18245,13 +18318,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Running agent is missing or lacks steer() — fall back to queue.
         adapter = self._adapter_for_source(source)
         if adapter:
-            queued_event = MessageEvent(
+            queued_event = dataclasses.replace(
+                event,
                 text=steer_text,
                 message_type=MessageType.TEXT,
-                source=event.source,
-                message_id=event.message_id,
-                channel_prompt=event.channel_prompt,
-                channel_context=event.channel_context,
             )
             self._enqueue_fifo(quick_key, queued_event, adapter)
         return "No active agent — /steer queued for the next turn."
@@ -18970,7 +19040,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event, _cmd_def_inner, _quick_key, source,
                 )
 
-            if event.message_type == MessageType.PHOTO:
+            if event.message_type == MessageType.PHOTO and not _is_feishu_file_followup(event):
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
                 adapter = self._adapter_for_source(source)
                 if adapter:
@@ -19049,7 +19119,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # full-event queue/interrupt path on every platform too.
             from gateway.stream_consumer import GatewayStreamConsumer
             consumer = getattr(running_agent, "_gateway_stream_consumer", None)
-            if _clarify_attachment_followup or (
+            if _clarify_attachment_followup or _is_feishu_file_followup(event) or (
                 source.platform == Platform.FEISHU
                 and isinstance(consumer, GatewayStreamConsumer)
                 and consumer.cardkit_mode
@@ -19551,7 +19621,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Strip the prefix so downstream treats it as a normal user
             # message. If the payload is empty, surface the usage hint.
             steer_payload = event.get_command_args().strip()
-            if not steer_payload:
+            if not steer_payload and not _is_feishu_file_followup(event):
                 return "Usage: /steer <prompt>  (no agent is running; sending as a normal message)"
             try:
                 event.text = steer_payload

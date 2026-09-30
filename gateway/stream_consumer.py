@@ -25,7 +25,7 @@ import secrets
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
@@ -72,13 +72,20 @@ _USER_INPUT_BOUNDARY = object()
 _ROLLOVER = object()
 
 
+def _format_followup_time(value: Optional[datetime] = None) -> str:
+    # Feishu follow-up cards must not change clocks with the gateway host.
+    return (value or datetime.now(timezone.utc)).astimezone(
+        timezone(timedelta(hours=8))
+    ).strftime("%H:%M:%S")
+
+
 @dataclass
 class FollowupReceipt:
     text: str
     reply_to_id: str
     metadata: dict
     requeue: Callable[[], bool]
-    received_at: str = field(default_factory=lambda: datetime.now().astimezone().strftime("%H:%M:%S"))
+    received_at: str = field(default_factory=_format_followup_time)
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     message_id: Optional[str] = None
     accepted: bool = False
@@ -965,8 +972,14 @@ class GatewayStreamConsumer:
         """Flush CardKit display state without splitting assistant text."""
         self._queue.put(_PROGRESS_BOUNDARY)
 
-    def register_followup(self, text: str, reply_to_id: str, metadata: dict, requeue: Callable[[], bool]) -> FollowupReceipt:
-        receipt = FollowupReceipt(text.strip(), reply_to_id, dict(metadata), requeue)
+    def register_followup(
+        self, text: str, reply_to_id: str, metadata: dict, requeue: Callable[[], bool],
+        *, received_at: Optional[datetime] = None,
+    ) -> FollowupReceipt:
+        receipt = FollowupReceipt(
+            text.strip(), reply_to_id, dict(metadata), requeue,
+            received_at=_format_followup_time(received_at),
+        )
         with self._followup_lock:
             self._followups.append(receipt)
         return receipt
@@ -1635,7 +1648,7 @@ class GatewayStreamConsumer:
             self._flush_think_buffer()
             self._cardkit_turn_final_text += self._accumulated[before_len:]
             final_text = self._clean_for_display(self._accumulated or self._last_sent_text or "")
-            consumed_at = datetime.now().astimezone().strftime("%H:%M:%S")
+            consumed_at = _format_followup_time()
             committed = not final_text.strip() and not self._message_id
             for attempt in range(3):
                 if committed:

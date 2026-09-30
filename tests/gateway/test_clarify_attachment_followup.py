@@ -481,7 +481,7 @@ async def test_zip_followup_aborts_real_legacy_batch_before_second_question():
     [("", MessageType.DOCUMENT), ("Use these source files", MessageType.TEXT)],
     ids=["empty-zip", "caption-with-zip"],
 )
-async def test_real_priority_route_preserves_clarify_upload_before_interrupt(
+async def test_real_priority_route_preserves_clarify_upload_when_steering_unavailable(
     monkeypatch, platform, busy_text_mode, text, message_type,
 ):
     monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
@@ -531,8 +531,14 @@ async def test_real_priority_route_preserves_clarify_upload_before_interrupt(
 
     assert entry.event.is_set()
     assert entry.response == ""
-    running_agent.interrupt.assert_called_once()
-    assert interrupt_observations == [(True, ["/tmp/source.zip"], ["application/zip"])]
+    if platform == Platform.FEISHU:
+        # A missing cached file / agent without redirect must retain the upload
+        # for a complete next turn, without tearing down the current task.
+        running_agent.interrupt.assert_not_called()
+        assert interrupt_observations == []
+    else:
+        running_agent.interrupt.assert_called_once()
+        assert interrupt_observations == [(True, ["/tmp/source.zip"], ["application/zip"])]
     assert adapter._pending_messages[session_key] is event
     assert event.text == text
     assert state.conversation.queued_events == []
