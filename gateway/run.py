@@ -11053,6 +11053,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ))
         return "\n\n".join([*notes, text]).strip()
 
+    def _busy_followup_is_cross_sender(self, event: MessageEvent, running_agent: Any) -> bool:
+        """True when a busy follow-up in a SHARED session comes from someone
+        other than the participant whose turn is running.
+
+        Steer/redirect/interrupt are corrections by the turn's owner; another
+        participant's message must run as its own (sender-prefixed) turn.
+        Unknown identities keep the legacy behaviour.
+        """
+        if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
+            return False
+        config = getattr(self, "config", None)
+        if not is_shared_multi_user_session(
+            event.source,
+            group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
+            thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+        ):
+            return False
+        owner = {
+            v for v in (getattr(running_agent, "_user_id", None), getattr(running_agent, "_user_id_alt", None))
+            if isinstance(v, str) and v
+        }
+        sender = {
+            v for v in (event.source.user_id, getattr(event.source, "user_id_alt", None))
+            if isinstance(v, str) and v
+        }
+        return bool(owner) and bool(sender) and not (owner & sender)
+
+    @staticmethod
+    def _explicit_steer_as_text(event: MessageEvent) -> MessageEvent:
+        """A queued '/steer x' must drain as the text 'x' (the drain safety
+        net discards slash commands)."""
+        payload = event.get_command_args().strip()
+        if event.get_command() != "steer" or not payload:
+            return event
+        return dataclasses.replace(
+            event,
+            text=payload,
+            message_type=event.message_type if event.media_urls else MessageType.TEXT,
+        )
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -11061,6 +11101,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # can inject messages into an active session they don't own.
         if (
             not getattr(event, "internal", False)
+            and getattr(event, "platform_auth_passed", False) is not True
             and not self._is_user_authorized(event.source)
         ):
             logger.warning(
@@ -11072,6 +11113,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
             )
             return True  # handled (silently dropped); do not fall through
+
+        if getattr(event, "_hermes_text_debounce_overflow", False) is True:
+            # The adapter's debounce could not hold this burst (its pending
+            # slot belongs to another sender): queue it as its own turn.
+            self._queue_or_replace_pending_event(session_key, event)
+            return True
 
         explicit_steer = event.get_command() == "steer"
         effective_mode = "steer" if explicit_steer else self._effective_busy_input_mode(event.source)
@@ -11150,7 +11197,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # MessageEvent.is_command()/get_command_args() only
                     # recognize the "/" prefix, not the per-platform display
                     # prefix ("!" on Slack/Matrix).
-                    _verb = "approve" if _approval_handler is self._handle_approve_command else "deny"
+                    _verb = "approve" if _approval_handler == self._handle_approve_command else "deny"
+                    _denied = self._check_slash_access(event.source, _verb)
+                    if _denied is not None:
+                        _adapter = self._adapter_for_source(event.source)
+                        if _adapter:
+                            _anchor = self._reply_anchor_for_event(event)
+                            await _adapter._send_with_retry(
+                                chat_id=event.source.chat_id,
+                                content=_denied,
+                                reply_to=_anchor,
+                                metadata=self._thread_metadata_for_source(event.source, _anchor),
+                            )
+                        return True
                     _synth = f"/{_verb}"
                     if _normalized_args:
                         _synth = f"{_synth} {_normalized_args}"
@@ -11248,6 +11307,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
             )
             effective_mode = "queue"
+        if effective_mode in {"interrupt", "steer"} and self._busy_followup_is_cross_sender(event, running_agent):
+            logger.info("Queueing cross-sender busy follow-up for shared session %s", session_key)
+            effective_mode = "queue"
+        queued_event = self._explicit_steer_as_text(event)
         steered = False
         redirected = False
         followup_receipt = None
@@ -11268,7 +11331,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # /stop or /new supersedes pending guidance; a normal final
                 # race instead preserves the message as an ordinary next turn.
                 if followup_consumer._run_still_current() and not getattr(running_agent, "_interrupt_requested", False):
-                    self._queue_or_replace_pending_event(session_key, event)
+                    self._queue_or_replace_pending_event(session_key, queued_event)
                     return True
                 return False
             return followup_consumer.register_followup(
@@ -11303,7 +11366,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 steer_text
                 and (
                     (
-                        event.message_type == MessageType.TEXT
+                        (event.message_type == MessageType.TEXT or explicit_steer)
                         and not event.media_urls
                         and not event.media_types
                     )
@@ -11389,7 +11452,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn in arrival order while still preserving photo-burst / album
         # merge semantics for media.
         if not steered and not redirected:
-            self._queue_or_replace_pending_event(session_key, event)
+            self._queue_or_replace_pending_event(session_key, queued_event)
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
@@ -18267,6 +18330,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=event.channel_prompt,
                 channel_context=event.channel_context,
                 internal=event.internal,
+                platform_auth_passed=event.platform_auth_passed,
                 timestamp=event.timestamp,
             )
             self._enqueue_fifo(quick_key, queued_event, adapter)
@@ -18305,6 +18369,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ):
             if await self._handle_active_session_busy_message(event, quick_key):
                 return ""
+        if self._busy_followup_is_cross_sender(event, running_agent):
+            adapter = self._adapter_for_source(source)
+            if adapter:
+                self._enqueue_fifo(quick_key, self._explicit_steer_as_text(event), adapter)
+            return "Queued for the next turn."
         if running_agent and hasattr(running_agent, "steer"):
             try:
                 accepted = running_agent.steer(steer_text)
@@ -19126,6 +19195,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ):
                 if await self._handle_active_session_busy_message(event, _quick_key):
                     return None
+            if self._busy_followup_is_cross_sender(event, running_agent):
+                logger.debug("PRIORITY cross-sender follow-up queued for session %s", _quick_key)
+                self._queue_or_replace_pending_event(_quick_key, event)
+                return None
             if effective_busy_input_mode == "steer":
                 # Steer mode: inject text into the running agent mid-run via
                 # agent.steer().  Falls back to queue semantics if the payload

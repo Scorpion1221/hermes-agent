@@ -6009,7 +6009,18 @@ class BasePlatformAdapter(ABC):
             existing_pending is not None
             and not self._can_merge_text_debounce_events(existing_pending, state.event)
         ):
-            return False
+            if self._busy_session_handler is None:
+                return False
+            # The pending slot belongs to another sender. Hand the burst to
+            # the gateway's FIFO instead of holding it here, where a third
+            # sender would have nowhere to go (it used to be dropped).
+            store.pop(session_key, None)
+            state.event._hermes_text_debounce_overflow = True  # type: ignore[attr-defined]
+            try:
+                await self._busy_session_handler(state.event, session_key)
+            except Exception as e:
+                logger.error("[%s] Debounce overflow hand-off failed: %s", self.name, e, exc_info=True)
+            return True
 
         state = store.pop(session_key, None)
         if state is None:

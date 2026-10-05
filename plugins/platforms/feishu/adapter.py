@@ -1681,6 +1681,13 @@ def check_feishu_requirements() -> bool:
         return False
 
 
+def _same_batch_sender(existing: MessageEvent, incoming: MessageEvent) -> bool:
+    """Shared group sessions must never fold one member's message into another's."""
+    def _sender(event: MessageEvent):
+        return getattr(event.source, "user_id_alt", None) or getattr(event.source, "user_id", None)
+    return _sender(existing) == _sender(incoming)
+
+
 class FeishuAdapter(BasePlatformAdapter):
     """Feishu/Lark bot adapter."""
 
@@ -4299,6 +4306,7 @@ class FeishuAdapter(BasePlatformAdapter):
     def _media_batch_is_compatible(existing: MessageEvent, incoming: MessageEvent) -> bool:
         return (
             existing.message_type == incoming.message_type
+            and _same_batch_sender(existing, incoming)
             and existing.reply_to_message_id == incoming.reply_to_message_id
             and existing.reply_to_text == incoming.reply_to_text
             and existing.source.thread_id == incoming.source.thread_id
@@ -4605,9 +4613,10 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _text_batch_is_compatible(existing: MessageEvent, incoming: MessageEvent) -> bool:
-        """Only merge text events when reply/thread context is identical."""
+        """Only merge one sender's text events with identical reply/thread context."""
         return (
-            existing.reply_to_message_id == incoming.reply_to_message_id
+            _same_batch_sender(existing, incoming)
+            and existing.reply_to_message_id == incoming.reply_to_message_id
             and existing.reply_to_text == incoming.reply_to_text
             and existing.source.thread_id == incoming.source.thread_id
         )

@@ -2725,6 +2725,7 @@ class GatewaySlashCommandsMixin:
             source=source,
             raw_message=event.raw_message,
             channel_prompt=event.channel_prompt,
+            platform_auth_passed=event.platform_auth_passed,
         )
         
         # Let the normal message handler process it
@@ -2789,6 +2790,7 @@ class GatewaySlashCommandsMixin:
                         source=event.source,
                         message_id=None,
                         channel_prompt=None,
+                        platform_auth_passed=event.platform_auth_passed,
                     )
                     self._enqueue_fifo(_quick_key, cont_event, adapter)
             except Exception as exc:
@@ -2910,6 +2912,7 @@ class GatewaySlashCommandsMixin:
                     source=event.source,
                     message_id=event.message_id,
                     channel_prompt=event.channel_prompt,
+                    platform_auth_passed=event.platform_auth_passed,
                 )
                 self._enqueue_fifo(_quick_key, kickoff_event, adapter)
             except Exception as exc:
