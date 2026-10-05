@@ -922,3 +922,130 @@ async def test_final_card_update_retries_without_rejected_mentions():
     assert [b["sequence"] for b in bodies] == [9, 10]
     assert "<at" in bodies[0]["card_body"]["body"]["elements"][0]["content"]
     assert bodies[1]["card_body"]["body"]["elements"][0]["content"] == "@董晓东 上线完成"
+
+
+# ── Transient failure of the streaming-close call (300308) ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_failed_close_falls_through_to_the_final_replacement():
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client = object()
+    adapter._streaming_cards["om_1"] = CardKitState(card_id="ck_1", message_id="om_1", sequence=7)
+    close = AsyncMock(return_value=False)
+    update = AsyncMock(return_value=True)
+
+    with (
+        patch("plugins.platforms.feishu.adapter.set_card_streaming_mode", new=close),
+        patch("plugins.platforms.feishu.adapter.cardkit_update_card", new=update),
+    ):
+        assert await adapter.finalize_streaming_message("om_1", "the summary") is True
+
+    # Sequences stay strictly increasing across the retry.
+    assert [c.kwargs["sequence"] for c in close.await_args_list] == [8]
+    assert update.await_args.kwargs["sequence"] == 9
+    assert update.await_args.kwargs["card_body"]["body"]["elements"][0]["content"] == "the summary"
+    assert "om_1" not in adapter._streaming_cards
+
+
+@pytest.mark.asyncio
+async def test_final_text_still_seals_the_card_when_close_keeps_failing():
+    """The full replacement sets streaming_mode false itself: a card whose
+    settings call keeps failing must still get the final answer, not spin."""
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client = object()
+    adapter._streaming_cards["om_1"] = CardKitState(card_id="ck_1", message_id="om_1", sequence=7)
+    update = AsyncMock(return_value=True)
+
+    with (
+        patch("plugins.platforms.feishu.adapter.set_card_streaming_mode", new=AsyncMock(return_value=False)),
+        patch("plugins.platforms.feishu.adapter.cardkit_update_card", new=update),
+    ):
+        assert await adapter.finalize_streaming_message("om_1", "the summary") is True
+
+    body = update.await_args.kwargs["card_body"]
+    assert body["config"]["streaming_mode"] is False
+    assert body["body"]["elements"][0]["content"] == "the summary"
+    assert "om_1" not in adapter._streaming_cards
+
+
+@pytest.mark.asyncio
+async def test_close_failure_without_a_body_to_replace_is_still_reported():
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client = object()
+    state = CardKitState(card_id="ck_1", message_id="om_1", sequence=7)
+    adapter._streaming_cards["om_1"] = state
+
+    with (
+        patch("plugins.platforms.feishu.adapter.set_card_streaming_mode", new=AsyncMock(return_value=False)),
+        patch("plugins.platforms.feishu.adapter.cardkit_update_card", new=AsyncMock(return_value=True)),
+        pytest.raises(RuntimeError, match="streaming close failed"),
+    ):
+        await adapter.finalize_streaming_message("om_1", "")
+
+    assert adapter._streaming_cards["om_1"] is state
+
+
+def _cardkit_client(*, settings_codes, update_codes=()):
+    """Fake lark CardKit client modelling remote card state.
+
+    ``settings_codes`` / ``update_codes`` are consumed one per call; 0 = OK.
+    """
+    remote = {"streaming": True, "body": None, "calls": []}
+    settings_codes, update_codes = list(settings_codes), list(update_codes)
+
+    def settings(req):
+        code = settings_codes.pop(0) if settings_codes else 0
+        remote["calls"].append(("settings", req.request_body.sequence, code))
+        if code:
+            return _fail(code, "Server Internal Error")
+        remote["streaming"] = json.loads(req.request_body.settings)["config"]["streaming_mode"]
+        return _ok()
+
+    def update(req):
+        code = update_codes.pop(0) if update_codes else 0
+        remote["calls"].append(("update", req.request_body.sequence, code))
+        if code:
+            return _fail(code, "Server Internal Error")
+        remote["body"] = json.loads(req.request_body.card.data)
+        remote["streaming"] = remote["body"]["config"]["streaming_mode"]
+        return _ok()
+
+    client = SimpleNamespace(cardkit=SimpleNamespace(v1=SimpleNamespace(
+        card=SimpleNamespace(settings=settings, update=update),
+    )))
+    return client, remote
+
+
+@pytest.mark.asyncio
+async def test_final_lands_and_streaming_stops_when_close_answers_300308():
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client, remote = _cardkit_client(settings_codes=[300308, 300308])
+    adapter._streaming_cards["om_2"] = CardKitState(card_id="ck_2", message_id="om_2", sequence=8)
+    try:
+        assert await adapter.finalize_streaming_message("om_2", "## swp 发布完成") is True
+    finally:
+        adapter._shutdown_sdk_executor()
+
+    assert remote["streaming"] is False
+    elements = remote["body"]["body"]["elements"]
+    assert elements[0]["content"].endswith("swp 发布完成")
+    assert all(e.get("element_id") != LOADING_ELEMENT_ID for e in elements)
+    sequences = [seq for _name, seq, _code in remote["calls"]]
+    assert sequences == sorted(set(sequences))
+
+
+@pytest.mark.asyncio
+async def test_final_failure_after_300308_is_reported_and_card_kept_for_retry():
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client, remote = _cardkit_client(settings_codes=[300308, 300308], update_codes=[300308])
+    state = CardKitState(card_id="ck_2", message_id="om_2", sequence=8)
+    adapter._streaming_cards["om_2"] = state
+    try:
+        with pytest.raises(RuntimeError):
+            await adapter.finalize_streaming_message("om_2", "## swp 发布完成")
+    finally:
+        adapter._shutdown_sdk_executor()
+
+    assert remote["streaming"] is True
+    assert adapter._streaming_cards["om_2"] is state

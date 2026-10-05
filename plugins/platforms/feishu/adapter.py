@@ -2634,20 +2634,18 @@ class FeishuAdapter(BasePlatformAdapter):
                 self._client, card_id=state.card_id, enabled=False, sequence=state.sequence,
             )
         except Exception:
-            if not stopped:
-                raise
             streaming_closed = False
-            logger.debug("[Feishu] Closing stopped card failed; trying full replacement", exc_info=True)
+            logger.debug("[Feishu] Closing streaming card %s failed; trying full replacement", state.card_id, exc_info=True)
         logger.info(
             "[Feishu] Streaming mode disabled for %s: %s",
             state.card_id,
             streaming_closed,
         )
-        if not streaming_closed and not stopped and not (state.expired and final_text):
-            # An expired card has already left streaming mode; its full-card
-            # update below is still authoritative. A stopped replacement also
-            # disables streaming and removes the loading element, so attempt
-            # that recovery even if the separate settings call failed.
+        if not streaming_closed and not (final_text or stopped):
+            # Nothing to replace the body with, so the card cannot be sealed.
+            # Otherwise the full-card replacement below carries
+            # streaming_mode=false and drops the loading element: it seals the
+            # card by itself (expired window, a stop, or a transient 300308).
             raise RuntimeError(f"CardKit streaming close failed for {state.card_id}")
         if final_text or stopped:
             final_card_updated = await self._update_card_body(

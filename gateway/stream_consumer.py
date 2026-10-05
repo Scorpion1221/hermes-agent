@@ -2945,6 +2945,21 @@ class GatewayStreamConsumer:
                         # answer. Preserve the existing recovery behavior, but
                         # only now that CardKit had the first chance to finish.
                         await self._send_fallback_final(self._accumulated)
+                    elif (
+                        self._cardkit_mode
+                        and streaming_message_id
+                        and final_stream_text.strip()
+                    ):
+                        # The authoritative full-card replacement did not land
+                        # (raise, non-True return): an earlier "successful"
+                        # element frame is no proof the answer is on screen
+                        # (230020 skips report success). Retract the claim and
+                        # post only what the card does not already show; if
+                        # that send fails too the gateway's normal send runs.
+                        self._final_response_sent = False
+                        self._final_content_delivered = False
+                        self._delivered_final_text = None
+                        await self._send_fallback_final(self._accumulated)
                     complete_cls_fn = getattr(
                         type(self.adapter), "on_streaming_message_complete", None
                     )
@@ -3137,7 +3152,14 @@ class GatewayStreamConsumer:
                 self._final_content_delivered = True
                 self._fallback_final_send = False
                 self._record_turn_final_payload(self._accumulated)
-            elif _best_effort_ok and not self._final_response_sent:
+            elif _best_effort_ok and not self._final_response_sent and (
+                # A CardKit frame "succeeds" even when Feishu skipped it
+                # (230020); promote only when the ACKed text covers the answer.
+                not self._cardkit_mode
+                or not self._continuation_text(
+                    self._clean_for_display(self._accumulated or "")
+                ).strip()
+            ):
                 self._final_response_sent = True
                 self._final_content_delivered = True
                 self._record_turn_final_payload(self._accumulated)

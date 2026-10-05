@@ -1231,3 +1231,101 @@ async def test_repeat_key_keeps_alike_previews_of_different_commands_apart():
     await asyncio.wait_for(task, 3)
 
     assert last_card(adapter) == "> terminal: git pull\n\n> terminal: git pull (×2)"
+
+
+
+class UncommittedFinalTransport(RolloverCardTransport):
+    """The live continuation card accepts element frames, but the turn-final
+    full-card commit never lands (settings + update both 5xx)."""
+
+    def __init__(self, *, skip_final_frame=False, fail_plain_sends=False, **kwargs):
+        super().__init__(**kwargs)
+        self.skip_final_frame = skip_final_frame
+        self.fail_plain_sends = fail_plain_sends
+        self.shown = {}  # message_id -> last frame CardKit actually rendered
+
+    async def send(self, **kwargs):
+        if not (kwargs.get("metadata") or {}).get("streaming") and self.fail_plain_sends:
+            return SimpleNamespace(success=False, message_id=None, error="Server Internal Error")
+        return await super().send(**kwargs)
+
+    def plain_sends(self):
+        return [s for s in self.sent if not (s.get("metadata") or {}).get("streaming")]
+
+    async def edit_message(self, **kwargs):
+        if self.skip_final_frame and "summary" in kwargs["content"]:
+            # 230020: Feishu skipped the frame; the card keeps its old text.
+            return SimpleNamespace(
+                success=True, message_id=kwargs["message_id"],
+                raw_response={"cardkit_rate_limited": True},
+            )
+        result = await super().edit_message(**kwargs)
+        if result.success:
+            self.shown[kwargs["message_id"]] = kwargs["content"]
+        return result
+
+    async def finalize_streaming_message(
+        self, message_id, final_text="", *, stopped=False, status="", footer=None,
+    ):
+        if footer is None and message_id == "card-2":
+            self.finalized.append({"message_id": message_id, "content": final_text, "footer": None, "stopped": stopped})
+            raise RuntimeError("CardKit final card update failed for ck_2")
+        return await super().finalize_streaming_message(
+            message_id, final_text, stopped=stopped, status=status, footer=footer,
+        )
+
+
+async def _run_rolled_turn_with_uncommitted_final(adapter, final):
+    consumer = consumer_for(adapter)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("1/4 构建\n\n2/4 推送")
+    consumer.on_delta(None)
+    consumer.on_progress("\n> terminal: swp build\n")
+    await asyncio.wait_for(adapter.first_send.wait(), 3)
+    assert await consumer.request_cardkit_rollover() == "rolled"
+    consumer.on_progress("3/4 ⏳ 生产产物读回校验\n")
+    await wait_for(lambda: len(adapter.sent) == 2)
+    consumer.on_delta(final)
+    consumer.finish(final)
+    await asyncio.wait_for(task, 3)
+    return consumer
+
+
+FINAL_SUMMARY = "## swp summary\n\nAll checks passed."
+
+
+@pytest.mark.asyncio
+async def test_uncommitted_final_is_posted_once_below_the_stuck_card():
+    adapter = UncommittedFinalTransport(skip_final_frame=True)
+    consumer = await _run_rolled_turn_with_uncommitted_final(adapter, FINAL_SUMMARY)
+
+    assert "summary" not in adapter.shown.get("card-2", "")
+    plain = adapter.plain_sends()
+    assert len(plain) == 1
+    assert "All checks passed." in plain[0]["content"]
+    # Only the unseen part: progress already on the card is not repeated.
+    assert "生产产物读回校验" not in plain[0]["content"]
+    assert consumer.final_content_delivered is True
+    assert consumer.delivered_final_matches(FINAL_SUMMARY) is True
+    assert adapter.completed == []
+
+
+@pytest.mark.asyncio
+async def test_uncommitted_final_is_left_to_the_gateway_when_the_repost_fails():
+    adapter = UncommittedFinalTransport(skip_final_frame=True, fail_plain_sends=True)
+    consumer = await _run_rolled_turn_with_uncommitted_final(adapter, FINAL_SUMMARY)
+
+    assert consumer.final_response_sent is False
+    assert consumer.final_content_delivered is False
+    assert consumer.delivered_final_matches(FINAL_SUMMARY) is not True
+
+
+@pytest.mark.asyncio
+async def test_final_shown_by_the_last_frame_is_not_resent_when_the_commit_fails():
+    adapter = UncommittedFinalTransport(skip_final_frame=False)
+    consumer = await _run_rolled_turn_with_uncommitted_final(adapter, FINAL_SUMMARY)
+
+    assert "All checks passed." in adapter.shown["card-2"]
+    assert adapter.plain_sends() == []
+    assert consumer.final_content_delivered is True
+    assert consumer.delivered_final_matches(FINAL_SUMMARY) is True
