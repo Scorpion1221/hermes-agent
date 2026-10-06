@@ -3669,7 +3669,7 @@ class TestProcessingReactions(unittest.TestCase):
         with self._patch_to_thread():
             self._run(adapter.on_processing_start(self._event()))
         self.assertEqual(tracker.create_calls, ["Typing"])
-        self.assertEqual(adapter._pending_processing_reactions["om_msg"], "r_typing")
+        self.assertEqual(adapter._pending_processing_reactions["om_msg"], ("Typing", "r_typing"))
 
 
     # --------------------------------------------------------------- complete
@@ -3730,7 +3730,7 @@ class TestProcessingReactions(unittest.TestCase):
         self.assertEqual(tracker.create_calls, ["Typing"])  # CrossMark NOT added
         self.assertEqual(tracker.delete_calls, ["r_typing"])  # delete was attempted
         self.assertEqual(
-            adapter._pending_processing_reactions["om_msg"], "r_typing",
+            adapter._pending_processing_reactions["om_msg"], ("Typing", "r_typing"),
         )  # handle retained
 
 

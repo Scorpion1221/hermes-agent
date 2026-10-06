@@ -11080,6 +11080,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         }
         return bool(owner) and bool(sender) and not (owner & sender)
 
+    async def _mark_busy_event(self, event: MessageEvent, state: str) -> None:
+        """Tell the adapter where a busy-session message stands.
+
+        ``state`` is ``queued`` (accepted, waits behind the running turn),
+        ``started`` (handed into the running turn) or ``dropped`` (never
+        answered). Adapters without per-message status (all but Feishu
+        today) do not implement the hooks; this is then a no-op.
+        """
+        adapter = self._adapter_for_source(event.source)
+        hook = getattr(adapter, f"mark_event_{state}", None) if adapter else None
+        if not callable(hook):
+            return
+        try:
+            await hook(event)
+        except Exception:
+            logger.debug("mark_event_%s failed", state, exc_info=True)
+
     @staticmethod
     def _explicit_steer_as_text(event: MessageEvent) -> MessageEvent:
         """A queued '/steer x' must drain as the text 'x' (the drain safety
@@ -11118,6 +11135,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # The adapter's debounce could not hold this burst (its pending
             # slot belongs to another sender): queue it as its own turn.
             self._queue_or_replace_pending_event(session_key, event)
+            await self._mark_busy_event(event, "queued")
             return True
 
         explicit_steer = event.get_command() == "steer"
@@ -11133,6 +11151,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled(effective_mode):
                 self._queue_or_replace_pending_event(session_key, event)
+                await self._mark_busy_event(event, "queued")
                 message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
@@ -11424,6 +11443,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if steered or redirected or followup_receipt.consumed:
                 # Reuse this receipt as the next stream; no separate English
                 # busy acknowledgement and no debounce that hides a new input.
+                # It waits for the hand-off; the consumer marks it started.
+                followup_receipt.event = event
+                await self._mark_busy_event(event, "queued")
                 await followup_consumer.acknowledge_followup(followup_receipt)
                 return True
             followup_consumer.discard_followup(followup_receipt)
@@ -11453,6 +11475,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # merge semantics for media.
         if not steered and not redirected:
             self._queue_or_replace_pending_event(session_key, queued_event)
+            await self._mark_busy_event(queued_event, "queued")
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
@@ -29103,7 +29126,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # call — no per-attribute pop-list to drift.
         state = self._peek_session_state(session_key)
         if state is not None:
+            _queued = getattr(state.conversation, "queued_events", None)
+            _dropped = list(_queued) if isinstance(_queued, list) else []
             state.conversation.clear()
+            if _dropped:
+                # Queued messages of the cleared conversation are never
+                # answered: drop their "queued" badges (sync caller).
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop is not None:
+                    for _event in _dropped:
+                        loop.create_task(self._mark_busy_event(_event, "dropped"))
         # Legacy plain-dict stores still registered in
         # _CONVERSATION_SCOPED_STATE (not yet folded into SessionState),
         # e.g. _pending_model_notes.  SessionState-backed names resolve to
@@ -29281,7 +29316,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
         if adapter and hasattr(adapter, "get_pending_message"):
-            adapter.get_pending_message(session_key)  # consume and discard
+            _discarded = adapter.get_pending_message(session_key)  # consume and discard
+            if _discarded is not None:
+                # Its "queued" badge would otherwise promise an answer forever.
+                await self._mark_busy_event(_discarded, "dropped")
         if _iac_state is not None:
             _iac_state.persistent.pending_command_text = None
         if release_running_state:

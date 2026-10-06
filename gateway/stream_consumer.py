@@ -93,6 +93,9 @@ class FollowupReceipt:
     # time.monotonic() just before the receipt card was sent; its CardKit
     # streaming window runs from here, not from the later handoff.
     card_created_monotonic: Optional[float] = None
+    # The inbound MessageEvent, so the adapter can update its status badge
+    # when the follow-up is handed to the agent or dropped.
+    event: Any = None
 
 
 # Queue marker for a completed assistant commentary message emitted between
@@ -481,6 +484,8 @@ class GatewayStreamConsumer:
         self._finish_requested = False
         self._consecutive_failures = 0
         self._followups: list[FollowupReceipt] = []
+        # Follow-ups handed to this turn's card; their status badge ends with the turn.
+        self._handed_off_followups: list[FollowupReceipt] = []
         self._followup_lock = threading.Lock()
         self._closed = False
         # Set when the final response content was sent to the user via
@@ -1011,7 +1016,19 @@ class GatewayStreamConsumer:
         if self._closed:
             await self._requeue_unconsumed_followups()
 
+    async def _mark_followup(self, receipt: FollowupReceipt, state: str) -> None:
+        hook = getattr(self.adapter, f"mark_event_{state}", None)
+        if receipt.event is None or not callable(hook):
+            return
+        try:
+            await hook(receipt.event)
+        except Exception:
+            logger.debug("mark_event_%s failed for follow-up", state, exc_info=True)
+
     async def _requeue_unconsumed_followups(self) -> None:
+        handed_off, self._handed_off_followups = self._handed_off_followups, []
+        for receipt in handed_off:
+            await self._mark_followup(receipt, "dropped")
         with self._followup_lock:
             pending, self._followups = self._followups, []
         for receipt in pending:
@@ -1023,6 +1040,8 @@ class GatewayStreamConsumer:
             if not receipt.consumed:
                 try:
                     queued = receipt.requeue() is True
+                    if not queued:
+                        await self._mark_followup(receipt, "dropped")
                     status = "等待后续处理" if queued else "补充已取消"
                     content = (
                         "本轮已结束，补充未在本轮接入；将按后续消息处理。" if queued
@@ -1694,6 +1713,9 @@ class GatewayStreamConsumer:
             self._cardkit_last_sealed = None
             self._cardkit_stream_expired = False
             self._reset_segment_state(preserve_no_edit=True)
+            for receipt in receipts:
+                await self._mark_followup(receipt, "started")
+                self._handed_off_followups.append(receipt)
             if receipts:
                 for receipt in receipts[:-1]:
                     if receipt.message_id:

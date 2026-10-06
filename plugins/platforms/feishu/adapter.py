@@ -67,7 +67,7 @@ import dataclasses
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Sequence
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -368,6 +368,12 @@ _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withd
 # badge is reserved for the final outgoing CardKit card so long streams have
 # an unambiguous completion signal without marking clarify/steer boundaries.
 _FEISHU_REACTION_IN_PROGRESS = "Typing"
+# A message that arrived while the session is busy (queued, or a follow-up
+# not yet handed to the agent) shows "one second" until its turn starts.
+_FEISHU_REACTION_QUEUED = "OneSecond"
+# Every Feishu message id a merged inbound event stands for (text/media batch
+# window), oldest first. Reactions mark each; replies anchor to the first.
+_FEISHU_MERGED_IDS_KEY = "feishu_message_ids"
 _FEISHU_REACTION_STREAM_COMPLETE = "DONE"
 _FEISHU_REACTION_FAILURE = "CrossMark"
 # Bound on the (message_id → reaction_id) handle cache. Happy-path entries
@@ -1681,6 +1687,25 @@ def check_feishu_requirements() -> bool:
         return False
 
 
+def feishu_message_ids(event: MessageEvent) -> List[str]:
+    """Every Feishu message id ``event`` stands for, oldest first."""
+    ids = list((getattr(event, "metadata", None) or {}).get(_FEISHU_MERGED_IDS_KEY) or ())
+    if event.message_id and event.message_id not in ids:
+        ids.insert(0, event.message_id)
+    return [str(i) for i in ids if i]
+
+
+def _record_merged_message_ids(existing: MessageEvent, incoming: MessageEvent) -> None:
+    """Fold ``incoming`` into a batched ``existing`` without moving its anchor."""
+    ids = feishu_message_ids(existing)
+    for message_id in feishu_message_ids(incoming):
+        if message_id not in ids:
+            ids.append(message_id)
+    if existing.metadata is None:
+        existing.metadata = {}
+    existing.metadata[_FEISHU_MERGED_IDS_KEY] = ids
+
+
 def _same_batch_sender(existing: MessageEvent, incoming: MessageEvent) -> bool:
     """Shared group sessions must never fold one member's message into another's."""
     def _sender(event: MessageEvent):
@@ -1786,7 +1811,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._update_prompt_counter = itertools.count(1)
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
-        self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
+        # message_id -> (emoji_type, reaction_id) of its current status badge.
+        self._pending_processing_reactions: "OrderedDict[str, Tuple[str, str]]" = OrderedDict()
         self._load_seen_message_ids()
 
     @staticmethod
@@ -4059,46 +4085,72 @@ class FeishuAdapter(BasePlatformAdapter):
             )
         return False
 
-    def _remember_processing_reaction(self, message_id: str, reaction_id: str) -> None:
+    def _remember_processing_reaction(self, message_id: str, reaction_id: str, emoji_type: str) -> None:
         cache = self._pending_processing_reactions
-        cache[message_id] = reaction_id
+        cache[message_id] = (emoji_type, reaction_id)
         cache.move_to_end(message_id)
         while len(cache) > _FEISHU_PROCESSING_REACTION_CACHE_SIZE:
             cache.popitem(last=False)
 
-    def _pop_processing_reaction(self, message_id: str) -> Optional[str]:
+    def _pop_processing_reaction(self, message_id: str) -> Optional[Tuple[str, str]]:
         return self._pending_processing_reactions.pop(message_id, None)
 
-    async def on_processing_start(self, event: MessageEvent) -> None:
+    async def _set_processing_reaction(self, message_id: str, emoji_type: Optional[str]) -> bool:
+        """Show ``emoji_type`` on ``message_id`` (None clears it).
+
+        Each inbound message carries at most one status badge: OneSecond while
+        it waits behind a busy turn, Typing while its turn runs. Returns False
+        when a previous badge could not be removed; it is then kept rather
+        than stacking a second, contradictory badge on top.
+        """
+        current = self._pending_processing_reactions.get(message_id)
+        if current and current[0] == emoji_type:
+            return True
+        if current:
+            if not await self._remove_reaction(message_id, current[1]):
+                return False
+            self._pop_processing_reaction(message_id)
+        if emoji_type:
+            reaction_id = await self._add_reaction(message_id, emoji_type)
+            if reaction_id:
+                self._remember_processing_reaction(message_id, reaction_id, emoji_type)
+        return True
+
+    async def mark_event_queued(self, event: MessageEvent) -> None:
+        """A busy session accepted ``event`` for later: badge it OneSecond."""
         if not self._reactions_enabled():
             return
-        message_id = event.message_id
-        if not message_id or message_id in self._pending_processing_reactions:
+        for message_id in feishu_message_ids(event):
+            if message_id not in self._pending_processing_reactions:
+                await self._set_processing_reaction(message_id, _FEISHU_REACTION_QUEUED)
+
+    async def mark_event_started(self, event: MessageEvent) -> None:
+        """``event``'s own turn (or hand-off) begins: badge each of its messages Typing."""
+        if not self._reactions_enabled():
             return
-        reaction_id = await self._add_reaction(message_id, _FEISHU_REACTION_IN_PROGRESS)
-        if reaction_id:
-            self._remember_processing_reaction(message_id, reaction_id)
+        for message_id in feishu_message_ids(event):
+            await self._set_processing_reaction(message_id, _FEISHU_REACTION_IN_PROGRESS)
+
+    async def mark_event_dropped(self, event: MessageEvent) -> None:
+        """``event`` will never be answered (/stop, /new, discarded): clear its badges."""
+        if not self._reactions_enabled():
+            return
+        for message_id in feishu_message_ids(event):
+            await self._set_processing_reaction(message_id, None)
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        await self.mark_event_started(event)
 
     async def on_processing_complete(
         self, event: MessageEvent, outcome: ProcessingOutcome
     ) -> None:
         if not self._reactions_enabled():
             return
-        message_id = event.message_id
-        if not message_id:
-            return
-
-        start_reaction_id = self._pending_processing_reactions.get(message_id)
-        if start_reaction_id:
-            if not await self._remove_reaction(message_id, start_reaction_id):
-                # Don't stack a second badge on top of a Typing we couldn't
-                # remove — UI would read as both "working" and "done/failed"
-                # simultaneously. Keep the handle so LRU eventually evicts it.
-                return
-            self._pop_processing_reaction(message_id)
-
-        if outcome is ProcessingOutcome.FAILURE:
-            await self._add_reaction(message_id, _FEISHU_REACTION_FAILURE)
+        for message_id in feishu_message_ids(event):
+            if not await self._set_processing_reaction(message_id, None):
+                continue
+            if outcome is ProcessingOutcome.FAILURE:
+                await self._add_reaction(message_id, _FEISHU_REACTION_FAILURE)
 
     async def on_streaming_message_complete(self, message_id: str) -> None:
         """Mark the final outgoing CardKit card as complete."""
@@ -4326,9 +4378,7 @@ class FeishuAdapter(BasePlatformAdapter):
         existing.media_types.extend(event.media_types)
         if event.text:
             existing.text = self._merge_caption(existing.text, event.text)
-        existing.timestamp = event.timestamp
-        if event.message_id:
-            existing.message_id = event.message_id
+        _record_merged_message_ids(existing, event)
         self._schedule_media_batch_flush(key)
 
     def _schedule_media_batch_flush(self, key: str) -> None:
@@ -4651,9 +4701,9 @@ class FeishuAdapter(BasePlatformAdapter):
 
         existing.text = next_text
         existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
-        existing.timestamp = event.timestamp
-        if event.message_id:
-            existing.message_id = event.message_id
+        # The reply anchors to the first message of the burst (the answer
+        # starts there); every id is kept so each one gets its reaction.
+        _record_merged_message_ids(existing, event)
         self._pending_text_batch_counts[key] = next_count
         self._schedule_text_batch_flush(key)
 

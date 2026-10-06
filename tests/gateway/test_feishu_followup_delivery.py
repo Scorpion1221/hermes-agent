@@ -236,3 +236,46 @@ async def test_batch_receipts_are_sealed_and_latest_anchor_owns_new_output():
     assert adapter.finalized[-1][0] == "card-3"
     assert adapter.sent[-1]["reply_to"] == "u2"
     assert adapter.finalized[-1][1].count("NEW") == 1
+
+
+class BadgeTransport(CardTransport):
+    """CardTransport + the adapter's per-message status hooks."""
+
+    def __init__(self):
+        super().__init__()
+        self.badges = []
+
+    async def mark_event_started(self, event):
+        self.badges.append(("started", event.message_id))
+
+    async def mark_event_dropped(self, event):
+        self.badges.append(("dropped", event.message_id))
+
+
+@pytest.mark.asyncio
+async def test_followup_badge_turns_typing_at_handoff_and_clears_when_the_turn_ends():
+    adapter = BadgeTransport()
+    consumer = consumer_for(adapter)
+    receipt = consumer.register_followup("改成方案二", "om_follow", {}, lambda: None)
+    receipt.event = SimpleNamespace(message_id="om_follow")
+    await consumer.acknowledge_followup(receipt)
+    consumer.on_delta("先做方案一。")
+    consumer.on_user_input_boundary(text="改成方案二")
+    consumer.on_delta("好，换成方案二。")
+    consumer.finish("好，换成方案二。")
+    await asyncio.wait_for(consumer.run(), 5)
+
+    assert adapter.badges == [("started", "om_follow"), ("dropped", "om_follow")]
+
+
+@pytest.mark.asyncio
+async def test_followup_cancelled_before_handoff_drops_its_badge():
+    adapter = BadgeTransport()
+    consumer = consumer_for(adapter)
+    receipt = consumer.register_followup("late", "om_late", {}, lambda: False)
+    receipt.event = SimpleNamespace(message_id="om_late")
+    await consumer.acknowledge_followup(receipt)
+    consumer.finish()
+    await asyncio.wait_for(consumer.run(), 5)
+
+    assert adapter.badges == [("dropped", "om_late")]
