@@ -5674,6 +5674,10 @@ class BasePlatformAdapter(ABC):
     _OK_EMOJI: Optional[str] = None
     _FAIL_EMOJI: Optional[str] = None
 
+    # A debounced busy-text burst replies to its newest message by default;
+    # adapters that answer a burst from its start anchor to the first.
+    _DEBOUNCE_ANCHOR_FIRST: bool = False
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Hook called when background processing begins."""
 
@@ -5993,11 +5997,15 @@ class BasePlatformAdapter(ABC):
             # Every merged id is recorded so adapters that badge each inbound
             # message still reach all of them.
             record_merged_message_ids(state.event, event)
-            latest_message_id = getattr(event, "message_id", None)
+            latest_message_id = None if self._DEBOUNCE_ANCHOR_FIRST else getattr(event, "message_id", None)
             latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
             if latest_message_id is not None:
                 state.event.message_id = str(latest_message_id)
-            if latest_anchor is not None and hasattr(state.event, "reply_to_message_id"):
+            if (
+                latest_anchor is not None
+                and not self._DEBOUNCE_ANCHOR_FIRST
+                and hasattr(state.event, "reply_to_message_id")
+            ):
                 state.event.reply_to_message_id = str(latest_anchor)
             state.last_ts = now
 

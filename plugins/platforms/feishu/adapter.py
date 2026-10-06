@@ -1705,6 +1705,9 @@ def _same_batch_sender(existing: MessageEvent, incoming: MessageEvent) -> bool:
 class FeishuAdapter(BasePlatformAdapter):
     """Feishu/Lark bot adapter."""
 
+    # A burst is answered from its first message; replies quote that one.
+    _DEBOUNCE_ANCHOR_FIRST = True
+
     supports_code_blocks = True  # Feishu renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
 

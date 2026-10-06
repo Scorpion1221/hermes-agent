@@ -274,3 +274,15 @@ async def test_debounced_burst_drains_as_one_turn_that_badges_every_message():
     assert reactions.badges("om_2") == ["Typing"] and reactions.badges("om_3") == ["Typing"]
     await adapter.on_processing_complete(drained, ProcessingOutcome.SUCCESS)
     assert reactions.badges("om_2") == [] and reactions.badges("om_3") == []
+
+
+@pytest.mark.asyncio
+async def test_debounced_burst_replies_to_its_first_message():
+    runner, adapter, reactions, key = _busy_gateway(mode="queue")
+    runner._busy_text_mode = "queue"
+    adapter._busy_text_mode = "queue"
+    await _deliver(adapter, _dm("第二条", "om_2"))
+    await _deliver(adapter, _dm("第三条", "om_3"))
+    await adapter._flush_text_debounce_now(key)
+
+    assert adapter._pending_messages[key].message_id == "om_2"
