@@ -123,12 +123,14 @@ FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
+    MERGED_MESSAGE_IDS_KEY,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
     ProcessingOutcome,
     SendResult,
     SUPPORTED_DOCUMENT_TYPES,
+    record_merged_message_ids,
     cache_document_from_bytes,
     cache_image_from_url,
     cache_audio_from_bytes,
@@ -371,9 +373,6 @@ _FEISHU_REACTION_IN_PROGRESS = "Typing"
 # A message that arrived while the session is busy (queued, or a follow-up
 # not yet handed to the agent) shows "one second" until its turn starts.
 _FEISHU_REACTION_QUEUED = "OneSecond"
-# Every Feishu message id a merged inbound event stands for (text/media batch
-# window), oldest first. Reactions mark each; replies anchor to the first.
-_FEISHU_MERGED_IDS_KEY = "feishu_message_ids"
 _FEISHU_REACTION_STREAM_COMPLETE = "DONE"
 _FEISHU_REACTION_FAILURE = "CrossMark"
 # Bound on the (message_id → reaction_id) handle cache. Happy-path entries
@@ -1688,22 +1687,12 @@ def check_feishu_requirements() -> bool:
 
 
 def feishu_message_ids(event: MessageEvent) -> List[str]:
-    """Every Feishu message id ``event`` stands for, oldest first."""
-    ids = list((getattr(event, "metadata", None) or {}).get(_FEISHU_MERGED_IDS_KEY) or ())
-    if event.message_id and event.message_id not in ids:
-        ids.insert(0, event.message_id)
-    return [str(i) for i in ids if i]
-
-
-def _record_merged_message_ids(existing: MessageEvent, incoming: MessageEvent) -> None:
-    """Fold ``incoming`` into a batched ``existing`` without moving its anchor."""
-    ids = feishu_message_ids(existing)
-    for message_id in feishu_message_ids(incoming):
-        if message_id not in ids:
-            ids.append(message_id)
-    if existing.metadata is None:
-        existing.metadata = {}
-    existing.metadata[_FEISHU_MERGED_IDS_KEY] = ids
+    """Every Feishu message id ``event`` stands for (it may be a merged burst)."""
+    ids = [str(i) for i in (getattr(event, "metadata", None) or {}).get(MERGED_MESSAGE_IDS_KEY) or () if i]
+    message_id = getattr(event, "message_id", None)
+    if message_id and str(message_id) not in ids:
+        ids.insert(0, str(message_id))
+    return ids
 
 
 def _same_batch_sender(existing: MessageEvent, incoming: MessageEvent) -> bool:
@@ -4404,7 +4393,7 @@ class FeishuAdapter(BasePlatformAdapter):
         existing.media_types.extend(event.media_types)
         if event.text:
             existing.text = self._merge_caption(existing.text, event.text)
-        _record_merged_message_ids(existing, event)
+        record_merged_message_ids(existing, event)
         self._schedule_media_batch_flush(key)
 
     def _schedule_media_batch_flush(self, key: str) -> None:
@@ -4729,7 +4718,7 @@ class FeishuAdapter(BasePlatformAdapter):
         existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
         # The reply anchors to the first message of the burst (the answer
         # starts there); every id is kept so each one gets its reaction.
-        _record_merged_message_ids(existing, event)
+        record_merged_message_ids(existing, event)
         self._pending_text_batch_counts[key] = next_count
         self._schedule_text_batch_flush(key)
 

@@ -2860,6 +2860,28 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
+MERGED_MESSAGE_IDS_KEY = "merged_message_ids"
+
+
+def record_merged_message_ids(existing: "MessageEvent", incoming: "MessageEvent") -> None:
+    """Remember every platform message id a merged event stands for.
+
+    Merging keeps one event, and one reply anchor (its first message);
+    adapters that badge each inbound message read this list.
+    """
+    ids = list((getattr(existing, "metadata", None) or {}).get(MERGED_MESSAGE_IDS_KEY) or ())
+    for candidate in (
+        getattr(existing, "message_id", None),
+        *((getattr(incoming, "metadata", None) or {}).get(MERGED_MESSAGE_IDS_KEY) or ()),
+        getattr(incoming, "message_id", None),
+    ):
+        if candidate and str(candidate) not in ids:
+            ids.append(str(candidate))
+    if getattr(existing, "metadata", None) is None:
+        existing.metadata = {}
+    existing.metadata[MERGED_MESSAGE_IDS_KEY] = ids
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -2903,6 +2925,7 @@ def merge_pending_message_event(
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
             _invalidate_pending_stt_cache(existing)
+            record_merged_message_ids(existing, event)
             return
 
         if existing_has_media or incoming_has_media:
@@ -2923,6 +2946,7 @@ def merge_pending_message_event(
             ):
                 existing.message_type = event.message_type
             _invalidate_pending_stt_cache(existing)
+            record_merged_message_ids(existing, event)
             return
 
         if (
@@ -2932,6 +2956,7 @@ def merge_pending_message_event(
         ):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            record_merged_message_ids(existing, event)
             return
 
     pending_messages[session_key] = event
@@ -5965,6 +5990,9 @@ class BasePlatformAdapter(ABC):
                     if state.event.text
                     else event.text
                 )
+            # Every merged id is recorded so adapters that badge each inbound
+            # message still reach all of them.
+            record_merged_message_ids(state.event, event)
             latest_message_id = getattr(event, "message_id", None)
             latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
             if latest_message_id is not None:
@@ -6464,6 +6492,15 @@ class BasePlatformAdapter(ABC):
                         return
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
+
+            # The message now waits behind the running turn (debounced, merged
+            # or queued below); adapters with per-message status show that.
+            mark_queued = getattr(self, "mark_event_queued", None)
+            if callable(mark_queued):
+                try:
+                    await mark_queued(event)
+                except Exception:
+                    logger.debug("[%s] mark_event_queued failed", self.name, exc_info=True)
 
             # Special case: photo bursts/albums frequently arrive as multiple near-
             # simultaneous messages. Queue them without interrupting the active run,

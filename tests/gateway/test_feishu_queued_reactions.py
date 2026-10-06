@@ -190,7 +190,7 @@ async def test_stop_clears_one_second_on_the_discarded_message():
 @pytest.mark.asyncio
 async def test_failed_turn_marks_each_message_with_cross_mark():
     adapter, reactions = _adapter()
-    event = SimpleNamespace(message_id="om_1", metadata={"feishu_message_ids": ["om_1", "om_2"]})
+    event = SimpleNamespace(message_id="om_1", metadata={"merged_message_ids": ["om_1", "om_2"]})
 
     await adapter.on_processing_start(event)
     await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
@@ -243,3 +243,34 @@ async def test_still_queued_messages_keep_one_second_when_the_turn_ends():
     await adapter.on_processing_complete(first, ProcessingOutcome.SUCCESS)
 
     assert reactions.badges("om_3") == ["OneSecond"]
+
+
+@pytest.mark.asyncio
+async def test_queue_text_mode_debounced_messages_show_one_second():
+    """busy_text_mode=queue parks text in the base debounce before the runner
+    sees it; those messages must still show they were received."""
+    runner, adapter, reactions, key = _busy_gateway(mode="queue")
+    runner._busy_text_mode = "queue"
+    adapter._busy_text_mode = "queue"
+
+    await _deliver(adapter, _dm("第二条", "om_2"))
+    await _deliver(adapter, _dm("第三条", "om_3"))
+
+    assert reactions.badges("om_2") == ["OneSecond"]
+    assert reactions.badges("om_3") == ["OneSecond"]
+
+
+@pytest.mark.asyncio
+async def test_debounced_burst_drains_as_one_turn_that_badges_every_message():
+    runner, adapter, reactions, key = _busy_gateway(mode="queue")
+    runner._busy_text_mode = "queue"
+    adapter._busy_text_mode = "queue"
+    await _deliver(adapter, _dm("第二条", "om_2"))
+    await _deliver(adapter, _dm("第三条", "om_3"))
+    await adapter._flush_text_debounce_now(key)
+    drained = adapter._pending_messages[key]
+
+    await adapter.on_processing_start(drained)
+    assert reactions.badges("om_2") == ["Typing"] and reactions.badges("om_3") == ["Typing"]
+    await adapter.on_processing_complete(drained, ProcessingOutcome.SUCCESS)
+    assert reactions.badges("om_2") == [] and reactions.badges("om_3") == []
