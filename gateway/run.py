@@ -32060,6 +32060,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "commands must not be passed as agent input",
                                 _pending_cmd_word,
                             )
+                            if pending_event is not None:
+                                await self._mark_busy_event(pending_event, "dropped")
                             pending_event = None
                             pending = None
                     except Exception:
@@ -32071,6 +32073,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key or "?",
                     self._status_action_label(),
                 )
+                if pending_event is not None:
+                    await self._mark_busy_event(pending_event, "dropped")
                 pending_event = None
                 pending = None
 
@@ -32281,6 +32285,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
+                # The drained message's own turn runs in-band here, outside
+                # the adapter's per-message processing hooks: its "queued"
+                # badge becomes "in progress" now; the adapter clears it when
+                # the triggering message's processing completes.
+                if pending_event is not None:
+                    await self._mark_busy_event(pending_event, "started")
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,

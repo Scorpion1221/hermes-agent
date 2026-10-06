@@ -1813,6 +1813,9 @@ class FeishuAdapter(BasePlatformAdapter):
         # by create, so we cache it per message_id.
         # message_id -> (emoji_type, reaction_id) of its current status badge.
         self._pending_processing_reactions: "OrderedDict[str, Tuple[str, str]]" = OrderedDict()
+        # message_id -> session key, for badges set on messages folded into a
+        # running turn (follow-ups); they end with that session's turn chain.
+        self._badge_sessions: "OrderedDict[str, str]" = OrderedDict()
         self._load_seen_message_ids()
 
     @staticmethod
@@ -4116,6 +4119,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 self._remember_processing_reaction(message_id, reaction_id, emoji_type)
         return True
 
+    def _badge_session_key(self, event: MessageEvent) -> Optional[str]:
+        return self._text_batch_key(event) if getattr(event, "source", None) is not None else None
+
     async def mark_event_queued(self, event: MessageEvent) -> None:
         """A busy session accepted ``event`` for later: badge it OneSecond."""
         if not self._reactions_enabled():
@@ -4128,8 +4134,15 @@ class FeishuAdapter(BasePlatformAdapter):
         """``event``'s own turn (or hand-off) begins: badge each of its messages Typing."""
         if not self._reactions_enabled():
             return
+        session_key = self._badge_session_key(event)
         for message_id in feishu_message_ids(event):
             await self._set_processing_reaction(message_id, _FEISHU_REACTION_IN_PROGRESS)
+            if session_key is None:
+                continue
+            self._badge_sessions[message_id] = session_key
+            self._badge_sessions.move_to_end(message_id)
+            while len(self._badge_sessions) > _FEISHU_PROCESSING_REACTION_CACHE_SIZE:
+                self._badge_sessions.popitem(last=False)
 
     async def mark_event_dropped(self, event: MessageEvent) -> None:
         """``event`` will never be answered (/stop, /new, discarded): clear its badges."""
@@ -4146,11 +4159,24 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> None:
         if not self._reactions_enabled():
             return
-        for message_id in feishu_message_ids(event):
+        own = feishu_message_ids(event)
+        for message_id in own:
+            self._badge_sessions.pop(message_id, None)
             if not await self._set_processing_reaction(message_id, None):
                 continue
             if outcome is ProcessingOutcome.FAILURE:
                 await self._add_reaction(message_id, _FEISHU_REACTION_FAILURE)
+        # The session's turn chain is over: messages handed into it (follow-ups,
+        # in-band drains) stop showing Typing. Queued ones keep "one second".
+        session_key = self._badge_session_key(event)
+        for message_id, key in list(self._badge_sessions.items()) if session_key else []:
+            if key != session_key or message_id in own:
+                continue
+            current = self._pending_processing_reactions.get(message_id)
+            if current and current[0] != _FEISHU_REACTION_IN_PROGRESS:
+                continue
+            self._badge_sessions.pop(message_id, None)
+            await self._set_processing_reaction(message_id, None)
 
     async def on_streaming_message_complete(self, message_id: str) -> None:
         """Mark the final outgoing CardKit card as complete."""

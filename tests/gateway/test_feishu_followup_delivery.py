@@ -253,7 +253,9 @@ class BadgeTransport(CardTransport):
 
 
 @pytest.mark.asyncio
-async def test_followup_badge_turns_typing_at_handoff_and_clears_when_the_turn_ends():
+async def test_followup_badge_turns_typing_at_handoff():
+    """Typing then lasts until the session's turn chain completes (the
+    adapter clears it with the triggering message), not at the hand-off."""
     adapter = BadgeTransport()
     consumer = consumer_for(adapter)
     receipt = consumer.register_followup("改成方案二", "om_follow", {}, lambda: None)
@@ -265,7 +267,7 @@ async def test_followup_badge_turns_typing_at_handoff_and_clears_when_the_turn_e
     consumer.finish("好，换成方案二。")
     await asyncio.wait_for(consumer.run(), 5)
 
-    assert adapter.badges == [("started", "om_follow"), ("dropped", "om_follow")]
+    assert adapter.badges == [("started", "om_follow")]
 
 
 @pytest.mark.asyncio

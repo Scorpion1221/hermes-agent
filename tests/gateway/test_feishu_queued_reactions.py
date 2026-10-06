@@ -207,3 +207,39 @@ async def test_reactions_toggle_disables_every_badge(monkeypatch):
     await adapter.on_processing_start(adapter._pending_messages[key])
 
     assert reactions.log == []
+
+
+@pytest.mark.asyncio
+async def test_messages_folded_into_a_turn_lose_typing_when_that_turn_chain_ends():
+    """Follow-ups handed into the running turn (and in-band drains) show Typing
+    while it runs and are cleared when the triggering message completes."""
+    runner, adapter, reactions, key = _busy_gateway(mode="queue")
+    trigger = adapter._pending_messages.get(key)  # nothing queued yet
+    owner = adapter.build_source(chat_id="oc_dm", chat_type="dm", user_id="ou_owner")
+    from gateway.platforms.base import MessageEvent, MessageType
+
+    first = MessageEvent(text="开始", message_type=MessageType.TEXT, source=owner, message_id="om_1")
+    folded = MessageEvent(text="补充", message_type=MessageType.TEXT, source=owner, message_id="om_2")
+    await adapter.on_processing_start(first)
+    await adapter.mark_event_queued(folded)
+    await adapter.mark_event_started(folded)  # handed into the running card
+    assert reactions.badges("om_2") == ["Typing"]
+
+    await adapter.on_processing_complete(first, ProcessingOutcome.SUCCESS)
+
+    assert reactions.badges("om_1") == [] and reactions.badges("om_2") == []
+    assert trigger is None
+
+
+@pytest.mark.asyncio
+async def test_still_queued_messages_keep_one_second_when_the_turn_ends():
+    runner, adapter, reactions, key = _busy_gateway(mode="queue")
+    owner = adapter.build_source(chat_id="oc_dm", chat_type="dm", user_id="ou_owner")
+    from gateway.platforms.base import MessageEvent, MessageType
+
+    first = MessageEvent(text="开始", message_type=MessageType.TEXT, source=owner, message_id="om_1")
+    await adapter.on_processing_start(first)
+    await _deliver(adapter, _dm("排队中", "om_3"))
+    await adapter.on_processing_complete(first, ProcessingOutcome.SUCCESS)
+
+    assert reactions.badges("om_3") == ["OneSecond"]

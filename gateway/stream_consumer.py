@@ -484,8 +484,6 @@ class GatewayStreamConsumer:
         self._finish_requested = False
         self._consecutive_failures = 0
         self._followups: list[FollowupReceipt] = []
-        # Follow-ups handed to this turn's card; their status badge ends with the turn.
-        self._handed_off_followups: list[FollowupReceipt] = []
         self._followup_lock = threading.Lock()
         self._closed = False
         # Set when the final response content was sent to the user via
@@ -1026,9 +1024,6 @@ class GatewayStreamConsumer:
             logger.debug("mark_event_%s failed for follow-up", state, exc_info=True)
 
     async def _requeue_unconsumed_followups(self) -> None:
-        handed_off, self._handed_off_followups = self._handed_off_followups, []
-        for receipt in handed_off:
-            await self._mark_followup(receipt, "dropped")
         with self._followup_lock:
             pending, self._followups = self._followups, []
         for receipt in pending:
@@ -1714,8 +1709,9 @@ class GatewayStreamConsumer:
             self._cardkit_stream_expired = False
             self._reset_segment_state(preserve_no_edit=True)
             for receipt in receipts:
+                # Typing until the session's turn chain ends (the adapter
+                # clears it when the triggering message completes).
                 await self._mark_followup(receipt, "started")
-                self._handed_off_followups.append(receipt)
             if receipts:
                 for receipt in receipts[:-1]:
                     if receipt.message_id:
