@@ -3222,6 +3222,15 @@ DEFAULT_CONFIG = {
         # producing ~/.hermes/sessions/sessions.json entirely.
         "write_sessions_json": True,
 
+        # When systemd/launchd starts the gateway, merge the PATH your login
+        # shell builds (``$SHELL -ilc``) into the gateway's own. The unit's
+        # PATH is a snapshot of the shell that last ran ``hermes gateway
+        # install`` / ``hermes update``, so tools only your rc files put on
+        # PATH (nvm, pyenv, cargo, ...) would otherwise go missing for the bot.
+        # Unit entries keep priority; a failing or slow (>5s) rc leaves PATH
+        # as the unit set it.
+        "login_shell_path": True,
+
         # Scale-to-zero idle detection (Phase 0). The gateway watches for idle
         # and, when an instance is opted in via the NAS "Labs" toggle (carried as
         # the HERMES_SCALE_TO_ZERO env stamp) AND messaging is relay-only/absent

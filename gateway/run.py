@@ -33471,6 +33471,19 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception as _audit_exc:
         logger.debug("Startup security audit failed (non-fatal): %s", _audit_exc)
 
+    # The unit/plist PATH is a snapshot of whichever shell last wrote it; merge
+    # in what the user's login shell resolves so CLIs installed through nvm,
+    # pyenv, cargo, ... stay reachable after an update from another shell.
+    try:
+        from gateway.login_shell_path import apply_for_service
+        from hermes_cli.config import read_raw_config
+
+        _added_path = apply_for_service(read_raw_config())
+        if _added_path:
+            logger.info("Added login-shell PATH entries: %s", os.pathsep.join(_added_path))
+    except Exception as _path_exc:
+        logger.debug("Login-shell PATH merge failed (non-fatal): %s", _path_exc)
+
     # Optional stderr handler — level driven by -v/-q flags on the CLI.
     # verbosity=None (-q/--quiet): no stderr output
     # verbosity=0    (default):    WARNING and above

@@ -480,11 +480,18 @@ For reliable auto-start, use Windows Task Scheduler to launch WSL + the gateway 
 2. Set it to trigger on user logon
 :::
 
-#### macOS: Node.js / ffmpeg / other tools not found by gateway
+#### Node.js / ffmpeg / other tools not found by the gateway service
 
-**Cause:** launchd services inherit a minimal PATH (`/usr/bin:/bin:/usr/sbin:/sbin`) that doesn't include Homebrew, nvm, cargo, or other user-installed tool directories. This commonly breaks the WhatsApp bridge (`node not found`) or voice transcription (`ffmpeg not found`).
+**Cause:** systemd and launchd start the gateway with the PATH written into the unit/plist, which is a snapshot of the shell that last ran `hermes gateway install` or `hermes update`. Directories only your rc files add (Homebrew, nvm, pyenv, cargo) are missing when that shell didn't load them — e.g. `hermes update` run from a plain SSH session. This commonly breaks the WhatsApp bridge (`node not found`) or voice transcription (`ffmpeg not found`).
 
-**Solution:** The gateway captures your shell PATH when you run `hermes gateway install`. If you installed tools after setting up the gateway, re-run the install to capture the updated PATH:
+**Solution:** When a service manager starts it, the gateway runs your login shell (`$SHELL -ilc`) once and appends the PATH entries it finds, so tools you install later are picked up on the next gateway restart. Check `~/.hermes/logs/gateway.log` for `Added login-shell PATH entries`. If your rc files take longer than 5 seconds or exit early, the gateway keeps the unit's PATH; to turn the merge off:
+
+```yaml
+gateway:
+  login_shell_path: false
+```
+
+You can still re-snapshot the unit's own PATH from a shell that has everything:
 
 ```bash
 hermes gateway install    # Re-snapshots your current PATH
