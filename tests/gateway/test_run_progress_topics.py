@@ -2843,3 +2843,77 @@ async def test_inactivity_timeout_message_omits_the_unlimited_denominator(monkey
     text = result.get("final_response") or ""
     assert "iteration 12)" in text
     assert str(sys.maxsize) not in text and "12/" not in text
+
+
+
+class LateSteerCardKitAgent:
+    """Turn 1 ends while a CardKit steer follow-up is still unconsumed.
+
+    Mirrors the cloud race: the follow-up was accepted as a steer (receipt
+    card shown) but landed after the agent's last tool batch, so it comes
+    back as pending_steer while its receipt is requeued as the full message
+    when the stream consumer closes.
+    """
+
+    LATE = "理想的应该是并行展示"
+    calls: list = []
+    loop = None
+    adapter = None
+
+    def __init__(self, **kwargs):
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cls = LateSteerCardKitAgent
+        cls.calls.append(message)
+        if len(cls.calls) > 1:
+            return {"final_response": "并行的回答", "messages": [], "api_calls": 1}
+        self.stream_delta_callback("第一条的回答")
+        time.sleep(0.2)
+        consumer = self._gateway_stream_consumer
+        source = SessionSource(platform=Platform.FEISHU, chat_id="oc_cardkit", chat_type="dm")
+        late = MessageEvent(text=cls.LATE, message_type=MessageType.TEXT, source=source, message_id="om_late")
+
+        def requeue():
+            cls.adapter._pending_messages["agent:main:feishu:dm:oc_cardkit"] = late
+            return True
+
+        receipt = consumer.register_followup(cls.LATE, "om_late", {}, requeue)
+        receipt.event = late
+        asyncio.run_coroutine_threadsafe(consumer.acknowledge_followup(receipt), cls.loop).result(5)
+        return {"final_response": "第一条的回答", "messages": [], "api_calls": 1,
+                "pending_steer": cls.LATE}
+
+
+@pytest.mark.asyncio
+async def test_late_steer_is_answered_once_as_its_own_requeued_message(monkeypatch, tmp_path):
+    """Regression: the bare steer text was drained before the consumer
+    requeued the receipt's message, so it was answered twice — first
+    unanchored, with its badge stuck on "queued"."""
+    LateSteerCardKitAgent.calls = []
+    LateSteerCardKitAgent.loop = asyncio.get_running_loop()
+    real_init = RolloverCardKitAdapter.__init__
+
+    def init(self, *a, **k):
+        real_init(self, *a, **k)
+        LateSteerCardKitAgent.adapter = self
+
+    monkeypatch.setattr(RolloverCardKitAdapter, "__init__", init)
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        LateSteerCardKitAgent,
+        session_id="sess-late-steer",
+        config_data={"streaming": {"enabled": True}},
+        platform=Platform.FEISHU,
+        chat_id="oc_cardkit",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=RolloverCardKitAdapter,
+    )
+
+    follow_ups = LateSteerCardKitAgent.calls[1:]
+    assert len(follow_ups) == 1, follow_ups
+    assert LateSteerCardKitAgent.LATE in follow_ups[0]
+    assert result["final_response"] == "并行的回答"

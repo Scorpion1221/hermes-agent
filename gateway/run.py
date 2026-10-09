@@ -31989,6 +31989,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Use session_key (not source.chat_id) to match adapter's storage keys.
             pending_event = None
             pending = None
+            if (
+                result
+                and result.get("pending_steer")
+                and stream_task is not None
+                and not stream_task.done()
+            ):
+                # A steer that missed the last tool batch comes back as
+                # pending_steer, and its CardKit follow-up receipt is requeued
+                # as the full message when the stream consumer closes. Let that
+                # land first: draining before it would answer the bare text
+                # (no reply anchor, badge stuck on "queued") and then answer
+                # the requeued message a second time.
+                try:
+                    await asyncio.wait_for(asyncio.shield(stream_task), timeout=5.0)
+                except Exception:
+                    logger.debug("Stream consumer did not close before the steer drain", exc_info=True)
             if result and adapter and session_key:
                 pending_event = _dequeue_pending_event(adapter, session_key)
                 # /queue overflow: after consuming the adapter's "next-up"
