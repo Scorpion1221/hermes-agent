@@ -5,6 +5,7 @@ from __future__ import annotations
 from agent.credential_pool_admin import CredentialPoolAdminMixin
 from agent.credential_pool_model_cooldowns import CredentialPoolModelCooldownMixin, model_cooldown_until
 
+import hashlib
 import logging
 import os
 import random
@@ -2476,6 +2477,19 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
 # --- Seeding --------------------------------------------------------------
 
 
+def _seeded_entry_id(entries: list[PooledCredential], provider: str, source: str) -> str:
+    """Id for a newly seeded row, stable across processes for the same (provider, source).
+
+    A seeded row a load does not persist (a profile borrowing root's rows) is re-seeded by
+    every process; a random id would change each time, so an id from ``hermes auth list``
+    would no longer match in the next ``hermes auth remove/reset <id>``.
+    """
+    candidate = hashlib.sha256(f"{provider}\0{source}".encode("utf-8")).hexdigest()[:6]
+    if any(entry.id == candidate for entry in entries):
+        return uuid.uuid4().hex[:6]
+    return candidate
+
+
 def _upsert_entry(entries: list[PooledCredential], provider: str, source: str, payload: dict[str, Any]) -> bool:
     matching_indices = [idx for idx, entry in enumerate(entries) if entry.source == source]
     existing_idx = matching_indices[0] if matching_indices else None
@@ -2484,7 +2498,7 @@ def _upsert_entry(entries: list[PooledCredential], provider: str, source: str, p
         entries[:] = [entry for idx, entry in enumerate(entries) if idx not in duplicate_indices]
 
     if existing_idx is None:
-        payload.setdefault("id", uuid.uuid4().hex[:6])
+        payload.setdefault("id", _seeded_entry_id(entries, provider, source))
         payload.setdefault("priority", _next_priority(entries))
         payload.setdefault("label", payload.get("label") or source)
         entries.append(PooledCredential.from_dict(provider, payload))

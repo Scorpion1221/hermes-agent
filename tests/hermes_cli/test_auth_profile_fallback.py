@@ -320,6 +320,24 @@ def test_load_pool_keeps_borrowed_root_rows_out_of_the_profile(profile_env, monk
     assert root_file.read_bytes() == root_before
 
 
+def test_unpersisted_seeded_row_keeps_its_id_across_loads(profile_env, monkeypatch):
+    """A borrowing profile re-seeds its env row on every load (nothing is persisted), so the
+    id ``hermes auth list`` printed must still resolve in the next ``auth remove/reset <id>``."""
+    from agent.credential_pool import load_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [{"id": "glob-1", "label": "root-key", "auth_type": "api_key",
+                        "priority": 0, "source": "manual", "access_token": "sk-or-root"}],
+    }))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-env")
+
+    listed = next(e for e in load_pool("openrouter").entries() if e.source == "env:OPENROUTER_API_KEY")
+    _index, matched, error = load_pool("openrouter").resolve_target(listed.id)
+
+    assert error is None
+    assert matched.source == "env:OPENROUTER_API_KEY"
+
+
 @pytest.mark.parametrize("strategy", ["fill_first", "round_robin"])
 def test_select_keeps_borrowed_root_rows_out_of_the_profile(profile_env, strategy):
     """Selecting from a borrowed pool heals in memory too: clearing an elapsed cooldown and
