@@ -24,7 +24,7 @@ _NAME_FIELDS = ("name", "display_name", "nickname", "en_name")
 
 async def prefetch_user_names(adapter: Any, open_ids: Iterable[str]) -> None:
     """Cache display names for ``open_ids`` not already cached; failures leave them unnamed."""
-    from plugins.platforms.feishu.adapter import _FEISHU_SENDER_NAME_TTL_SECONDS
+    from .adapter import _FEISHU_SENDER_NAME_TTL_SECONDS
 
     pending = [oid for oid in dict.fromkeys(open_ids) if oid and adapter._get_cached_sender_name(oid) is None]
     for start in range(0, len(pending), _BATCH_SIZE):

@@ -15,8 +15,8 @@ logger = logging.getLogger(__name__)
 
 async def fetch_message_text(adapter: Any, message_id: str) -> Optional[str]:
     """Readable text of ``message_id`` (LRU-cached on the adapter); None when it can't be fetched."""
-    from plugins.platforms.feishu.adapter import _FEISHU_MESSAGE_TEXT_CACHE_SIZE
-    from plugins.platforms.feishu.feishu_forward import display_text, fetch_message_items, render_merge_forward
+    from .adapter import _FEISHU_MESSAGE_TEXT_CACHE_SIZE
+    from .feishu_forward import display_text, fetch_message_items, render_merge_forward
 
     if not adapter._client or not message_id:
         return None

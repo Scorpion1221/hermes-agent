@@ -35,7 +35,7 @@ async def fetch_message_items(adapter: Any, message_id: str) -> Optional[list[An
 
     Without ``raw_card_content`` a Card JSON 2.0 card reads back as a "please upgrade" placeholder.
     """
-    from plugins.platforms.feishu import adapter as facade
+    from . import adapter as facade
 
     request = facade._sdk_build(
         facade.GetMessageRequest, message_id=message_id, card_msg_content_type="raw_card_content",
@@ -52,7 +52,7 @@ async def fetch_message_items(adapter: Any, message_id: str) -> Optional[list[An
 
 def display_text(normalized: Any) -> str:
     """Readable text of a normalized message: its text, its attachment placeholder, or ``[<type>]``."""
-    from plugins.platforms.feishu.adapter import FALLBACK_IMAGE_TEXT
+    from .adapter import FALLBACK_IMAGE_TEXT
 
     text = normalized.text_content or str(normalized.metadata.get("placeholder_text") or "").strip()
     if text or normalized.raw_type in ("", "text"):
@@ -62,7 +62,7 @@ def display_text(normalized: Any) -> str:
 
 async def expand_merge_forward(adapter: Any, message_id: str, normalized: Any) -> Any:
     """An inbound forward as its transcript plus (bounded) child media; ``normalized`` on failure."""
-    from plugins.platforms.feishu.adapter import FeishuNormalizedMessage
+    from .adapter import FeishuNormalizedMessage
 
     if not adapter._client or not message_id:
         return normalized
@@ -82,8 +82,8 @@ async def expand_merge_forward(adapter: Any, message_id: str, normalized: Any) -
 
 async def render_merge_forward(adapter: Any, root_id: str, items: list[Any]) -> Optional[ForwardTranscript]:
     """Transcript of a forward's GET ``items``; None when they hold no forwarded message."""
-    from plugins.platforms.feishu.adapter import FALLBACK_FORWARD_TEXT
-    from plugins.platforms.feishu.feishu_names import prefetch_user_names
+    from .adapter import FALLBACK_FORWARD_TEXT
+    from .feishu_names import prefetch_user_names
 
     children: dict[str, list[Any]] = defaultdict(list)
     for item in items:
@@ -140,7 +140,7 @@ class _Transcript:
 
     def add(self, depth: int, item: Any) -> bool:
         """Append one entry; False once the char budget is spent."""
-        from plugins.platforms.feishu.adapter import FALLBACK_FORWARD_TEXT
+        from .adapter import FALLBACK_FORWARD_TEXT
 
         if self._chars >= MAX_FORWARD_CHARS:
             return False

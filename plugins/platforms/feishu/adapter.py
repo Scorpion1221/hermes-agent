@@ -735,7 +735,7 @@ def _normalize_share_chat_message(payload: dict[str, Any]) -> FeishuNormalizedMe
 
 
 def _normalize_interactive_message(message_type: str, payload: dict[str, Any]) -> FeishuNormalizedMessage:
-    from plugins.platforms.feishu.feishu_card_text import render_json_card
+    from .feishu_card_text import render_json_card
     if card_text := render_json_card(payload):  # GET with card_msg_content_type=raw_card_content
         return FeishuNormalizedMessage(raw_type=message_type, text_content=card_text, relation_kind="interactive")
     card_payload = payload.get("card") if isinstance(payload.get("card"), dict) else payload
@@ -3017,7 +3017,7 @@ class FeishuAdapter(BasePlatformAdapter):
         logger.info("[Feishu] Received raw message type=%s message_id=%s", raw_type, message_id)
         normalized = self._normalize(raw_type, raw_content, getattr(message, "mentions", None))
         if raw_type == "merge_forward":  # the event body is a placeholder; the forwarded messages come from GET
-            from plugins.platforms.feishu.feishu_forward import expand_merge_forward
+            from .feishu_forward import expand_merge_forward
             normalized = await expand_merge_forward(self, message_id, normalized)
         media_urls, media_types = await self._download_feishu_message_resources(
             message_id=message_id, normalized=normalized,
@@ -3333,7 +3333,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def _fetch_message_text(self, message_id: str) -> Optional[str]:
         """Readable text of a quoted message (``reply_to_text``); see ``feishu_quote``."""
-        from plugins.platforms.feishu.feishu_quote import fetch_message_text
+        from .feishu_quote import fetch_message_text
         return await fetch_message_text(self, message_id)
 
     @staticmethod

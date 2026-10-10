@@ -26,6 +26,10 @@ NESTED = "om_fwd_nested"
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
 
 
+class _SdkRequest(SimpleNamespace):
+    """What a bound SDK request builder produces (``_sdk_build`` falls back to a bare SimpleNamespace)."""
+
+
 class _FakeSdkBuilder:
     def __init__(self):
         self._fields = {}
@@ -41,7 +45,7 @@ class _FakeSdkBuilder:
         return _set
 
     def build(self):
-        return SimpleNamespace(**self._fields)
+        return _SdkRequest(**self._fields)
 
 
 class _FakeSdkRequestType:
@@ -368,6 +372,26 @@ def test_quoted_merge_forward_reads_as_its_transcript_without_downloading_media(
 
     assert quoted == "[Merged forward message]\n- Alice: the numbers\n- Alice: [Image]"
     assert client.resource_gets == []
+
+
+def test_quoted_fetch_through_the_loaded_plugin_uses_its_bound_sdk_request(monkeypatch):
+    """The plugin loader imports the adapter under its own package name; the fetch helpers must use
+    that module's SDK bindings (``_load_lark_oapi`` binds them there), not a second copy's."""
+    from gateway.config import PlatformConfig
+    from gateway.platform_registry import platform_registry
+    from hermes_cli.plugins import discover_plugins
+
+    discover_plugins()
+    adapter_cls = platform_registry.get("feishu").adapter_factory
+    monkeypatch.setattr(sys.modules[adapter_cls.__module__], "GetMessageRequest", _FakeSdkRequestType)
+    client = FakeFeishu({"om_parent": [item("om_parent", "text", {"text": "the plan"}, upper=None)]})
+    adapter = adapter_cls(PlatformConfig())
+    adapter._client = client
+
+    assert asyncio.run(adapter._fetch_message_text("om_parent")) == "the plan"
+    (request,) = client.message_gets
+    assert type(request) is _SdkRequest
+    assert (request.message_id, request.card_msg_content_type) == ("om_parent", "raw_card_content")
 
 
 def test_quoted_image_reads_as_an_image_placeholder():
