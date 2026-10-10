@@ -2,8 +2,10 @@
 
 A merge-forward transcript names every distinct sender, so one ``contact/v3/users/batch`` call
 replaces a ``contact/v3/users/{id}`` GET per sender. Feishu rejects the whole batch when any id is
-unknown to the tenant (an external contact, a departed user), so a failed batch falls back to the
-adapter's single lookup for that chunk.
+unknown to the tenant (an external contact, a departed user), so a refused batch falls back to the
+adapter's single lookup for that chunk, and the ids neither call could name are cached as nameless
+("") for the usual TTL: the next forward from that chat does not repeat the refused round trip.
+A transport failure also falls back to single lookups but remembers no misses.
 """
 
 from __future__ import annotations
@@ -13,13 +15,14 @@ import itertools
 import json
 import logging
 import time
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
 _BATCH_SIZE = 50  # contact/v3/users/batch accepts at most 50 user_ids per call
 NAME_CACHE_MAX = 2048
 _NAME_FIELDS = ("name", "display_name", "nickname", "en_name")
+_REFUSED = object()  # Feishu answered, but rejected the batch (some id is unknown to the tenant)
 
 
 async def prefetch_user_names(adapter: Any, open_ids: Iterable[str]) -> None:
@@ -30,15 +33,20 @@ async def prefetch_user_names(adapter: Any, open_ids: Iterable[str]) -> None:
     for start in range(0, len(pending), _BATCH_SIZE):
         chunk = pending[start:start + _BATCH_SIZE]
         names = await _fetch_user_names(adapter, chunk)
-        if names is None:
+        if not isinstance(names, dict):  # refused or failed: one lookup per sender
             await asyncio.gather(*(adapter._resolve_sender_name_from_api(oid) for oid in chunk))
-            continue
+            if names is None:
+                continue  # transport failure: remember no misses, the next forward retries
+            names = {}
         expire_at = time.time() + _FEISHU_SENDER_NAME_TTL_SECONDS
-        adapter._sender_name_cache.update((oid, (name, expire_at)) for oid, name in names.items())
+        adapter._sender_name_cache.update(
+            (oid, (names.get(oid, ""), expire_at)) for oid in chunk if adapter._get_cached_sender_name(oid) is None
+        )
     _trim(adapter._sender_name_cache)
 
 
-async def _fetch_user_names(adapter: Any, open_ids: list[str]) -> Optional[dict[str, str]]:
+async def _fetch_user_names(adapter: Any, open_ids: list[str]) -> Any:
+    """``{open_id: name}`` for the ids Feishu named, ``_REFUSED``, or None on a transport failure."""
     try:
         content = await adapter._tenant_get_raw(
             "/open-apis/contact/v3/users/batch",
@@ -51,7 +59,7 @@ async def _fetch_user_names(adapter: Any, open_ids: list[str]) -> Optional[dict[
     code = payload.get("code") if isinstance(payload, dict) else None
     if code != 0:
         logger.debug("[Feishu] Batch user-name lookup refused: code=%s", code)
-        return None
+        return _REFUSED
     names: dict[str, str] = {}
     for user in (payload.get("data") or {}).get("items") or []:
         if not isinstance(user, dict):

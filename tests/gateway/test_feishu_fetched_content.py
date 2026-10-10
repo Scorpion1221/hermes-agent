@@ -303,6 +303,22 @@ def test_unresolvable_forward_senders_get_neutral_labels_never_raw_ids():
     assert "ou_" not in text_out and "cli_" not in text_out
 
 
+def test_a_sender_no_lookup_can_name_is_not_looked_up_again_on_the_next_forward():
+    items = [
+        forward_root(),
+        item("om_a", "text", {"text": "from a colleague"}, sender="ou_alice", at=1),
+        item("om_x", "text", {"text": "from someone who left"}, sender="ou_departed", at=2),
+    ]
+    client = FakeFeishu({ROOT: items}, users={"ou_alice": "Alice"})
+    adapter = make_adapter(client)
+
+    first = inbound_forward(adapter)[0]
+    second = inbound_forward(adapter)[0]
+
+    assert first == second == "[Merged forward message]\n- Alice: from a colleague\n- Participant 1: from someone who left"
+    assert len(client.batch_gets) == 1 and sorted(client.user_gets) == ["ou_alice", "ou_departed"]
+
+
 def test_forward_sender_names_come_from_one_batch_call_and_are_cached():
     items = [
         forward_root(),
