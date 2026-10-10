@@ -320,6 +320,41 @@ def test_load_pool_keeps_borrowed_root_rows_out_of_the_profile(profile_env, monk
     assert root_file.read_bytes() == root_before
 
 
+@pytest.mark.parametrize("strategy", ["fill_first", "round_robin"])
+def test_select_keeps_borrowed_root_rows_out_of_the_profile(profile_env, strategy):
+    """Selecting from a borrowed pool heals in memory too: clearing an elapsed cooldown and
+    round-robin reordering must not copy root's rows into the profile, or the copy shadows a
+    key later rotated at root."""
+    from agent.credential_pool import load_pool
+    from hermes_cli.auth import read_credential_pool
+
+    (profile_env["profile"] / "config.yaml").write_text(
+        f"credential_pool_strategies:\n  openrouter: {strategy}\n")
+    root_file = profile_env["global"] / "auth.json"
+    _write(root_file, _make_auth_store(pool={"openrouter": [
+        {"id": "glob-1", "label": "a", "auth_type": "api_key", "priority": 0, "source": "manual",
+         "access_token": "sk-or-1", "last_status": "exhausted",
+         "last_status_at": time.time() - 7200, "last_error_code": 429},
+        {"id": "glob-2", "label": "b", "auth_type": "api_key", "priority": 1, "source": "manual",
+         "access_token": "sk-or-2"},
+    ]}))
+    root_before = root_file.read_bytes()
+
+    pool = load_pool("openrouter")
+    assert pool.select().id == "glob-1"  # the elapsed cooldown was lifted in memory
+    pool.select()
+
+    profile_file = profile_env["profile"] / "auth.json"
+    profile_pool = json.loads(profile_file.read_text()).get("credential_pool", {}) if profile_file.exists() else {}
+    assert "openrouter" not in profile_pool
+    assert root_file.read_bytes() == root_before
+    # A key rotated at root still reaches the profile.
+    rotated = json.loads(root_before)
+    rotated["credential_pool"]["openrouter"][0]["access_token"] = "sk-or-rotated"
+    _write(root_file, rotated)
+    assert read_credential_pool("openrouter")[0]["access_token"] == "sk-or-rotated"
+
+
 def test_load_pool_still_persists_healing_for_rows_the_profile_owns(profile_env, monkeypatch):
     from agent.credential_pool import load_pool
 

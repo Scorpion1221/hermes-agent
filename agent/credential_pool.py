@@ -1175,6 +1175,17 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 if pair != (entry.access_token, entry.refresh_token):
                     self._replace_entry(entry, PooledCredential.from_dict(self.provider, row))
 
+    def _persist_read_path_heal(self, *, removed_ids: Optional[list[str]] = None) -> None:
+        """Persist healing done while selecting (elapsed cooldowns, DEAD prunes, round-robin order).
+
+        Same ownership rule as load_pool(): rows a named profile reads through the global-root
+        fallback stay in memory, or this write would copy root's rows into the profile, whose
+        copy then shadows root forever. Single-use OAuth providers write borrowed rows back to
+        root update-only (persist_pool_entries), so they persist as before.
+        """
+        if self.provider in SINGLE_USE_REFRESH_POOL_PROVIDERS or _profile_owns_pool_provider(self.provider):
+            self._persist(removed_ids=removed_ids)
+
     def _adopt(self, entry: PooledCredential, *, persist: bool = True, **updates: Any) -> PooledCredential:
         """``replace(entry, **updates)``, swap it into the pool, optionally persist."""
         updated = replace(entry, **updates)
@@ -2151,7 +2162,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             pruned_ids = set(entries_to_prune)
             self._entries = [e for e in self._entries if e.id not in pruned_ids]
         if cleared_any:
-            self._persist(removed_ids=entries_to_prune)
+            self._persist_read_path_heal(removed_ids=entries_to_prune)
         return available, pending_refresh
 
     def _log_no_available_entries(self) -> None:
@@ -2196,7 +2207,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             rotated = [candidate for candidate in self._entries if candidate.id != entry.id]
             rotated.append(replace(entry, priority=len(self._entries) - 1))
             self._entries = [replace(candidate, priority=idx) for idx, candidate in enumerate(rotated)]
-            self._persist()
+            self._persist_read_path_heal()
             entry = self._find(lambda candidate: candidate.id == entry.id) or entry
         self._current_id = entry.id
         return entry, pending_refresh
