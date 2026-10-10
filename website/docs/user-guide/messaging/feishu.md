@@ -417,7 +417,7 @@ platforms:
       quote_chain_max_depth: 20   # Messages walked toward the start of a reply chain (default: 20; 0 or 1 = only the quoted message)
 ```
 
-Walking the chain takes about 3 seconds at most. If Feishu is slow, the agent gets a shorter chain marked as incomplete instead of a late reply.
+Walking the chain and downloading the quoted attachments take about 3 seconds at most. If Feishu is slow, the agent gets a shorter chain marked as incomplete, and attachments that are still downloading are left out of that message instead of delaying the reply; the next reply quoting the same message gets them without downloading them again.
 
 ### Outbound (sending)
 

@@ -37,8 +37,8 @@ USERS = {"ou_alice": "Alice", "ou_bob": "Bob"}
 
 
 class ChainFeishu(FakeFeishu):
-    """``messages`` keyed by id; ``slow`` ids answer after ``slow_delay`` seconds or once ``released`` is
-    set, whichever is first; resources succeed."""
+    """``messages`` keyed by id; ``slow`` message ids and resource keys answer after ``slow_delay``
+    seconds or once ``released`` is set, whichever is first; resources succeed."""
 
     def __init__(self, messages, users=USERS, *, slow=(), slow_delay=0.0, resource_types=None):
         super().__init__(messages, users)
@@ -57,6 +57,8 @@ class ChainFeishu(FakeFeishu):
 
     def _get_resource(self, request):
         self.resource_gets.append(request)
+        if request.file_key in self.slow:
+            self.released.wait(self.slow_delay)
         content_type = self.resource_types.get(request.file_key, "image/png")
         body = PNG if content_type.startswith("image/") else b"%PDF-1.4 synthetic"
         return SimpleNamespace(
@@ -422,6 +424,49 @@ def test_a_quoted_file_is_attached_as_a_document_and_a_quoted_voice_note_is_not(
     assert file_event.media_types == ["application/pdf"] and file_event.reply_to_text == "[Attachment: report.pdf]"
     assert voice_event.media_urls == [] and voice_event.message_type.value == "text"
     assert [r.file_key for r in client.resource_gets] == ["file_report"]
+
+
+def test_a_slow_quoted_download_costs_at_most_the_budget_and_the_next_reply_reuses_it(monkeypatch):
+    import plugins.platforms.feishu.feishu_quote as quote
+
+    monkeypatch.setattr(quote, "CHAIN_BUDGET_SECONDS", 0.3)
+    report = msg("om_file", {"file_key": "file_report", "file_name": "report.pdf"}, msg_type="file")
+    client = ChainFeishu(
+        {"om_file": [report]}, slow={"file_report"}, slow_delay=10, resource_types={"file_report": "application/pdf"},
+    )
+    adapter = make_adapter(client)
+
+    async def two_replies():
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        first = await quote.fetch_quoted_reply(adapter, "om_file")
+        elapsed = loop.time() - start
+        client.released.set()  # the abandoned download now finishes in the background
+        await asyncio.gather(*adapter._quote_background_fetches)
+        return first, elapsed, await quote.fetch_quoted_reply(adapter, "om_file")
+
+    first, elapsed, second = asyncio.run(two_replies())
+
+    assert elapsed < 3  # stopped at the 0.3s budget, not after the 10s download
+    assert (first.text, first.media_urls) == ("[Attachment: report.pdf]", [])
+    assert second.media_types == ["application/pdf"] and os.path.isfile(second.media_urls[0])
+    assert len(client.resource_gets) == 1
+
+
+def test_replies_quoting_the_same_image_share_one_download_until_its_file_is_gone():
+    from plugins.platforms.feishu.feishu_quote import fetch_quoted_reply
+
+    client = ChainFeishu({"om_img": [msg("om_img", {"image_key": "img_chart"}, msg_type="image")]})
+    adapter = make_adapter(client)
+
+    first = asyncio.run(fetch_quoted_reply(adapter, "om_img"))
+    second = asyncio.run(fetch_quoted_reply(adapter, "om_img"))
+    assert second.media_urls == first.media_urls and len(client.resource_gets) == 1
+
+    os.remove(first.media_urls[0])  # the gateway's media cache cleanup removed it
+    third = asyncio.run(fetch_quoted_reply(adapter, "om_img"))
+
+    assert len(client.resource_gets) == 2 and os.path.isfile(third.media_urls[0])
 
 
 def test_quoted_media_follows_the_reply_into_a_text_batch():

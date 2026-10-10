@@ -12,7 +12,9 @@ reply in that chain.
 Messages are fetched with card bodies as raw ``json_card``, so a quoted Card JSON 2.0 card (the
 bot's own replies) reads as its content and a quoted merge-forward as its transcript (text only).
 Images and files of the directly quoted message, never of its ancestors, are downloaded and
-attached to the event (capped), as other adapters attach quoted images.
+attached to the event (capped), as other adapters attach quoted images. The download shares the
+walk's time budget and is cached per quoted message (while its files exist), so a slow download
+is left out of that reply but reused, not repeated, by the next reply quoting the same message.
 """
 
 from __future__ import annotations
@@ -20,6 +22,8 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import os
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Optional
 
@@ -30,6 +34,7 @@ NAMES_BUDGET_SECONDS = 0.5  # one batch lookup naming the chain's senders
 MAX_ANCESTOR_CHARS = 500
 MAX_ANCESTORS_CHARS = 4000
 MAX_QUOTED_MEDIA = 5
+MEDIA_CACHE_SIZE = 64  # quoted messages whose downloaded attachments are kept for later replies
 _TYPE_LABELS = {"interactive": "card", "media": "video", "merge_forward": "merged forward", "post": "rich text"}
 # agent/context_compressor.py ends the gateway's reply pointer at the first `"]` + blank line.
 _POINTER_END = '"]\n\n'
@@ -63,7 +68,7 @@ async def fetch_quoted_reply(adapter: Any, message_id: Optional[str]) -> QuotedR
     if quoted is None:
         return QuotedReply()
     (ancestors, complete), (media_urls, media_types) = await asyncio.gather(
-        _walk_ancestors(adapter, quoted, deadline), _download_media(adapter, quoted),
+        _walk_ancestors(adapter, quoted, deadline), _attachments(adapter, quoted, deadline),
     )
     text = await _render(adapter, quoted, ancestors, complete)
     return QuotedReply(
@@ -148,15 +153,40 @@ async def _within(adapter: Any, work: Awaitable[Any], timeout: float) -> Any:
         return None
 
 
-async def _download_media(adapter: Any, quoted: QuoteNode) -> tuple[list[str], list[str]]:
-    from .adapter import FeishuNormalizedMessage
-
+async def _attachments(adapter: Any, quoted: QuoteNode, deadline: float) -> tuple[list[str], list[str]]:
+    """The quoted message's attachments as downloaded by the deadline; none when the download is still running."""
     # Quoted audio stays a text placeholder: attached, the gateway would transcribe it as the user's own voice.
     image_keys = list(quoted.image_keys[:MAX_QUOTED_MEDIA])
     files = [ref for ref in quoted.media_refs if ref.resource_type != "audio"]
     media_refs = files[:MAX_QUOTED_MEDIA - len(image_keys)]
     if not image_keys and not media_refs:
         return [], []
+    cache: OrderedDict[str, asyncio.Future] = vars(adapter).setdefault("_quote_media_cache", OrderedDict())
+    download = cache.get(quoted.message_id)
+    if download is None or (download.done() and not _still_cached(download)):
+        download = asyncio.ensure_future(_download(adapter, quoted, image_keys, media_refs))
+    cache[quoted.message_id] = download
+    cache.move_to_end(quoted.message_id)
+    while len(cache) > MEDIA_CACHE_SIZE:
+        cache.popitem(last=False)
+    result = download.result() if download.done() else await _within(
+        adapter, download, deadline - asyncio.get_running_loop().time(),
+    )
+    urls, types = result or ([], [])
+    return list(urls), list(types)
+
+
+def _still_cached(download: asyncio.Future) -> bool:
+    """A finished download is reused while it produced files and they are still in the media cache."""
+    if download.cancelled() or download.exception() is not None:
+        return False
+    urls = download.result()[0]
+    return bool(urls) and all(os.path.exists(url) for url in urls)
+
+
+async def _download(adapter: Any, quoted: QuoteNode, image_keys: list[str], media_refs: list[Any]) -> tuple[list[str], list[str]]:
+    from .adapter import FeishuNormalizedMessage
+
     urls, types = await adapter._download_feishu_message_resources(
         message_id=quoted.message_id,
         normalized=FeishuNormalizedMessage(
