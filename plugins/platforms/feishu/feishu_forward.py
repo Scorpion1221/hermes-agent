@@ -11,6 +11,7 @@ forward's id answer 234003 "File not in msg".
 from __future__ import annotations
 
 import logging
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -21,6 +22,8 @@ MAX_FORWARD_ENTRIES = 100
 MAX_FORWARD_CHARS = 10_000
 MAX_ENTRY_CHARS = 2_000
 MAX_FORWARD_MEDIA = 10
+# The gateway expands ``@file:``/``@url:``/``@diff``... references (built-in and plugin prefixes) in event text.
+_CONTEXT_REFERENCE = re.compile(r"(?<![\w/])@(?=[A-Za-z][\w-]*:\S|(?:diff|staged)\b)")
 
 
 @dataclass
@@ -48,6 +51,12 @@ async def fetch_message_items(adapter: Any, message_id: str) -> Optional[list[An
         )
         return None
     return list(getattr(getattr(response, "data", None), "items", None) or [])
+
+
+def keep_references_literal(text: str) -> str:
+    """Forwarded text is other people's: a reference in it must not read a file or fetch a URL on the
+    forwarder's behalf, so its ``@`` becomes a full-width ``＠`` (the expander no longer matches it)."""
+    return _CONTEXT_REFERENCE.sub("＠", text)
 
 
 def display_text(normalized: Any) -> str:

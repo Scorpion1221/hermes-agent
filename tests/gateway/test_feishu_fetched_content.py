@@ -334,6 +334,34 @@ def test_prefetched_names_keep_the_sender_cache_bounded():
     assert max(sum(key == "user_ids" for key, _ in r.queries) for r in client.batch_gets) <= 50
 
 
+def test_context_references_in_a_forward_stay_literal(tmp_path):
+    """Forwarded messages are third-party text: the gateway's @-reference expander must not read a
+    local file or fetch a URL named in one, as it already refuses to for quoted replies."""
+    from agent.context_references import preprocess_context_references_async
+
+    (tmp_path / "plan.md").write_text("SECRET PLAN", encoding="utf-8")
+    items = [
+        forward_root(),
+        item("om_a", "text", {"text": "fyi @file:plan.md"}, sender="ou_external", at=1),
+        item("om_b", "text", {"text": "see @url:http://10.0.0.1/admin and @diff"}, sender="ou_external", at=2),
+        item("om_c", "text", {"text": "@Alice: ok, mail me at alice@example.com"}, sender="ou_external", at=3),
+    ]
+    text_out = inbound_forward(make_adapter(FakeFeishu({ROOT: items})))[0]
+    fetched = []
+
+    result = asyncio.run(preprocess_context_references_async(
+        text_out, cwd=tmp_path, allowed_root=tmp_path, context_length=100_000, url_fetcher=fetched.append,
+    ))
+
+    assert (result.references, result.expanded, fetched) == ([], False, [])
+    assert "SECRET PLAN" not in result.message
+    assert text_out.splitlines()[1:] == [
+        "- Participant 1: fyi ＠file:plan.md",
+        "- Participant 1: see ＠url:http://10.0.0.1/admin and ＠diff",
+        "- Participant 1: @Alice: ok, mail me at alice@example.com",
+    ]
+
+
 @pytest.mark.parametrize("failure", ["refused", "raises"])
 def test_merge_forward_fetch_failure_keeps_the_placeholder(failure):
     client = FakeFeishu(get_ok=False)
