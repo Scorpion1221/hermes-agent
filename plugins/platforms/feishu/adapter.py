@@ -735,6 +735,9 @@ def _normalize_share_chat_message(payload: dict[str, Any]) -> FeishuNormalizedMe
 
 
 def _normalize_interactive_message(message_type: str, payload: dict[str, Any]) -> FeishuNormalizedMessage:
+    from plugins.platforms.feishu.feishu_card_text import render_json_card
+    if card_text := render_json_card(payload):  # GET with card_msg_content_type=raw_card_content
+        return FeishuNormalizedMessage(raw_type=message_type, text_content=card_text, relation_kind="interactive")
     card_payload = payload.get("card") if isinstance(payload.get("card"), dict) else payload
     title = _first_non_empty_text(
         _find_header_title(card_payload), payload.get("title"),
@@ -3013,6 +3016,9 @@ class FeishuAdapter(BasePlatformAdapter):
         message_id = str(getattr(message, "message_id", "") or "")
         logger.info("[Feishu] Received raw message type=%s message_id=%s", raw_type, message_id)
         normalized = self._normalize(raw_type, raw_content, getattr(message, "mentions", None))
+        if raw_type == "merge_forward":  # the event body is a placeholder; the forwarded messages come from GET
+            from plugins.platforms.feishu.feishu_forward import expand_merge_forward
+            normalized = await expand_merge_forward(self, message_id, normalized)
         media_urls, media_types = await self._download_feishu_message_resources(
             message_id=message_id, normalized=normalized,
         )
@@ -3326,44 +3332,9 @@ class FeishuAdapter(BasePlatformAdapter):
             return None
 
     async def _fetch_message_text(self, message_id: str) -> Optional[str]:
-        if not self._client or not message_id:
-            return None
-        if message_id in self._message_text_cache:
-            self._message_text_cache.move_to_end(message_id)
-            return self._message_text_cache[message_id]
-        try:
-            request = self._build_get_message_request(message_id)
-            response = await self._run_blocking(self._client.im.v1.message.get, request)
-            if not response or getattr(response, "success", lambda: False)() is False:
-                code = getattr(response, "code", "unknown")
-                msg = getattr(response, "msg", "message lookup failed")
-                logger.warning("[Feishu] Failed to fetch parent message %s: [%s] %s", message_id, code, msg)
-                return None
-            items = getattr(getattr(response, "data", None), "items", None) or []
-            parent = items[0] if items else None
-            body = getattr(parent, "body", None)
-            msg_type = getattr(parent, "msg_type", "") or ""
-            raw_content = getattr(body, "content", "") or ""
-            parent_mentions = getattr(parent, "mentions", None) if parent else None
-            text = self._extract_text_from_raw_content(
-                msg_type=msg_type, raw_content=raw_content, mentions=parent_mentions,
-            )
-            self._message_text_cache[message_id] = text
-            while len(self._message_text_cache) > _FEISHU_MESSAGE_TEXT_CACHE_SIZE:
-                self._message_text_cache.popitem(last=False)
-            return text
-        except Exception:
-            logger.warning("[Feishu] Failed to fetch parent message %s", message_id, exc_info=True)
-            return None
-
-    def _extract_text_from_raw_content(
-        self, *, msg_type: str, raw_content: str, mentions: Optional[Sequence[Any]] = None,
-    ) -> Optional[str]:
-        normalized = self._normalize(msg_type, raw_content, mentions)
-        if normalized.text_content:
-            return normalized.text_content
-        placeholder = normalized.metadata.get("placeholder_text") if isinstance(normalized.metadata, dict) else None
-        return str(placeholder).strip() or None
+        """Readable text of a quoted message (``reply_to_text``); see ``feishu_quote``."""
+        from plugins.platforms.feishu.feishu_quote import fetch_message_text
+        return await fetch_message_text(self, message_id)
 
     @staticmethod
     def _default_image_media_type(ext: str) -> str:
