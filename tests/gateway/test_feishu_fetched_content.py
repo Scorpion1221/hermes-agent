@@ -15,6 +15,7 @@ import io
 import json
 import os
 import sys
+import time
 import types
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -77,6 +78,7 @@ class FakeFeishu:
         self.messages = messages or {}
         self.users = users or {}
         self.get_ok = get_ok
+        self.get_delay = 0.0  # seconds a message GET takes (on the adapter's SDK executor thread)
         self.message_gets, self.resource_gets, self.batch_gets, self.user_gets = [], [], [], []
         self.im = SimpleNamespace(v1=SimpleNamespace(
             message=SimpleNamespace(get=self._get_message),
@@ -86,6 +88,7 @@ class FakeFeishu:
 
     def _get_message(self, request):
         self.message_gets.append(request)
+        time.sleep(self.get_delay)
         if not self.get_ok:
             return SimpleNamespace(success=lambda: False, code=230002, msg="no permission")
         return SimpleNamespace(success=lambda: True, data=SimpleNamespace(items=self.messages[request.message_id]))
@@ -371,6 +374,78 @@ def test_merge_forward_fetch_failure_keeps_the_placeholder(failure):
     text_out, message_type, media_urls, _types, _inlined, _mentions = inbound_forward(make_adapter(client))
 
     assert (text_out, message_type.value, media_urls) == ("[Merged forward message]", "text", [])
+
+
+def inbound_event(message_id, message_type, content):
+    message = inbound_message(message_id, message_type, content)
+    message.chat_type = "p2p"
+    sender = SimpleNamespace(
+        sender_type="user", sender_id=SimpleNamespace(open_id="ou_alice", user_id=None, union_id=None),
+    )
+    return SimpleNamespace(event=SimpleNamespace(message=message, sender=sender))
+
+
+def delivered_turns(adapter, *events):
+    """Deliver ``events`` concurrently, in arrival order, through the real inbound path; return each
+    agent turn's text. The batch timer is parked and the pending batches flushed once all are in."""
+    adapter.get_chat_info = AsyncMock(return_value={"name": "DM"})
+    adapter.handle_message = AsyncMock()
+    adapter._text_batch_delay_seconds = adapter._text_batch_split_delay_seconds = 600
+
+    async def deliver():
+        await asyncio.gather(*(adapter._handle_message_event_data(event) for event in events))
+        for task in adapter._pending_text_batch_tasks.values():
+            task.cancel()
+        for key in list(adapter._pending_text_batches):
+            await adapter._flush_text_batch_now(key)
+
+    asyncio.run(deliver())
+    return [call.args[0].text for call in adapter.handle_message.await_args_list]
+
+
+def test_a_note_sent_behind_a_slow_forward_joins_it_as_one_turn_forward_first():
+    items = [forward_root(), item("om_a", "text", {"text": "the numbers"}, at=1)]
+    client = FakeFeishu({ROOT: items}, users={"ou_alice": "Alice"})
+    client.get_delay = 0.5
+
+    turns = delivered_turns(
+        make_adapter(client),
+        inbound_event(ROOT, "merge_forward", "Merged and Forwarded Message"),
+        inbound_event("om_note", "text", json.dumps({"text": "please summarize"})),
+    )
+
+    assert turns == ["[Merged forward message]\n- Alice: the numbers\nplease summarize"]
+
+
+def test_a_long_forward_transcript_does_not_push_its_note_into_a_turn_of_its_own():
+    from plugins.platforms.feishu.adapter import _DEFAULT_TEXT_BATCH_MAX_CHARS
+    from plugins.platforms.feishu.feishu_forward import MAX_ENTRY_CHARS
+
+    count = _DEFAULT_TEXT_BATCH_MAX_CHARS // MAX_ENTRY_CHARS + 1
+    items = [forward_root()] + [item(f"om_{i}", "text", {"text": "x" * MAX_ENTRY_CHARS}, at=i) for i in range(count)]
+    client = FakeFeishu({ROOT: items}, users={"ou_alice": "Alice"})
+
+    turns = delivered_turns(
+        make_adapter(client),
+        inbound_event(ROOT, "merge_forward", "Merged and Forwarded Message"),
+        inbound_event("om_note", "text", json.dumps({"text": "please summarize"})),
+    )
+
+    assert len(turns) == 1 and len(turns[0]) > _DEFAULT_TEXT_BATCH_MAX_CHARS
+    assert turns[0].startswith("[Merged forward message]\n") and turns[0].endswith("\nplease summarize")
+
+
+def test_text_batches_without_a_forward_still_flush_at_the_char_cap():
+    from plugins.platforms.feishu.adapter import _DEFAULT_TEXT_BATCH_MAX_CHARS
+
+    long_text = "y" * (_DEFAULT_TEXT_BATCH_MAX_CHARS - 10)
+    turns = delivered_turns(
+        make_adapter(FakeFeishu()),
+        inbound_event("om_1", "text", json.dumps({"text": long_text})),
+        inbound_event("om_2", "text", json.dumps({"text": "and one more thing"})),
+    )
+
+    assert turns == [long_text, "and one more thing"]
 
 
 # --- quoted messages (reply_to_text) ---

@@ -2114,20 +2114,23 @@ class FeishuAdapter(BasePlatformAdapter):
         if not message or not sender or not getattr(sender, "sender_id", None):
             logger.debug("[Feishu] Dropping malformed inbound event: missing message/sender")
             return
-        message_id = getattr(message, "message_id", None)
-        if not message_id or await self._is_duplicate(message_id):
-            logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
-            return
-        reason = self._admit(sender, message)
-        if reason is not None:
-            logger.debug("[Feishu] dropping inbound event: %s", reason)
-            if reason == "group_policy_rejected":
-                self._warn_once_empty_allowlist_deny(getattr(message, "chat_id", "") or "")
-            return
-        await self._process_inbound_message(
-            data=data, message=message, sender_id=getattr(sender, "sender_id", None),
-            chat_type=getattr(message, "chat_type", "p2p"), message_id=message_id, is_bot=_is_bot_sender(sender),
-        )
+        from .feishu_forward_order import in_arrival_order
+        async with in_arrival_order(self, message, sender):  # before any await: a forward outruns its note
+            message_id = getattr(message, "message_id", None)
+            if not message_id or await self._is_duplicate(message_id):
+                logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
+                return
+            reason = self._admit(sender, message)
+            if reason is not None:
+                logger.debug("[Feishu] dropping inbound event: %s", reason)
+                if reason == "group_policy_rejected":
+                    self._warn_once_empty_allowlist_deny(getattr(message, "chat_id", "") or "")
+                return
+            await self._process_inbound_message(
+                data=data, message=message, sender_id=getattr(sender, "sender_id", None),
+                chat_type=getattr(message, "chat_type", "p2p"), message_id=message_id,
+                is_bot=_is_bot_sender(sender),
+            )
 
     def _on_message_read_event(self, data: P2ImMessageMessageReadV1) -> None:
         """Ignore read-receipt events that Hermes does not act on."""
@@ -2967,7 +2970,8 @@ class FeishuAdapter(BasePlatformAdapter):
         next_count = self._pending_text_batch_counts.get(key, 1) + 1
         appended_text = event.text or ""
         next_text = f"{existing.text}\n{appended_text}" if existing.text and appended_text else (existing.text or appended_text)
-        if next_count > self._text_batch_max_messages or len(next_text) > self._text_batch_max_chars:
+        from .feishu_forward_order import batch_chars  # a forward's transcript does not count
+        if next_count > self._text_batch_max_messages or batch_chars(existing, next_text) > self._text_batch_max_chars:
             await self._flush_text_batch_now(key)
             _start_batch()
             return
