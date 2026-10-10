@@ -60,6 +60,32 @@ def test_tool_added_by_profile_becomes_resolvable_after_the_unit_entries(home):
     assert env["PATH"].startswith(UNIT_PATH + os.pathsep)
 
 
+def _shell_param(name, rc_file, rc_line):
+    return pytest.param(name, rc_file, rc_line, id=name,
+                        marks=pytest.mark.skipif(shutil.which(name) is None, reason=f"{name} is not installed"))
+
+
+@pytest.mark.parametrize("shell, rc_file, rc_line", [
+    _shell_param("bash", ".profile", 'export PATH="{dir}:$PATH"'),
+    # zsh is the macOS default, and what launchd's passwd fallback resolves to; nvm lives in .zshrc.
+    _shell_param("zsh", ".zshrc", 'export PATH="{dir}:$PATH"'),
+    _shell_param("dash", ".profile", 'export PATH="{dir}:$PATH"'),
+    _shell_param("ksh", ".profile", 'export PATH="{dir}:$PATH"'),
+    _shell_param("fish", ".config/fish/config.fish", "set -gx PATH {dir} $PATH"),
+])
+def test_each_login_shell_contributes_its_rc_path(home, shell, rc_file, rc_line):
+    tool = _install_tool(home / "rc-bin")
+    rc = home / rc_file
+    rc.parent.mkdir(parents=True, exist_ok=True)
+    rc.write_text(rc_line.format(dir=tool.parent) + "\n", encoding="utf-8")
+    env = _service_env(home, SHELL=shutil.which(shell))
+
+    apply_for_service({}, env, timeout=10)
+
+    assert shutil.which(tool.name, path=env["PATH"]) == str(tool)
+    assert all(os.path.isabs(entry) for entry in env["PATH"].split(os.pathsep))
+
+
 def test_profile_noise_does_not_corrupt_path(home):
     tool = _install_tool(home / "bin")
     (home / ".profile").write_text(

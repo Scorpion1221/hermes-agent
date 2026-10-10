@@ -34,7 +34,8 @@ logger = logging.getLogger(__name__)
 
 _PATH_START = "__HERMES_LOGIN_PATH_START__"
 _PATH_END = "__HERMES_LOGIN_PATH_END__"
-_PROBE_COMMAND = f"printf '%s' \"{_PATH_START}${{PATH}}{_PATH_END}\""
+# Valid in sh-family shells and fish alike: fish rejects ``${PATH}`` and joins a quoted "$PATH" with ':'.
+_PROBE_COMMAND = f"printf '%s%s%s' {_PATH_START} \"$PATH\" {_PATH_END}"
 ATTEMPT_TIMEOUT_S = 5.0
 # What a fresh login carries. The gateway's own environment holds the secrets loaded from .env and
 # its supervisor markers; neither belongs in the user's rc files.
