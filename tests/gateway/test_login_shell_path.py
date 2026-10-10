@@ -22,6 +22,11 @@ pytestmark = pytest.mark.platforms("posix")  # POSIX login shells
 
 BASH = shutil.which("bash") or "/bin/bash"
 UNIT_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+# Probe deadline for the hanging-rc tests: long enough for /etc/profile + the rc to reach the line
+# under test on a loaded runner, far below the rc's 30s sleep.
+HANG_TIMEOUT = 3
+# One probe plus the 1s kill grace, with headroom; a second probe or waiting out the sleep exceeds it.
+HANG_BUDGET = HANG_TIMEOUT + 1 + 5
 
 
 def _install_tool(directory, name="nvm-only-tool"):
@@ -112,8 +117,8 @@ def test_hanging_profile_is_probed_once_and_leaves_unit_path(home, tmp_path):
     env = _service_env(home)
 
     started = time.monotonic()
-    assert apply_for_service({}, env, timeout=1) is None
-    assert time.monotonic() - started < 6
+    assert apply_for_service({}, env, timeout=HANG_TIMEOUT) is None
+    assert time.monotonic() - started < HANG_BUDGET
     # Startup waits for one timeout at most: the plain-login fallback would hang on the same rc.
     assert runs.read_text(encoding="utf-8-sig").splitlines() == ["run"]
     assert env["PATH"] == UNIT_PATH
@@ -126,9 +131,9 @@ def test_profile_hanging_after_the_sentinel_still_yields_its_path(home):
     env = _service_env(home)
 
     started = time.monotonic()
-    added = apply_for_service({}, env, timeout=1)
+    added = apply_for_service({}, env, timeout=HANG_TIMEOUT)
 
-    assert time.monotonic() - started < 6
+    assert time.monotonic() - started < HANG_BUDGET
     assert str(tool.parent) in added
     assert shutil.which(tool.name, path=env["PATH"]) == str(tool)
 
