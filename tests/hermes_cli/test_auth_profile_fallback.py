@@ -295,6 +295,50 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
 
 
 
+def test_load_pool_keeps_borrowed_root_rows_out_of_the_profile(profile_env, monkeypatch):
+    """Load-time healing (here: env-key seeding) on a provider read through the root
+    fallback stays in memory. Persisting it would copy root's rows into the profile, and
+    from then on the profile's copy shadows root forever (rotated root keys never reach it)."""
+    from agent.credential_pool import load_pool
+
+    root_file = profile_env["global"] / "auth.json"
+    _write(root_file, _make_auth_store(pool={
+        "openrouter": [{"id": "glob-1", "label": "root-key", "auth_type": "api_key",
+                        "priority": 0, "source": "manual", "access_token": "sk-or-root"}],
+    }))
+    root_before = root_file.read_bytes()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-env")
+
+    pool = load_pool("openrouter")
+
+    # The borrowed row and the env-seeded row are both usable in this process...
+    assert {e.source for e in pool.entries()} == {"manual", "env:OPENROUTER_API_KEY"}
+    # ...but nothing was materialized into the profile, and root is untouched.
+    profile_file = profile_env["profile"] / "auth.json"
+    profile_pool = json.loads(profile_file.read_text()).get("credential_pool", {}) if profile_file.exists() else {}
+    assert "openrouter" not in profile_pool
+    assert root_file.read_bytes() == root_before
+
+
+def test_load_pool_still_persists_healing_for_rows_the_profile_owns(profile_env, monkeypatch):
+    from agent.credential_pool import load_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [{"id": "glob-1", "auth_type": "api_key", "priority": 0,
+                        "source": "manual", "access_token": "sk-or-root"}],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [{"id": "prof-1", "auth_type": "api_key", "priority": 0,
+                        "source": "manual", "access_token": "sk-or-profile"}],
+    }))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-env")
+
+    load_pool("openrouter")
+
+    rows = json.loads((profile_env["profile"] / "auth.json").read_text())["credential_pool"]["openrouter"]
+    assert {r["source"] for r in rows} == {"manual", "env:OPENROUTER_API_KEY"}
+
+
 def test_auth_lock_reentrancy_is_scoped_after_profile_context_switch(profile_env):
     """Changing profile context cannot inherit another store's lock depth."""
     from hermes_cli import auth

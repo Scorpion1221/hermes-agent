@@ -3123,6 +3123,13 @@ def load_pool(provider: str) -> CredentialPool:
 
     pool = CredentialPool(provider, entries)
     pool._persisted_token_pairs = auth_mod._token_pairs_by_id(raw_entries)
+    # Rows read through the global-root fallback belong to the root store. Single-use OAuth
+    # providers write them back to root update-only (persist_pool_entries); for any other
+    # provider a load-time persist would copy them into the profile, whose rows then shadow
+    # the root forever (read_credential_pool: a profile with ANY rows wins). Keep that
+    # healing in memory — the root profile's own load_pool() heals root rows.
+    if changed and raw_entries and provider not in SINGLE_USE_REFRESH_POOL_PROVIDERS:
+        changed = _profile_owns_pool_provider(provider)
     if changed:
         pool._persist(removed_ids=sorted(disk_ids - {entry.id for entry in entries}))
     # Remember the root's borrowed rows so a later ``add_entry`` in this
