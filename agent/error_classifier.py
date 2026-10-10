@@ -12,7 +12,7 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence
 
 logger = logging.getLogger(__name__)
@@ -1211,6 +1211,25 @@ def _classify_400(c: _Ctx) -> Verdict:
     return _V_FORMAT_ERROR
 
 
+# Upstream status a relay embeds in its own error ("[openai/gpt-5.5] [502]: fetch connect timeout").
+_RELAY_WRAPPED_STATUS = re.compile(r"\]\s*\[([45]\d\d)\]\s*:")
+
+
+def _status_401(c: _Ctx) -> Verdict:
+    # Relays (e.g. 9router) answer 401 for whatever the upstream returned, embedding its status
+    # ("HTTP 401: [openai/gpt-5.5] [502]: fetch connect timeout"). Rotating or benching the key
+    # cannot fix an upstream outage, overflow or malformed request: classify by the upstream
+    # status. A wrapped 401 is a real auth failure and stays below.
+    wrapped = _RELAY_WRAPPED_STATUS.search(c.msg)
+    if wrapped and int(wrapped.group(1)) != 401:
+        return _by_status(replace(c, status_code=int(wrapped.group(1))))
+    # Unwrapped bodies: the 400 path's validation signals — generic ``invalid_request_error``
+    # stays out because genuine OpenAI 401 auth errors carry it too.
+    if any(p in c.msg for p in _400_VALIDATION_PATTERNS) or c.code in _400_VALIDATION_CODES:
+        return _V_FORMAT_ERROR
+    return _V_AUTH_ROTATE
+
+
 def _classify_image_tool_422(c: _Ctx) -> Verdict:
     """422: pydantic relays report the same content-field shapes as 400 (#104731, #112473)."""
     if _oversized_message_content_rejection(c.body):
@@ -1223,7 +1242,7 @@ def _classify_image_tool_422(c: _Ctx) -> Verdict:
 # retry-safe (RFC 9110 §15.5.9; proxies emit it when generation outruns the
 # read window). Unlisted 4xx → format_error, 5xx → server_error.
 _STATUS_HANDLERS: dict[int, Callable[[_Ctx], Verdict]] = {
-    400: _classify_400, 401: lambda c: _V_AUTH_ROTATE, 402: lambda c: _classify_402(c.msg, dict),
+    400: _classify_400, 401: _status_401, 402: lambda c: _classify_402(c.msg, dict),
     403: _status_403, 404: _status_404, 408: lambda c: _V_TIMEOUT, 413: lambda c: _V_PAYLOAD_TOO_LARGE,
     422: lambda c: _classify_image_tool_422(c),
     429: _status_429, 500: _status_5xx, 502: _status_5xx,

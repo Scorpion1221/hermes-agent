@@ -412,7 +412,7 @@ tail -f ~/.hermes/logs/gateway.log   # 查看日志
 - **HERMES_HOME** — 将网关限定到你的 Hermes 安装。
 
 :::tip 安装后 PATH 变更
-launchd plist 是静态的——如果你在配置网关后安装了新工具（例如通过 nvm 安装新版 Node.js，或通过 Homebrew 安装 ffmpeg），请重新运行 `hermes gateway install` 以捕获更新后的 PATH。网关会检测到过时的 plist 并自动重新加载。
+launchd plist 是静态的，但网关每次启动时还会追加你的登录 shell 的 PATH（`gateway.login_shell_path`，默认开启），因此之后安装的工具（例如通过 nvm 安装新版 Node.js，或通过 Homebrew 安装 ffmpeg）在 `hermes gateway restart` 后即可被找到。如需把它们写入 plist 本身，请在包含这些目录的 shell 中运行 `hermes gateway install --force`，它会重写 plist 并重新加载服务。
 :::
 
 :::info 多个安装

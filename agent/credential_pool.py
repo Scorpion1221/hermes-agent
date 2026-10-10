@@ -5,6 +5,7 @@ from __future__ import annotations
 from agent.credential_pool_admin import CredentialPoolAdminMixin
 from agent.credential_pool_model_cooldowns import CredentialPoolModelCooldownMixin, model_cooldown_until
 
+import hashlib
 import logging
 import os
 import random
@@ -1175,6 +1176,17 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 if pair != (entry.access_token, entry.refresh_token):
                     self._replace_entry(entry, PooledCredential.from_dict(self.provider, row))
 
+    def _persist_read_path_heal(self, *, removed_ids: Optional[list[str]] = None) -> None:
+        """Persist healing done while selecting (elapsed cooldowns, DEAD prunes, round-robin order).
+
+        Same ownership rule as load_pool(): rows a named profile reads through the global-root
+        fallback stay in memory, or this write would copy root's rows into the profile, whose
+        copy then shadows root forever. Single-use OAuth providers write borrowed rows back to
+        root update-only (persist_pool_entries), so they persist as before.
+        """
+        if self.provider in SINGLE_USE_REFRESH_POOL_PROVIDERS or _profile_owns_pool_provider(self.provider):
+            self._persist(removed_ids=removed_ids)
+
     def _adopt(self, entry: PooledCredential, *, persist: bool = True, **updates: Any) -> PooledCredential:
         """``replace(entry, **updates)``, swap it into the pool, optionally persist."""
         updated = replace(entry, **updates)
@@ -2151,7 +2163,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             pruned_ids = set(entries_to_prune)
             self._entries = [e for e in self._entries if e.id not in pruned_ids]
         if cleared_any:
-            self._persist(removed_ids=entries_to_prune)
+            self._persist_read_path_heal(removed_ids=entries_to_prune)
         return available, pending_refresh
 
     def _log_no_available_entries(self) -> None:
@@ -2196,7 +2208,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             rotated = [candidate for candidate in self._entries if candidate.id != entry.id]
             rotated.append(replace(entry, priority=len(self._entries) - 1))
             self._entries = [replace(candidate, priority=idx) for idx, candidate in enumerate(rotated)]
-            self._persist()
+            self._persist_read_path_heal()
             entry = self._find(lambda candidate: candidate.id == entry.id) or entry
         self._current_id = entry.id
         return entry, pending_refresh
@@ -2465,6 +2477,19 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
 # --- Seeding --------------------------------------------------------------
 
 
+def _seeded_entry_id(entries: list[PooledCredential], provider: str, source: str) -> str:
+    """Id for a newly seeded row, stable across processes for the same (provider, source).
+
+    A seeded row a load does not persist (a profile borrowing root's rows) is re-seeded by
+    every process; a random id would change each time, so an id from ``hermes auth list``
+    would no longer match in the next ``hermes auth remove/reset <id>``.
+    """
+    candidate = hashlib.sha256(f"{provider}\0{source}".encode("utf-8")).hexdigest()[:6]
+    if any(entry.id == candidate for entry in entries):
+        return uuid.uuid4().hex[:6]
+    return candidate
+
+
 def _upsert_entry(entries: list[PooledCredential], provider: str, source: str, payload: dict[str, Any]) -> bool:
     matching_indices = [idx for idx, entry in enumerate(entries) if entry.source == source]
     existing_idx = matching_indices[0] if matching_indices else None
@@ -2473,7 +2498,7 @@ def _upsert_entry(entries: list[PooledCredential], provider: str, source: str, p
         entries[:] = [entry for idx, entry in enumerate(entries) if idx not in duplicate_indices]
 
     if existing_idx is None:
-        payload.setdefault("id", uuid.uuid4().hex[:6])
+        payload.setdefault("id", _seeded_entry_id(entries, provider, source))
         payload.setdefault("priority", _next_priority(entries))
         payload.setdefault("label", payload.get("label") or source)
         entries.append(PooledCredential.from_dict(provider, payload))
@@ -3123,6 +3148,13 @@ def load_pool(provider: str) -> CredentialPool:
 
     pool = CredentialPool(provider, entries)
     pool._persisted_token_pairs = auth_mod._token_pairs_by_id(raw_entries)
+    # Rows read through the global-root fallback belong to the root store. Single-use OAuth
+    # providers write them back to root update-only (persist_pool_entries); for any other
+    # provider a load-time persist would copy them into the profile, whose rows then shadow
+    # the root forever (read_credential_pool: a profile with ANY rows wins). Keep that
+    # healing in memory — the root profile's own load_pool() heals root rows.
+    if changed and raw_entries and provider not in SINGLE_USE_REFRESH_POOL_PROVIDERS:
+        changed = _profile_owns_pool_provider(provider)
     if changed:
         pool._persist(removed_ids=sorted(disk_ids - {entry.id for entry in entries}))
     # Remember the root's borrowed rows so a later ``add_entry`` in this

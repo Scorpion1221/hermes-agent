@@ -5191,6 +5191,9 @@ def _start_gateway_configure_logging(verbosity: Optional[int]) -> None:
         log_startup_security_warnings(hermes_home=_hermes_home, config=_best_effort(_raw_cfg))
 
     _best_effort(_security_audit, "Startup security audit failed (non-fatal): %s")
+    # A unit's PATH is a snapshot of the shell that wrote it: append what the user's login shell adds.
+    from gateway.login_shell_path import apply_for_service
+    _best_effort(lambda: apply_for_service(_load_gateway_config()), "Login-shell PATH merge failed: %s")
 
     # Optional stderr handler from -v/-q: None (quiet) = none; 0 = WARNING; 1 = INFO; 2+ = DEBUG.
     if verbosity is not None:
@@ -5627,10 +5630,9 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     from cron.scheduler_provider import (
         InProcessCronScheduler, resolve_cron_scheduler, scheduler_for_profile_mode)
     cron_stop = threading.Event()
-    # ONE gateway process per host multiplexes every profile, so its cron ticker owns EVERY
-    # profile's store — `gateway.multiplex_profiles` gates adapters, not cron. Gating the tick set
-    # on that flag left every non-launch profile's jobs in a store no ticker visited: they
-    # silently never fired.
+    # ONE gateway process per host multiplexes every profile, so its cron ticker owns EVERY profile's
+    # store — `gateway.multiplex_profiles` gates adapters, not cron. Gating the tick set on that flag
+    # left every non-launch profile's jobs in a store no ticker visited: they silently never fired.
     try:
         cron_profile_homes = _cron_tick_profile_homes(runner.config)
     except Exception as exc:
@@ -5797,9 +5799,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     await asyncio.to_thread(recover_left_core_at_gateway_start)  # before the runner loads platform config
 
     runner = GatewayRunner(config)
-    # Multiplex: swap the launch-home file handlers for per-profile routers so each profile's records
-    # land in its own logs/. Must run after the runner resolved (possibly None) config and setup_logging.
-    # See #82936.
+    # Multiplex: swap the launch-home file handlers for per-profile routers so each profile's records land in
+    # its own logs/. Must run after the runner resolved (possibly None) config and setup_logging. See #82936.
     _enable_multiplex_log_routing(runner.config)
     # ``--replace`` is explicit startup authority, not a durable reconnect policy: GatewayRunner scopes
     # it to cold adapter connects and clears it before the background reconnect watcher starts.
@@ -5884,9 +5885,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # discover_mcp_tools() blocks up to 120s; on the loop thread it would freeze platform heartbeats.
     try:
         # MCP tool discovery — run in an executor so the asyncio event loop stays responsive even when a
-        # configured MCP server is slow or unreachable.  discover_mcp_tools() uses a blocking 120s wait
-        # internally; calling it from the loop thread would freeze platform heartbeats (Discord shard,
-        # Telegram polling) until it returned. See #16856.
+        # configured MCP server is slow or unreachable. discover_mcp_tools() uses a blocking 120s wait
+        # internally; on the loop thread it would freeze platform heartbeats until it returned. See #16856.
         await _discover_gateway_mcp_tools(runner.config)
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)

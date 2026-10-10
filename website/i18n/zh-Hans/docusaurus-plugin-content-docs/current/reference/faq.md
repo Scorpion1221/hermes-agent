@@ -467,16 +467,24 @@ nohup hermes gateway run > ~/.hermes/logs/gateway.log 2>&1 &
 2. 设置在用户登录时触发
 :::
 
-#### macOS：网关找不到 Node.js / ffmpeg / 其他工具
+#### 网关服务找不到 Node.js / ffmpeg / 其他工具
 
-**原因：** launchd 服务继承的是最小 PATH（`/usr/bin:/bin:/usr/sbin:/sbin`），不包含 Homebrew、nvm、cargo 或其他用户安装的工具目录。这通常会导致 WhatsApp bridge（`node not found`）或语音转录（`ffmpeg not found`）失败。
+**原因：** systemd 和 launchd 使用写入 unit/plist 的 PATH 启动网关，其中不包含只有 shell rc 文件才会添加的目录（Homebrew、nvm、pyenv、cargo 等）。在 macOS 上，plist 还会快照写入它的 shell 的 PATH（`hermes gateway install`，或会重写 plist 的更新），因此从未加载这些目录的 shell 写入 plist 会再次丢失它们。这通常会导致 agent 运行的 CLI 报 `command not found`，或语音转录（`ffmpeg not found`）失败。
 
-**解决方案：** 网关在您运行 `hermes gateway install` 时会捕获您的 shell PATH。如果您在设置网关后安装了新工具，请重新运行 install 以捕获更新后的 PATH：
+**解决方案：** 由服务管理器启动时，网关会运行一次您的登录 shell（`$SHELL -ilc`），并把 unit 中缺少的 PATH 条目追加进来，因此之后安装的工具在下次重启网关时即可被找到。可在 `gateway.log` 中查找 `Added login-shell PATH entries`。如果 rc 文件耗时超过 5 秒或执行失败，网关会保留 unit 的 PATH。如需关闭此合并：
+
+```yaml
+gateway:
+  login_shell_path: false
+```
+
+在 macOS 上，您仍可以在包含所有目录的 shell 中重新快照 plist 自身的 PATH：
 
 ```bash
-hermes gateway install    # 重新快照当前 PATH
-hermes gateway start      # 检测到更新的 plist 并重新加载
+hermes gateway install --force   # 用当前 PATH 重写 plist 并重新加载
 ```
+
+不加 `--force` 时，如果只有 PATH 不同，`hermes gateway install` 会提示 "Service already installed"，`hermes gateway start` 也不会因此重新加载 plist。
 
 您可以验证 plist 中的 PATH 是否正确：
 ```bash

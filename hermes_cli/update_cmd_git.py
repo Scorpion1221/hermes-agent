@@ -6,6 +6,7 @@ test patches on ``update_cmd`` stay effective).
 """
 
 import logging
+import re
 from contextlib import nullcontext, suppress
 import subprocess
 import sys
@@ -294,6 +295,53 @@ def _is_fork(origin_url: Optional[str]) -> bool:
         return url.removesuffix(".git")
 
     return _norm(origin_url) not in {_norm(official) for official in OFFICIAL_REPO_URLS}
+
+
+# github.com in every spelling git accepts for it: credentials or a user in an HTTPS URL
+# (``https://x-access-token:TOKEN@github.com/...``), an explicit SSH port, GitHub's SSH-over-443 host.
+# The channel-authority parser (``source_releases._GITHUB_ORIGIN``) reads those as the official
+# repository, which sent such a fork through the channel flow and onto main. Other hosts, SSH host
+# aliases included, cannot be told apart from a mirror of the official repository: channels apply.
+_GITHUB_REMOTE = re.compile(
+    r"^(?:(?:https?|ssh)://(?:[^@/]+@)?(?:ssh\.)?github\.com(?::\d+)?/|(?:[^@/:]+@)?github\.com:)"
+    r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$", re.IGNORECASE,
+)
+
+
+def _fork_tracked_branch(git_cmd: list[str], cwd: Path) -> tuple[Optional[str], Optional[str]]:
+    """``(repository, branch)`` a GitHub fork checkout follows instead of a release channel.
+
+    Hosted channel records carry the official repository as their authority, so a fork can only
+    fall back to its own ``main`` (often a stale mirror) or fail the authority check. A fork
+    follows the branch it is checked out on, when origin carries that branch. ``repository`` is
+    None for the official repository and non-GitHub mirrors (channels apply); ``branch`` is None
+    when the fork's HEAD is detached or its branch is not on origin.
+    """
+    from hermes_cli.source_releases import OFFICIAL_REPOSITORY
+
+    # The configured URL, as source_repository reads it (``remote get-url`` applies insteadOf).
+    match = _GITHUB_REMOTE.fullmatch(_git_stdout(git_cmd, ["config", "--get", "remote.origin.url"], cwd) or "")
+    if match is None or match[1].lower() == OFFICIAL_REPOSITORY.lower():
+        return None, None
+    repository = match[1]
+    branch = _git_stdout(git_cmd, ["symbolic-ref", "--quiet", "--short", "HEAD"], cwd)
+    if not branch:
+        return repository, None
+    from hermes_cli.update_cmd import _git_run
+
+    # Ask origin, not refs/remotes/origin/<branch>: a single-branch clone never writes that ref for
+    # a second branch origin has, and a branch renamed or deleted on the fork leaves a stale one.
+    probe = _git_run(git_cmd, ["ls-remote", "--exit-code", "--heads", "origin", f"refs/heads/{branch}"],
+                     cwd, network=True)
+    # Exit 2 is origin answering without the branch; any other failure (offline, auth) is the fetch's.
+    return repository, (None if probe.returncode == 2 else branch)
+
+
+def _print_fork_branch_unresolved(repository: str) -> None:
+    print(f"✗ This checkout tracks the fork {repository}, but HEAD is not on a branch origin has"
+          " (detached, never pushed, or renamed or deleted on the fork).")
+    print("  Release channels belong to the official repository, so a fork has no default to fall back to.")
+    print("  Check out the branch this install should follow, or re-run with --branch NAME.")
 
 
 def _has_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:

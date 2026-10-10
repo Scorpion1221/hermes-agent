@@ -165,7 +165,7 @@ class _NonStreamRequest:
                 phase = "reconnect"
             elif last_event_ts is not None:
                 phase = "post_event"
-            watchdog = wn.codex_watchdog_deadline(stale_timeout=wd.stale_timeout,
+            watchdog = wn.codex_watchdog_deadline(stale_timeout=wd.stale_after(last_event_ts is not None),
                 ttfb_enabled=wd.ttfb_enabled, ttfb_timeout=wd.ttfb_timeout,
                 last_event_ts=last_event_ts, last_progress_ts=last_progress_ts,
                 retry_started_ts=retry_started_ts,
@@ -235,22 +235,27 @@ class _NonStreamRequest:
             f"⚠️ Codex stream sent no events for {int(event_stale_elapsed)}s after {arm_point} "
             f"(model: {self._model()}). Reconnecting.")
         self._abort_request("codex_stream_idle_kill")
+        if wd.post_event_ceiling > 0:
+            # Compatible backends get the stream detector's (longer) patience, so count the kill
+            # like it does (#58962): one that keeps dying after its first event trips the give-up
+            # instead of burning that budget on every attempt.
+            h._bump_stale_streak(agent)
         agent._touch_activity(f"codex stream killed after {int(event_stale_elapsed)}s with no SSE events")
         self._await_worker_after_kill(
             f"Codex stream produced no SSE events for {int(event_stale_elapsed)}s "
             f"after {arm_point} (threshold: {int(wd.idle_timeout)}s)")
 
-    def _stale_kill(self, elapsed: float) -> None:
+    def _stale_kill(self, elapsed: float, stale_timeout: float) -> None:
         """No response within the stale timeout: kill and count toward the
         circuit breaker (#58962, see ``_stale_streak``)."""
-        agent, wd = self.agent, self.wd
+        agent = self.agent
         silent_hint = h._codex_silent_hang_hint(agent, self.api_kwargs)
-        h._report_stale_nonstream_kill(agent, self.api_kwargs, elapsed, wd.stale_timeout, hint=silent_hint)
+        h._report_stale_nonstream_kill(agent, self.api_kwargs, elapsed, stale_timeout, hint=silent_hint)
         self._abort_request("stale_call_kill")
         h._bump_stale_streak(agent)
         h._touch_stale_kill_activity(agent, elapsed)
         self._await_worker_after_kill(
-            f"Non-streaming API call timed out after {int(elapsed)}s with no response (threshold: {int(wd.stale_timeout)}s)"
+            f"Non-streaming API call timed out after {int(elapsed)}s with no response (threshold: {int(stale_timeout)}s)"
             + (f". {silent_hint}" if silent_hint else ""))
 
     def _interrupt(self, elapsed: float) -> None:
@@ -306,8 +311,9 @@ class _NonStreamRequest:
                     and idle_elapsed > wd.idle_timeout):
                 self._idle_kill(idle_elapsed)
                 break
-            if elapsed > wd.stale_timeout:
-                self._stale_kill(elapsed)
+            stale_timeout = wd.stale_after(last_event_ts is not None)
+            if elapsed > stale_timeout:
+                self._stale_kill(elapsed, stale_timeout)
                 break
             if agent._interrupt_requested:
                 self._interrupt(elapsed)
