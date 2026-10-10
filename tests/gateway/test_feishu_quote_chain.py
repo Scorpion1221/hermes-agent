@@ -13,6 +13,7 @@ import asyncio
 import io
 import json
 import os
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -36,17 +37,18 @@ USERS = {"ou_alice": "Alice", "ou_bob": "Bob"}
 
 
 class ChainFeishu(FakeFeishu):
-    """``messages`` keyed by id; ``slow`` ids answer after ``slow_delay`` seconds; resources succeed."""
+    """``messages`` keyed by id; ``slow`` ids answer after ``slow_delay`` seconds or once ``released`` is
+    set, whichever is first; resources succeed."""
 
     def __init__(self, messages, users=USERS, *, slow=(), slow_delay=0.0, resource_types=None):
         super().__init__(messages, users)
-        self.slow, self.slow_delay = set(slow), slow_delay
+        self.slow, self.slow_delay, self.released = set(slow), slow_delay, threading.Event()
         self.resource_types = resource_types or {}
 
     def _get_message(self, request):
         if request.message_id in self.slow:
             self.message_gets.append(request)
-            asyncio.run(asyncio.sleep(self.slow_delay))  # runs on the adapter's SDK executor thread
+            self.released.wait(self.slow_delay)  # runs on the adapter's SDK executor thread
             return SimpleNamespace(success=lambda: True, data=SimpleNamespace(items=self.messages[request.message_id]))
         if request.message_id not in self.messages:
             self.message_gets.append(request)
@@ -301,7 +303,7 @@ def test_a_slow_ancestor_costs_at_most_the_budget_and_yields_the_partial_chain(m
     import plugins.platforms.feishu.feishu_quote as quote
 
     monkeypatch.setattr(quote, "CHAIN_BUDGET_SECONDS", 0.3)
-    client = ChainFeishu(alternating_chain(4), slow={"om_2"}, slow_delay=1.5)
+    client = ChainFeishu(alternating_chain(4), slow={"om_2"}, slow_delay=10)
     adapter = make_adapter(client)
     message = inbound_message("om_new", "text", json.dumps({"text": "and now?"}), parent_id="om_4")
 
@@ -309,11 +311,13 @@ def test_a_slow_ancestor_costs_at_most_the_budget_and_yields_the_partial_chain(m
         loop = asyncio.get_running_loop()
         start = loop.time()
         event = await dispatched_event_async(adapter, message)
-        return event, loop.time() - start
+        elapsed = loop.time() - start
+        client.released.set()  # let the abandoned GET finish now rather than at interpreter exit
+        return event, elapsed
 
     event, elapsed = asyncio.run(timed())
 
-    assert elapsed < 1.2
+    assert elapsed < 3  # stopped at the 0.3s budget, not after the 10s GET
     assert event.reply_to_text.split("\n")[:3] == [
         "Earlier messages in this reply chain, oldest first:",
         "- … earlier messages not shown",
