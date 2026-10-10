@@ -1211,6 +1211,16 @@ def _classify_400(c: _Ctx) -> Verdict:
     return _V_FORMAT_ERROR
 
 
+def _status_401(c: _Ctx) -> Verdict:
+    # Relays wrap an upstream 400 request-validation rejection in a 401 ("HTTP 401:
+    # [openai/gpt-5.5] [400]: Unsupported parameter: 'max_tokens'"): rotating keys cannot
+    # fix a malformed request. Same signals as the 400 path — generic ``invalid_request_error``
+    # stays out because genuine OpenAI 401 auth errors carry it too.
+    if any(p in c.msg for p in _400_VALIDATION_PATTERNS) or c.code in _400_VALIDATION_CODES:
+        return _V_FORMAT_ERROR
+    return _V_AUTH_ROTATE
+
+
 def _classify_image_tool_422(c: _Ctx) -> Verdict:
     """422: pydantic relays report the same content-field shapes as 400 (#104731, #112473)."""
     if _oversized_message_content_rejection(c.body):
@@ -1223,7 +1233,7 @@ def _classify_image_tool_422(c: _Ctx) -> Verdict:
 # retry-safe (RFC 9110 §15.5.9; proxies emit it when generation outruns the
 # read window). Unlisted 4xx → format_error, 5xx → server_error.
 _STATUS_HANDLERS: dict[int, Callable[[_Ctx], Verdict]] = {
-    400: _classify_400, 401: lambda c: _V_AUTH_ROTATE, 402: lambda c: _classify_402(c.msg, dict),
+    400: _classify_400, 401: _status_401, 402: lambda c: _classify_402(c.msg, dict),
     403: _status_403, 404: _status_404, 408: lambda c: _V_TIMEOUT, 413: lambda c: _V_PAYLOAD_TOO_LARGE,
     422: lambda c: _classify_image_tool_422(c),
     429: _status_429, 500: _status_5xx, 502: _status_5xx,

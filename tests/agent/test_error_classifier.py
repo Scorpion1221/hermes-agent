@@ -164,6 +164,33 @@ class TestClassifyApiError:
         assert result.retryable is False
         assert result.should_fallback is True
 
+    @pytest.mark.parametrize("message,body", [
+        ("HTTP 401: [openai/gpt-5.5] [400]: Unsupported parameter: 'max_tokens' is not supported "
+         "with this model. Use 'max_completion_tokens' instead.", None),
+        ("Unauthorized", {"error": {"code": "unknown_parameter", "message": "bad field"}}),
+    ])
+    def test_401_wrapping_upstream_400_validation_is_format_error(self, message, body):
+        """A relay that wraps an upstream 400 request-validation rejection in a 401 is a
+        malformed request: rotating credentials cannot fix it, so no rotation."""
+        e = MockAPIError(message, status_code=401, body=body)
+        result = classify_api_error(e, provider="custom", model="gpt-combos")
+        assert result.reason == FailoverReason.format_error
+        assert result.should_rotate_credential is False
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_401_with_generic_invalid_request_error_stays_auth(self):
+        """Genuine OpenAI 401 key failures carry ``invalid_request_error`` too; that alone
+        must not reroute a real auth failure away from rotation."""
+        e = MockAPIError(
+            "Incorrect API key provided", status_code=401,
+            body={"error": {"type": "invalid_request_error", "code": "invalid_api_key",
+                            "message": "Incorrect API key provided: sk-abc."}},
+        )
+        result = classify_api_error(e, provider="openai")
+        assert result.reason == FailoverReason.auth
+        assert result.should_rotate_credential is True
+
     def test_403_classified_as_auth(self):
         e = MockAPIError("Forbidden", status_code=403)
         result = classify_api_error(e, provider="anthropic")
