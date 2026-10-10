@@ -120,19 +120,52 @@ def test_fork_check_reports_against_its_checked_out_branch(fork, capsys):
 
 
 @pytest.mark.parametrize("check", [False, True])
-def test_fork_on_a_branch_origin_lacks_stops_instead_of_moving_to_main(fork, capsys, check):
+@pytest.mark.parametrize("branch", ["local-only", "next"])
+def test_fork_on_a_branch_origin_lacks_stops_instead_of_moving_to_main(fork, monkeypatch, capsys, check, branch):
+    """``local-only`` was never pushed; ``next`` was deleted (or renamed) on the fork, so only a
+    stale ``refs/remotes/origin/next`` is left: the fetch-time refspec never prunes it."""
+    from hermes_cli import update_receipt
+
+    stops = []
+    monkeypatch.setattr(update_receipt, "record_stop_reason", stops.append)
     fork.point_origin(FORK_URL)
-    fork.park("local-only")
+    fork.park(branch)
+    if branch == "next":
+        git(fork.origin, "branch", "-D", "next")
     fork.args.check = check
 
     with pytest.raises(SystemExit) as stop:
         cli_main.cmd_update(fork.args)
 
     assert stop.value.code == 1
-    assert "fork-owner/hermes-agent" in capsys.readouterr().out
+    assert "✗ This checkout tracks the fork fork-owner/hermes-agent" in capsys.readouterr().out
+    assert stops == ([] if check else ["branch_missing"])
     assert git(fork.clone, "rev-parse", "HEAD") == fork.base
-    assert git(fork.clone, "branch", "--show-current") == "local-only"
+    assert git(fork.clone, "branch", "--show-current") == branch
     assert fork.requests == []
+    assert fork.channel_reads == []
+
+
+@pytest.mark.parametrize("check", [False, True])
+def test_single_branch_fork_follows_a_branch_it_has_no_tracking_ref_for(fork, capsys, check):
+    """A ``--depth 1 --branch develop`` installer clone maps only develop; moved to ``next`` via
+    ``git fetch origin next && git switch -c next FETCH_HEAD``, it has no refs/remotes/origin/next."""
+    fork.point_origin(FORK_URL)
+    git(fork.clone, "config", "remote.origin.fetch", "+refs/heads/develop:refs/remotes/origin/develop")
+    git(fork.clone, "update-ref", "-d", "refs/remotes/origin/next")
+    fork.park("next")
+    fork.args.check = check
+
+    cli_main.cmd_update(fork.args)
+
+    if check:
+        assert "behind origin/next" in capsys.readouterr().out
+        assert fork.requests == []
+    else:
+        request, = fork.requests
+        assert request["branch"] == "next"
+        assert git(fork.clone, "rev-parse", "HEAD") == fork.tips["next"]
+        assert git(fork.clone, "branch", "--show-current") == "next"
     assert fork.channel_reads == []
 
 

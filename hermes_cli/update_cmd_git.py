@@ -325,13 +325,21 @@ def _fork_tracked_branch(git_cmd: list[str], cwd: Path) -> tuple[Optional[str], 
         return None, None
     repository = match[1]
     branch = _git_stdout(git_cmd, ["symbolic-ref", "--quiet", "--short", "HEAD"], cwd)
-    if branch and _git_ok(git_cmd, ["rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"], cwd):
-        return repository, branch
-    return repository, None
+    if not branch:
+        return repository, None
+    from hermes_cli.update_cmd import _git_run
+
+    # Ask origin, not refs/remotes/origin/<branch>: a single-branch clone never writes that ref for
+    # a second branch origin has, and a branch renamed or deleted on the fork leaves a stale one.
+    probe = _git_run(git_cmd, ["ls-remote", "--exit-code", "--heads", "origin", f"refs/heads/{branch}"],
+                     cwd, network=True)
+    # Exit 2 is origin answering without the branch; any other failure (offline, auth) is the fetch's.
+    return repository, (None if probe.returncode == 2 else branch)
 
 
 def _print_fork_branch_unresolved(repository: str) -> None:
-    print(f"✗ This checkout tracks the fork {repository}, but HEAD is not on a branch origin has.")
+    print(f"✗ This checkout tracks the fork {repository}, but HEAD is not on a branch origin has"
+          " (detached, never pushed, or renamed or deleted on the fork).")
     print("  Release channels belong to the official repository, so a fork has no default to fall back to.")
     print("  Check out the branch this install should follow, or re-run with --branch NAME.")
 
