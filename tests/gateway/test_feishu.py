@@ -7,7 +7,6 @@ import socket
 import tempfile
 import time
 import unittest
-from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -16,6 +15,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from gateway.platforms.event import ProcessingOutcome
+from plugins.platforms.feishu.feishu_quote import QuotedReply
 
 
 if TYPE_CHECKING:
@@ -2027,7 +2027,7 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         adapter._bot_user_id = ""
         adapter._bot_name = "Hermes"
         adapter._download_feishu_message_resources = AsyncMock(return_value=([], []))
-        adapter._fetch_message_text = AsyncMock(return_value=None)
+        adapter._fetch_quoted_reply = AsyncMock(return_value=QuotedReply())
         adapter.get_chat_info = AsyncMock(return_value={"name": "Test Chat"})
         adapter._resolve_sender_profile = AsyncMock(
             return_value={"user_id": "u1", "user_name": "Alice", "user_id_alt": None}
@@ -2152,7 +2152,7 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
 
     def test_regular_reply_root_id_does_not_become_thread_id(self):
         adapter = self._build_adapter()
-        adapter._fetch_message_text = AsyncMock(return_value="parent text")
+        adapter._fetch_quoted_reply = AsyncMock(return_value=QuotedReply(text="parent text"))
         message = SimpleNamespace(
             content=json.dumps({"text": "regular reply"}),
             message_type="text",
@@ -2208,45 +2208,6 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         adapter.build_source.assert_called_once()
         self.assertEqual(adapter.build_source.call_args.kwargs["thread_id"], "omt_thread")
 
-class TestFeishuFetchMessageText(unittest.TestCase):
-    def _build_adapter(self):
-        from plugins.platforms.feishu.adapter import FeishuAdapter
-
-        adapter = FeishuAdapter.__new__(FeishuAdapter)
-        adapter._bot_open_id = "ou_bot"
-        adapter._bot_user_id = ""
-        adapter._bot_name = "Hermes"
-        adapter._message_text_cache = OrderedDict()
-        adapter._client = Mock()
-        adapter._build_get_message_request = Mock(return_value=object())
-        return adapter
-
-    def test_fetch_message_text_marks_is_self_via_string_id_shape(self):
-        """History-path Mention objects carry id as str + id_type; is_self must still work."""
-        adapter = self._build_adapter()
-        # bot_name is empty — is_self must be detected via open_id alone
-        adapter._bot_name = ""
-
-        bot_mention = SimpleNamespace(
-            key="@_user_1",
-            id="ou_bot",
-            id_type="open_id",
-            name="Hermes",
-        )
-        parent = SimpleNamespace(
-            body=SimpleNamespace(content=json.dumps({"text": "@_user_1 hi"})),
-            msg_type="text",
-            mentions=[bot_mention],
-        )
-        response = Mock()
-        response.success = Mock(return_value=True)
-        response.data = SimpleNamespace(items=[parent])
-        adapter._client.im.v1.message.get = Mock(return_value=response)
-
-        # The rendered text should still have the bot name substituted.
-        result = asyncio.run(adapter._fetch_message_text("m_parent"))
-        self.assertEqual(result, "@Hermes hi")
-
 class TestFeishuMentionEndToEnd(unittest.TestCase):
     """High-level scenarios from the design spec — verify the full pipeline."""
 
@@ -2258,7 +2219,7 @@ class TestFeishuMentionEndToEnd(unittest.TestCase):
         adapter._bot_user_id = ""
         adapter._bot_name = "Hermes"
         adapter._download_feishu_message_resources = AsyncMock(return_value=([], []))
-        adapter._fetch_message_text = AsyncMock(return_value=None)
+        adapter._fetch_quoted_reply = AsyncMock(return_value=QuotedReply())
         adapter.get_chat_info = AsyncMock(return_value={"name": "Test Chat"})
         adapter._resolve_sender_profile = AsyncMock(
             return_value={"user_id": "u1", "user_name": "Alice", "user_id_alt": None}

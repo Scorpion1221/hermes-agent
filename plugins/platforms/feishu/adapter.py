@@ -197,7 +197,7 @@ _FEISHU_REACTION_FAILURE = "CrossMark"
 # drain on completion; the cap is a safeguard against unbounded growth from
 # delete-failures, not a capacity plan.
 _FEISHU_PROCESSING_REACTION_CACHE_SIZE = 1024
-_FEISHU_MESSAGE_TEXT_CACHE_SIZE = 512       # LRU cap for reply-context message text lookups
+_FEISHU_MESSAGE_TEXT_CACHE_SIZE = 512       # LRU cap for quoted-message (reply chain) lookups
 
 # QR onboarding constants
 _ONBOARD_ACCOUNTS_URLS = {
@@ -320,6 +320,7 @@ class FeishuAdapterSettings:
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
     allow_all_dm: bool = False  # resolved per-profile so multiplexed adapters honor their own .env
+    quote_chain_max_depth: int = 20  # quoted messages walked toward the root; 0/1 = the direct quote only
 
 
 @dataclass
@@ -1331,7 +1332,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._pending_inbound_max_depth = 1000  # cap queue; drop oldest beyond
         self._chat_locks: collections.OrderedDict[str, asyncio.Lock] = collections.OrderedDict()  # chat_id → lock (per-chat serial processing, LRU-bounded)
         self._chat_info_cache: dict[str, dict[str, Any]] = {}
-        self._message_text_cache: OrderedDict[str, Optional[str]] = OrderedDict()
+        self._quote_node_cache: OrderedDict[str, Any] = OrderedDict()  # message_id → feishu_quote.QuoteNode (LRU)
         self._app_lock_identity: Optional[str] = None
         self._text_batch_state = FeishuBatchState()
         self._pending_text_batches = self._text_batch_state.events
@@ -1419,6 +1420,7 @@ class FeishuAdapter(BasePlatformAdapter):
             default_group_policy=str(extra.get("default_group_policy", "")).strip().lower(),
             group_rules=group_rules, allow_bots=allow_bots, allow_all_dm=allow_all_dm,
             require_mention=_to_boolean(extra.get("require_mention", _get_scoped_secret("FEISHU_REQUIRE_MENTION", "true"))),
+            quote_chain_max_depth=_coerce_required_int(extra.get("quote_chain_max_depth"), default=20, min_value=0),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -2644,7 +2646,7 @@ class FeishuAdapter(BasePlatformAdapter):
             getattr(message, "parent_id", None) or getattr(message, "upper_message_id", None)
             or getattr(message, "root_id", None) or None
         )
-        reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
+        quote = await self._fetch_quoted_reply(reply_to_message_id)
         sender_primary = (
             getattr(sender_id, "open_id", None) or getattr(sender_id, "user_id", None)
             or getattr(sender_id, "union_id", None) or "<unknown>"
@@ -2671,9 +2673,9 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         normalized = MessageEvent(
             text=text, message_type=inbound_type, source=source, raw_message=data,
-            message_id=message_id, media_urls=media_urls, media_types=media_types,
-            media_text_inlined=media_text_inlined,
-            reply_to_message_id=reply_to_message_id, reply_to_text=reply_to_text,
+            message_id=message_id, media_urls=media_urls + quote.media_urls, media_types=media_types + quote.media_types,
+            media_text_inlined=media_text_inlined + [False] * len(quote.media_urls),
+            reply_to_message_id=reply_to_message_id, reply_to_text=quote.text, reply_to_is_own_message=quote.is_own,
             channel_prompt=self._resolve_channel_prompt(chat_id, thread_id or None),
             timestamp=datetime.now(),
         )
@@ -3321,27 +3323,13 @@ class FeishuAdapter(BasePlatformAdapter):
         return getattr(getattr(resp, "raw", None), "content", None)
 
     async def _fetch_bot_names(self, bot_ids: list[str]) -> Optional[dict[str, str]]:
-        if not self._client or not bot_ids:
-            return None
-        try:
-            content = await self._tenant_get_raw(
-                "/open-apis/bot/v3/bots/basic_batch", queries=[("bot_ids", oid) for oid in bot_ids],
-            )
-            if not content:
-                return None
-            payload = json.loads(content)
-            if payload.get("code") != 0:
-                return None
-            bots = (payload.get("data") or {}).get("bots") or {}
-            return {oid: str(info.get("name") or "").strip() for oid, info in bots.items() if oid}
-        except Exception:
-            logger.debug("[Feishu] Failed to fetch bot names for %s", bot_ids, exc_info=True)
-            return None
+        from .feishu_names import fetch_bot_names
+        return await fetch_bot_names(self, bot_ids)
 
-    async def _fetch_message_text(self, message_id: str) -> Optional[str]:
-        """Readable text of a quoted message (``reply_to_text``); see ``feishu_quote``."""
-        from .feishu_quote import fetch_message_text
-        return await fetch_message_text(self, message_id)
+    async def _fetch_quoted_reply(self, message_id: Optional[str]) -> Any:
+        """The quoted message's chain text, own-message flag and media; see ``feishu_quote``."""
+        from .feishu_quote import fetch_quoted_reply
+        return await fetch_quoted_reply(self, message_id)
 
     @staticmethod
     def _default_image_media_type(ext: str) -> str:

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 from gateway.config import PlatformConfig
+from plugins.platforms.feishu.feishu_quote import QuotedReply
 
 
 def _build_adapter(extra=None):
@@ -23,7 +24,7 @@ def _build_adapter(extra=None):
     adapter._bot_user_id = ""
     adapter._bot_name = "Hermes"
     adapter._download_feishu_message_resources = AsyncMock(return_value=([], []))
-    adapter._fetch_message_text = AsyncMock(return_value=None)
+    adapter._fetch_quoted_reply = AsyncMock(return_value=QuotedReply())
     adapter.get_chat_info = AsyncMock(return_value={"name": "Test Chat"})
     adapter._resolve_sender_profile = AsyncMock(
         return_value={"user_id": "u1", "user_name": "Alice", "user_id_alt": None}

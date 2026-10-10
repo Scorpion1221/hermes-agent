@@ -487,7 +487,7 @@ def test_quoted_merge_forward_reads_as_its_transcript_without_downloading_media(
     ]
     client = FakeFeishu({ROOT: items}, users={"ou_alice": "Alice"})
 
-    quoted = asyncio.run(make_adapter(client)._fetch_message_text(ROOT))
+    quoted = asyncio.run(make_adapter(client)._fetch_quoted_reply(ROOT)).text
 
     assert quoted == "[Merged forward message]\n- Alice: the numbers\n- Alice: [Image]"
     assert client.resource_gets == []
@@ -507,7 +507,7 @@ def test_quoted_fetch_through_the_loaded_plugin_uses_its_bound_sdk_request(monke
     adapter = adapter_cls(PlatformConfig())
     adapter._client = client
 
-    assert asyncio.run(adapter._fetch_message_text("om_parent")) == "the plan"
+    assert asyncio.run(adapter._fetch_quoted_reply("om_parent")).text == "the plan"
     (request,) = client.message_gets
     assert type(request) is _SdkRequest
     assert (request.message_id, request.card_msg_content_type) == ("om_parent", "raw_card_content")
@@ -516,15 +516,15 @@ def test_quoted_fetch_through_the_loaded_plugin_uses_its_bound_sdk_request(monke
 def test_quoted_image_reads_as_an_image_placeholder():
     client = FakeFeishu({"om_img": [item("om_img", "image", {"image_key": "img_1"}, upper=None)]})
 
-    assert asyncio.run(make_adapter(client)._fetch_message_text("om_img")) == "[Image]"
+    assert asyncio.run(make_adapter(client)._fetch_quoted_reply("om_img")).text == "[Image]"
 
 
 def test_quoted_message_lookup_failure_returns_none_and_retries_next_time():
     client = FakeFeishu(get_ok=False)
     adapter = make_adapter(client)
 
-    assert asyncio.run(adapter._fetch_message_text("om_gone")) is None
-    assert asyncio.run(adapter._fetch_message_text("om_gone")) is None
+    assert asyncio.run(adapter._fetch_quoted_reply("om_gone")).text is None
+    assert asyncio.run(adapter._fetch_quoted_reply("om_gone")).text is None
     assert len(client.message_gets) == 2
 
 

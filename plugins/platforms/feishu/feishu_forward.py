@@ -177,13 +177,16 @@ class _Transcript:
         return True
 
     def _label(self, sender: Any) -> str:
-        """Display name, or a neutral label: raw ou_/cli_ ids never reach the model."""
-        adapter = self._adapter
-        sender_id = str(getattr(sender, "id", "") or "")
-        embedded = str(getattr(sender, "sender_name", "") or "").strip()
-        if embedded:
-            return embedded
-        if getattr(sender, "sender_type", "") == "app":
-            return (adapter._bot_name if sender_id and sender_id == adapter._app_id else "") or "Bot"
-        name = adapter._get_cached_sender_name(sender_id) if sender_id else None
-        return name or self._anonymous.setdefault(sender_id, f"Participant {len(self._anonymous) + 1}")
+        return sender_label(self._adapter, sender, self._anonymous)
+
+
+def sender_label(adapter: Any, sender: Any, anonymous: dict[str, str]) -> str:
+    """Display name, or a neutral label numbered through ``anonymous``: raw ou_/cli_ ids never reach the model."""
+    sender_id = str(getattr(sender, "id", "") or "")
+    embedded = str(getattr(sender, "sender_name", "") or "").strip()
+    if embedded:
+        return embedded
+    if getattr(sender, "sender_type", "") == "app":
+        return (adapter._bot_name if sender_id and sender_id == adapter._app_id else "") or "Bot"
+    name = adapter._get_cached_sender_name(sender_id) if sender_id else None
+    return name or anonymous.setdefault(sender_id, f"Participant {len(anonymous) + 1}")

@@ -6,6 +6,8 @@ unknown to the tenant (an external contact, a departed user), so a refused batch
 adapter's single lookup for that chunk, and the ids neither call could name are cached as nameless
 ("") for the usual TTL: the next forward from that chat does not repeat the refused round trip.
 A transport failure also falls back to single lookups but remembers no misses.
+
+Bot names come from ``bot/v3/bots/basic_batch`` instead: the contact API does not know bots.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import itertools
 import json
 import logging
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +70,26 @@ async def _fetch_user_names(adapter: Any, open_ids: list[str]) -> Any:
         if user.get("open_id") and name:
             names[str(user["open_id"])] = name
     return names
+
+
+async def fetch_bot_names(adapter: Any, bot_ids: list[str]) -> Optional[dict[str, str]]:
+    """``{open_id: name}`` from ``bot/v3/bots/basic_batch`` (the contact API has no bot names); None on failure."""
+    if not adapter._client or not bot_ids:
+        return None
+    try:
+        content = await adapter._tenant_get_raw(
+            "/open-apis/bot/v3/bots/basic_batch", queries=[("bot_ids", oid) for oid in bot_ids],
+        )
+        if not content:
+            return None
+        payload = json.loads(content)
+        if payload.get("code") != 0:
+            return None
+        bots = (payload.get("data") or {}).get("bots") or {}
+        return {oid: str(info.get("name") or "").strip() for oid, info in bots.items() if oid}
+    except Exception:
+        logger.debug("[Feishu] Failed to fetch bot names for %s", bot_ids, exc_info=True)
+        return None
 
 
 def _trim(cache: dict[str, tuple[str, float]]) -> None:

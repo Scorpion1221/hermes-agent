@@ -406,6 +406,19 @@ Media from rich-text (post) messages is also extracted and cached — both inlin
 
 For small text-based documents (.txt, .md), the file content is automatically appended after the message text so the agent can read it directly without needing tools — the caption you typed alongside the file stays in place.
 
+### Quoted replies
+
+When you reply to (quote) a message, the agent sees the quoted message in full. If that message was itself a reply, the earlier messages of the reply chain come before it, oldest first, one shortened line each with the sender's name and message type. Cards (including Hermes' own replies) and merged forwards read as their text. Images and files in the quoted message itself (up to 5) are attached to your message, so "what does this chart show?" works as a reply to a chart. Quoted voice notes stay a text marker and are not transcribed as your own words.
+
+```yaml
+platforms:
+  feishu:
+    extra:
+      quote_chain_max_depth: 20   # Messages walked toward the start of a reply chain (default: 20; 0 or 1 = only the quoted message)
+```
+
+Walking the chain takes about 3 seconds at most. If Feishu is slow, the agent gets a shorter chain marked as incomplete instead of a late reply.
+
 ### Outbound (sending)
 
 | Method | What it sends |
