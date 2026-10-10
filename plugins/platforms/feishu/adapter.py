@@ -2270,7 +2270,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 label.capitalize(), ident, expected_chat_id, callback_chat_id,
             )
             return None
-        return open_id, callback_chat_id, self._get_cached_sender_name(open_id) or open_id
+        from plugins.platforms.feishu.feishu_card_operator import card_operator_name
+        return open_id, callback_chat_id, card_operator_name(self, operator)
 
     def _handle_approval_card_action(self, *, event: Any, action_value: dict[str, Any], loop: Any) -> Any:
         """Schedule approval resolution and build the synchronous callback response."""

@@ -77,9 +77,10 @@ def _make_card_action_data(
 
 
 def _close_submitted_coro(coro, _loop):
-    """Close scheduled coroutines in sync-handler tests to avoid unawaited warnings."""
+    """Close scheduled coroutines in sync-handler tests to avoid unawaited warnings; an awaited
+    result (the operator-name lookup on a cache miss) comes back empty."""
     coro.close()
-    return SimpleNamespace(add_done_callback=lambda *_args, **_kwargs: None)
+    return SimpleNamespace(add_done_callback=lambda *_args, **_kwargs: None, result=lambda timeout=None: None)
 
 
 # ===========================================================================
