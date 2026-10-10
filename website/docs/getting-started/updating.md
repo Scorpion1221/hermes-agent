@@ -230,8 +230,16 @@ git -C "$repo" -c gc.writeCommitGraph=false gc --auto
 
 ### Updating against a non-default branch: `--branch`
 
-Source installs track `origin/main`. Use
-`--branch NAME` for a one-run branch override:
+Source installs track `origin/main`. A checkout whose `origin` is a GitHub fork
+instead follows the branch it is checked out on, when origin has that branch:
+release channels belong to the official repository, so `hermes update`,
+`hermes update --check` and gateway `/update` skip them and pull
+`origin/<current branch>`. A fork checkout on a detached HEAD or a local-only
+branch stops with a message instead of moving to `main`. Install a fork
+on a chosen branch with
+`curl -fsSL https://raw.githubusercontent.com/<owner>/hermes-agent/<branch>/scripts/install.sh | HERMES_REPO_URL=https://github.com/<owner>/hermes-agent.git bash -s -- --branch <branch>`.
+
+Use `--branch NAME` for a one-run branch override:
 
 ```bash
 hermes update --branch release-candidate

@@ -296,6 +296,32 @@ def _is_fork(origin_url: Optional[str]) -> bool:
     return _norm(origin_url) not in {_norm(official) for official in OFFICIAL_REPO_URLS}
 
 
+def _fork_tracked_branch(git_cmd: list[str], cwd: Path) -> tuple[Optional[str], Optional[str]]:
+    """``(repository, branch)`` a GitHub fork checkout follows instead of a release channel.
+
+    Hosted channel records carry the official repository as their authority, so a fork can only
+    fall back to its own ``main`` (often a stale mirror) or fail the authority check. A fork
+    follows the branch it is checked out on, when origin carries that branch. ``repository`` is
+    None for the official repository and non-GitHub mirrors (channels apply); ``branch`` is None
+    when the fork's HEAD is detached or its branch is not on origin.
+    """
+    from hermes_cli.source_releases import OFFICIAL_REPOSITORY, source_repository
+
+    repository = source_repository(git_cmd, cwd)
+    if repository.lower() == OFFICIAL_REPOSITORY.lower():
+        return None, None
+    branch = _git_stdout(git_cmd, ["symbolic-ref", "--quiet", "--short", "HEAD"], cwd)
+    if branch and _git_ok(git_cmd, ["rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"], cwd):
+        return repository, branch
+    return repository, None
+
+
+def _print_fork_branch_unresolved(repository: str) -> None:
+    print(f"✗ This checkout tracks the fork {repository}, but HEAD is not on a branch origin has.")
+    print("  Release channels belong to the official repository, so a fork has no default to fall back to.")
+    print("  Check out the branch this install should follow, or re-run with --branch NAME.")
+
+
 def _has_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
     """Check if an 'upstream' remote already exists."""
     return _git_ok(git_cmd, ["remote", "get-url", "upstream"], cwd)

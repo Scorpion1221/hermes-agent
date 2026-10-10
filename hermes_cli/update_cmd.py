@@ -97,8 +97,9 @@ from hermes_cli.update_cmd_git import (
     OFFICIAL_REPO_URL, OFFICIAL_REPO_URLS, SKIP_UPSTREAM_PROMPT_FILE, _ORPHAN_RESCUE_REFS_TO_KEEP,
     _ORPHAN_RESCUE_REF_MAX_AGE_DAYS, _add_upstream_remote, _assess_parked_branch_switch,
     _branch_head_label, _branch_head_suffix, _classify_fetch_failure, _count_commits_between,
-    _discard_lockfile_churn, _ensure_non_trampoline_git, _get_origin_url, _git_is_trampoline,
-    _has_upstream_remote, _is_fork, _locate_real_git, _mark_skip_upstream_prompt,
+    _discard_lockfile_churn, _ensure_non_trampoline_git, _fork_tracked_branch, _get_origin_url,
+    _git_is_trampoline, _has_upstream_remote, _is_fork, _locate_real_git, _mark_skip_upstream_prompt,
+    _print_fork_branch_unresolved,
     _normalize_managed_eol, _park_detached_head, _portable_git_candidates, _print_fetch_failure,
     _print_parked_branch_kept_notice, _print_parked_branch_skip_warning,
     _prune_orphan_rescue_refs, _push_synced_fork, _should_skip_upstream_prompt, _sync_fork_with_upstream,
@@ -629,6 +630,13 @@ def _source_update_channel(args=None, *, channel=None, branch_explicit=False) ->
     return resolve_update_channel(config, _m().PROJECT_ROOT)
 
 
+def _follows_default_channel(selected_channel: str, branch_explicit: bool, transient_channel) -> bool:
+    """True when nothing but the default ``main`` subscription picked the target: the one case a
+    fork checkout follows its own branch (``_fork_tracked_branch``). ``--branch``, ``--channel``
+    and a persisted ``--set-channel`` stay the user's explicit choice."""
+    return not branch_explicit and transient_channel is None and selected_channel == "main"
+
+
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False, channel=None):
     """Implement ``hermes update --check``: fetch and report without installing.
 
@@ -667,7 +675,15 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False, ch
     _check.clear_git_debris(root)
 
     selected_channel = _source_update_channel(channel=channel, branch_explicit=branch_explicit)
-    if not branch_explicit:
+    fork, fork_branch = (_fork_tracked_branch(git_cmd, root)
+                         if _follows_default_channel(selected_channel, branch_explicit, channel) else (None, None))
+    if fork is not None:
+        if fork_branch is None:
+            _print_fork_branch_unresolved(fork)
+            sys.exit(1)
+        print(f"→ Following fork branch: {fork} {fork_branch}")
+        branch = fork_branch
+    elif not branch_explicit:
         branch = _check.channel_compare_branch(selected_channel, git_cmd, root)
         if branch is None:
             return
@@ -1835,12 +1851,27 @@ def _cmd_update_impl(args, gateway_mode: bool):
     completion_request = _source_completion_request(
         opts, _pre_update_plan, pre_update_snapshot_id, _windows_gateway_resume,
         had_desktop_app_before_update, gateway_mode)
+    selected_channel = _source_update_channel(args)
+    fork = None
+    if not use_zip_update and _follows_default_channel(
+            selected_channel, bool(getattr(args, "branch", None)), getattr(args, "channel", None)):
+        fork, fork_branch = _fork_tracked_branch(git_cmd, _m().PROJECT_ROOT)
+        if fork is not None:
+            if fork_branch is None:
+                _print_fork_branch_unresolved(fork)
+                _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+                _record_stop("branch_missing")
+                sys.exit(1)
+            print(f"→ Following fork branch: {fork} {fork_branch}")
+            # Exactly `--branch <fork_branch>` from here on, the ZIP fallback's refusal included.
+            from copy import copy
+            args = copy(args)
+            args.branch = fork_branch
     branch = _m()._resolve_update_branch(args)
     completion_request["branch"] = branch
     target_ref = f"origin/{branch}"
     release_sha = None
-    target_repository = None
-    selected_channel = _source_update_channel(args)
+    target_repository = fork
     if not getattr(args, "branch", None):
         from hermes_cli.release_channels import retrying_reads
         from hermes_cli.source_releases import resolve_source_target
