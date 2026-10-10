@@ -632,9 +632,15 @@ def _source_update_channel(args=None, *, channel=None, branch_explicit=False) ->
 
 def _follows_default_channel(selected_channel: str, branch_explicit: bool, transient_channel) -> bool:
     """True when nothing but the default ``main`` subscription picked the target: the one case a
-    fork checkout follows its own branch (``_fork_tracked_branch``). ``--branch``, ``--channel``
-    and a persisted ``--set-channel`` stay the user's explicit choice."""
-    return not branch_explicit and transient_channel is None and selected_channel == "main"
+    fork checkout follows its own branch (``_fork_tracked_branch``). ``--branch``, ``--channel``,
+    a persisted ``--set-channel`` and ``updates.parked_branch_strategy: update_in_place`` (local
+    patches carried on top of main, merged in place) stay the user's explicit choice."""
+    if branch_explicit or transient_channel is not None or selected_channel != "main":
+        return False
+    # Read failures mean the default strategy, exactly as _apply_parked_branch_guard reads it.
+    with _best_effort('Could not read updates.parked_branch_strategy: %s'):
+        return _updates_config().get("parked_branch_strategy", "switch") != "update_in_place"
+    return True
 
 
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False, channel=None):

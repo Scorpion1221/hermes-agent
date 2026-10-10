@@ -7,6 +7,7 @@ check and exited 1. The fork follows the branch it is checked out on instead, wi
 import pytest
 
 from hermes_cli import main as cli_main, source_releases
+from hermes_constants import get_hermes_home
 from tests.hermes_cli.test_update_target_identity import git, update_tree  # noqa: F401 -- fixture
 
 FORK_URL = "https://github.com/fork-owner/hermes-agent.git"
@@ -125,3 +126,49 @@ def test_official_origin_keeps_resolving_the_channel(fork, monkeypatch):
     assert request["branch"] == "main"
     assert git(fork.clone, "rev-parse", "HEAD") == fork.tips["main"]
     assert fork.channel_reads == [("main", "NousResearch/hermes-agent")]
+
+
+def _commit_local_patch(fork):
+    (fork.clone / "local-patch.txt").write_text("carried on top of main\n", encoding="utf-8")
+    git(fork.clone, "add", "local-patch.txt")
+    git(fork.clone, "-c", "commit.gpgsign=false", "commit", "-qm", "local patch")
+    return git(fork.clone, "rev-parse", "HEAD")
+
+
+@pytest.mark.parametrize("pushed", [True, False])
+def test_fork_with_update_in_place_merges_main_into_its_branch(fork, monkeypatch, pushed):
+    """``updates.parked_branch_strategy: update_in_place`` is the documented way to carry local
+    patches on main; a fork that set it keeps getting main merged into its branch."""
+    (get_hermes_home() / "config.yaml").write_text(
+        "updates:\n  parked_branch_strategy: update_in_place\n", encoding="utf-8")
+    fork.point_origin(FORK_URL)
+    fork.park("custom")
+    patch = _commit_local_patch(fork)
+    if pushed:
+        git(fork.clone, "push", "-q", "origin", "custom")
+    monkeypatch.setattr(cli_main, "_sync_with_upstream_if_needed", lambda *_a, **_k: True)
+
+    cli_main.cmd_update(fork.args)
+
+    request, = fork.requests
+    assert request["branch"] == "main"
+    assert git(fork.clone, "branch", "--show-current") == "custom"
+    for kept in (fork.tips["main"], patch):
+        git(fork.clone, "merge-base", "--is-ancestor", kept, "HEAD")  # raises when not merged
+    assert fork.channel_reads == [("main", "fork-owner/hermes-agent")]
+
+
+def test_fork_check_with_update_in_place_compares_against_main(fork, capsys):
+    (get_hermes_home() / "config.yaml").write_text(
+        "updates:\n  parked_branch_strategy: update_in_place\n", encoding="utf-8")
+    fork.point_origin(FORK_URL)
+    fork.park("custom")
+    _commit_local_patch(fork)
+    git(fork.clone, "push", "-q", "origin", "custom")
+    fork.args.check = True
+
+    cli_main.cmd_update(fork.args)
+
+    assert "behind origin/main" in capsys.readouterr().out
+    assert fork.requests == []
+

@@ -234,8 +234,10 @@ Source installs track `origin/main`. A checkout whose `origin` is a GitHub fork
 instead follows the branch it is checked out on, when origin has that branch:
 release channels belong to the official repository, so `hermes update`,
 `hermes update --check` and gateway `/update` skip them and pull
-`origin/<current branch>`. A fork checkout on a detached HEAD or a local-only
-branch stops with a message instead of moving to `main`. Install a fork
+`origin/<current branch>`. A fork checkout on a detached HEAD or a branch
+origin does not have stops with a message instead of moving to `main`. A fork
+that sets `updates.parked_branch_strategy: update_in_place` (see below) keeps
+merging `origin/main` into its branch instead. Install a fork
 on a chosen branch with
 `curl -fsSL https://raw.githubusercontent.com/<owner>/hermes-agent/<branch>/scripts/install.sh | HERMES_REPO_URL=https://github.com/<owner>/hermes-agent.git bash -s -- --branch <branch>`.
 
