@@ -2393,45 +2393,8 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("Failed to resolve Feishu update prompt: %s", exc)
 
     async def _handle_reaction_event(self, event_type: str, data: Any) -> None:
-        """Fetch the reacted-to message; if it was sent by this bot, emit a synthetic text event."""
-        if not self._client:
-            return
-        event = getattr(data, "event", None)
-        message_id = str(getattr(event, "message_id", "") or "")
-        if not message_id:
-            return
-        # Fetch the target message to verify it was sent by us and to obtain chat context.
-        try:
-            request = self._build_get_message_request(message_id)
-            response = await self._run_blocking(self._client.im.v1.message.get, request)
-            if not self._response_succeeded(response):
-                return
-            items = getattr(getattr(response, "data", None), "items", None) or []
-            msg = items[0] if items else None
-            if not msg:
-                return
-            # GET im/v1/messages reports sender.id=app_id for bot messages — peer bots share
-            # sender_type="app" with us but differ on app_id. Only route our own messages.
-            sender = getattr(msg, "sender", None)
-            if str(getattr(sender, "id", "") or "") != self._app_id:
-                return
-            chat_id = str(getattr(msg, "chat_id", "") or "")
-            chat_type_raw = str(getattr(msg, "chat_type", "p2p") or "p2p")
-            if not chat_id:
-                return
-        except Exception:
-            logger.debug("[Feishu] Failed to fetch message for reaction routing", exc_info=True)
-            return
-        user_id_obj = getattr(event, "user_id", None)
-        reaction_type_obj = getattr(event, "reaction_type", None)
-        emoji_type = str(getattr(reaction_type_obj, "emoji_type", "") or "UNKNOWN")
-        action = "added" if "created" in event_type else "removed"
-        synthetic_text = f"reaction:{action}:{emoji_type}"
-        logger.info("[Feishu] Routing reaction %s:%s on bot message %s as synthetic event", action, emoji_type, message_id)
-        await self._dispatch_synthetic_event(
-            text=synthetic_text, message_type=MessageType.TEXT, chat_id=chat_id, sender_id=user_id_obj,
-            event_chat_type=chat_type_raw, raw_message=data, message_id=message_id,
-        )
+        from plugins.platforms.feishu.feishu_reaction import handle_reaction_event
+        await handle_reaction_event(self, event_type, data)
 
     def _is_card_action_duplicate(self, token: str) -> bool:
         """Return True if this card action token was already processed within the dedup window."""
@@ -2477,9 +2440,9 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def _dispatch_synthetic_event(
         self, *, text: str, message_type: MessageType, chat_id: str, sender_id: Any, event_chat_type: str,
-        raw_message: Any, message_id: str,
+        raw_message: Any, message_id: str, thread_id: Optional[str] = None, **event_fields: Any,
     ) -> None:
-        """Wrap a reaction/card click as a MessageEvent and run it through the guarded pipeline."""
+        """Wrap a reaction/card click as a MessageEvent (``event_fields``: reply context etc.) and run it guarded."""
         sender_profile = await self._resolve_sender_profile(sender_id)
         chat_info = await self.get_chat_info(chat_id)
         source = self.build_source(
@@ -2488,13 +2451,13 @@ class FeishuAdapter(BasePlatformAdapter):
             chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=event_chat_type),
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
-            thread_id=None,
+            thread_id=thread_id,
             user_id_alt=sender_profile["user_id_alt"],
         )
         synthetic_event = MessageEvent(
             text=text, message_type=message_type, source=source, raw_message=raw_message,
-            message_id=message_id, channel_prompt=self._resolve_channel_prompt(chat_id),
-            timestamp=datetime.now(),
+            message_id=message_id, channel_prompt=self._resolve_channel_prompt(chat_id, thread_id),
+            timestamp=datetime.now(), **event_fields,
         )
         await self._handle_message_with_guards(synthetic_event)
 
@@ -2562,7 +2525,8 @@ class FeishuAdapter(BasePlatformAdapter):
         return data is not None
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        message_id = event.message_id
+        from plugins.platforms.feishu.feishu_reaction import feishu_message_id
+        message_id = feishu_message_id(event.message_id)  # a reaction badges the message it reacted to
         if not self._reactions_enabled() or not message_id or message_id in self._pending_processing_reactions:
             return
         reaction_id = await self._add_reaction(message_id, _FEISHU_REACTION_IN_PROGRESS)
@@ -2574,7 +2538,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 cache.popitem(last=False)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        message_id = event.message_id
+        from plugins.platforms.feishu.feishu_reaction import feishu_message_id
+        message_id = feishu_message_id(event.message_id)
         if not self._reactions_enabled() or not message_id:
             return
         start_reaction_id = self._pending_processing_reactions.get(message_id)
@@ -3747,8 +3712,9 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _send_raw_message(
         self, *, chat_id: str, msg_type: str, payload: str, reply_to: Optional[str], metadata: Optional[dict[str, Any]],
     ) -> Any:
+        from plugins.platforms.feishu.feishu_reaction import feishu_message_id  # a reaction's id → reacted message
         thread_id = (metadata or {}).get("thread_id")
-        effective_reply_to = reply_to or ((metadata or {}).get("reply_to_message_id") if thread_id else None)
+        effective_reply_to = feishu_message_id(reply_to or ((metadata or {}).get("reply_to_message_id") if thread_id else None))
         if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload, msg_type=msg_type, reply_in_thread=bool(thread_id), uuid_value=str(uuid.uuid4()),
