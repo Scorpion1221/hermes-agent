@@ -507,3 +507,86 @@ async def dispatched_event_async(adapter, message):
         chat_type="p2p", message_id=message.message_id,
     )
     return adapter._dispatch_inbound_event.await_args.args[0]
+
+
+# --- quoted media: only for an explicit quote, once per batch ---
+
+def inbound(message_id, content, *, parent=None, root=None, thread=None, message_type="text"):
+    message = inbound_message(message_id, message_type, json.dumps(content), parent_id=parent)
+    message.root_id, message.thread_id, message.chat_type = root or parent, thread, "group"
+    sender = SimpleNamespace(sender_type="user", sender_id=SimpleNamespace(open_id="ou_alice", user_id=None, union_id=None))
+    return SimpleNamespace(event=SimpleNamespace(message=message, sender=sender))
+
+
+def delivered_events(adapter, *events):
+    """Deliver ``events`` concurrently, in arrival order, through the real inbound path; return the
+    agent turns. Batch timers are parked and the pending batches flushed once all are in."""
+    from unittest.mock import AsyncMock
+
+    adapter._admit = lambda sender, message: None  # group admission is not under test here
+    adapter.get_chat_info = AsyncMock(return_value={"name": "Group", "type": "group"})
+    adapter.handle_message = AsyncMock()
+    adapter._text_batch_delay_seconds = adapter._text_batch_split_delay_seconds = 600
+    adapter._media_batch_delay_seconds = 600
+
+    async def deliver():
+        await asyncio.gather(*(adapter._handle_message_event_data(event) for event in events))
+        for task in [*adapter._pending_text_batch_tasks.values(), *adapter._pending_media_batch_tasks.values()]:
+            task.cancel()
+        for key in list(adapter._pending_text_batches):
+            await adapter._flush_text_batch_now(key)
+        for key in list(adapter._pending_media_batches):
+            await adapter._flush_media_batch_now(key)
+
+    asyncio.run(deliver())
+    return [call.args[0] for call in adapter.handle_message.await_args_list]
+
+
+@pytest.mark.parametrize("parent", ["om_root", None], ids=["parent-is-topic-root", "root-id-only"])
+def test_messages_posted_in_a_topic_do_not_attach_the_topics_root_media(parent):
+    """A topic post names the topic's root as parent (or carries only ``root_id``) without quoting it."""
+    client = ChainFeishu({"om_root": [msg("om_root", {"image_key": "img_root"}, msg_type="image")]})
+    adapter = make_adapter(client)
+
+    turns = delivered_events(
+        adapter,
+        inbound("om_t1", {"text": "first"}, parent=parent, root="om_root", thread="omt_topic"),
+        inbound("om_t2", {"text": "second"}, parent=parent, root="om_root", thread="omt_topic"),
+    )
+
+    assert [(turn.text, turn.reply_to_text, turn.media_urls) for turn in turns] == [("first\nsecond", "[Image]", [])]
+    assert client.resource_gets == []
+
+
+def test_an_explicit_quote_inside_a_topic_still_attaches_the_quoted_media():
+    messages = {
+        "om_root": [msg("om_root", {"text": "topic"})],
+        "om_img": [msg("om_img", {"image_key": "img_chart"}, parent="om_root", msg_type="image")],
+    }
+    client = ChainFeishu(messages)
+    adapter = make_adapter(client)
+
+    (turn,) = delivered_events(adapter, inbound("om_t1", {"text": "this one?"}, parent="om_img", root="om_root", thread="omt_topic"))
+
+    assert turn.media_types == ["image/png"] and [r.file_key for r in client.resource_gets] == ["img_chart"]
+
+
+@pytest.mark.parametrize(
+    ("message_type", "content", "own_media"),
+    [("text", {"text": "look"}, []), ("image", {"image_key": "img_own"}, ["image/png"])],
+    ids=["text-batch", "photo-batch"],
+)
+def test_replies_batched_together_carry_the_quoted_media_once(message_type, content, own_media):
+    client = ChainFeishu({"om_img": [msg("om_img", {"image_key": "img_chart"}, msg_type="image")]})
+    adapter = make_adapter(client)
+
+    (turn,) = delivered_events(
+        adapter,
+        inbound("om_r1", content, parent="om_img", message_type=message_type),
+        inbound("om_r2", content, parent="om_img", message_type=message_type),
+    )
+
+    quoted = [url for url in turn.media_urls if turn.media_urls.count(url) > 1]
+    assert quoted == [] and len(turn.media_urls) == len(turn.media_types) == len(turn.media_text_inlined)
+    assert turn.media_types == own_media + ["image/png"] + own_media
+    assert [r.file_key for r in client.resource_gets].count("img_chart") == 1

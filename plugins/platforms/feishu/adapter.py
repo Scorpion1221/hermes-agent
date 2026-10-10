@@ -2646,7 +2646,7 @@ class FeishuAdapter(BasePlatformAdapter):
             getattr(message, "parent_id", None) or getattr(message, "upper_message_id", None)
             or getattr(message, "root_id", None) or None
         )
-        quote = await self._fetch_quoted_reply(reply_to_message_id)
+        quote = await self._fetch_quoted_reply(reply_to_message_id, message)
         sender_primary = (
             getattr(sender_id, "open_id", None) or getattr(sender_id, "user_id", None)
             or getattr(sender_id, "union_id", None) or "<unknown>"
@@ -2715,9 +2715,8 @@ class FeishuAdapter(BasePlatformAdapter):
             self._pending_media_batches[key] = event
             self._schedule_media_batch_flush(key)
             return
-        existing.media_urls.extend(event.media_urls)
-        existing.media_types.extend(event.media_types)
-        existing.media_text_inlined.extend(event.media_text_inlined)
+        from .feishu_quote import merge_media  # a quoted message's cached files must not repeat
+        merge_media(existing, event)
         if event.text:
             existing.text = self._merge_caption(existing.text, event.text)
         existing.timestamp = event.timestamp
@@ -2979,9 +2978,8 @@ class FeishuAdapter(BasePlatformAdapter):
             return
 
         existing.text = next_text
-        existing.media_urls.extend(event.media_urls)
-        existing.media_types.extend(event.media_types)
-        existing.media_text_inlined.extend(event.media_text_inlined)
+        from .feishu_quote import merge_media  # a quoted message's cached files must not repeat
+        merge_media(existing, event)
         existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
         existing.timestamp = event.timestamp
         if event.message_id:
@@ -3326,10 +3324,10 @@ class FeishuAdapter(BasePlatformAdapter):
         from .feishu_names import fetch_bot_names
         return await fetch_bot_names(self, bot_ids)
 
-    async def _fetch_quoted_reply(self, message_id: Optional[str]) -> Any:
+    async def _fetch_quoted_reply(self, message_id: Optional[str], inbound: Any = None) -> Any:
         """The quoted message's chain text, own-message flag and media; see ``feishu_quote``."""
         from .feishu_quote import fetch_quoted_reply
-        return await fetch_quoted_reply(self, message_id)
+        return await fetch_quoted_reply(self, message_id, inbound=inbound)
 
     @staticmethod
     def _default_image_media_type(ext: str) -> str:

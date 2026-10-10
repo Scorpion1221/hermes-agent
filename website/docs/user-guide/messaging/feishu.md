@@ -408,7 +408,7 @@ For small text-based documents (.txt, .md), the file content is automatically ap
 
 ### Quoted replies
 
-When you reply to (quote) a message, the agent sees the quoted message in full. If that message was itself a reply, the earlier messages of the reply chain come before it, oldest first, one shortened line each with the sender's name and message type. Cards (including Hermes' own replies) and merged forwards read as their text. Images and files in the quoted message itself (up to 5) are attached to your message, so "what does this chart show?" works as a reply to a chart. Quoted voice notes stay a text marker and are not transcribed as your own words.
+When you reply to (quote) a message, the agent sees the quoted message in full. If that message was itself a reply, the earlier messages of the reply chain come before it, oldest first, one shortened line each with the sender's name and message type. Cards (including Hermes' own replies) and merged forwards read as their text. Images and files in the quoted message itself (up to 5) are attached to your message, so "what does this chart show?" works as a reply to a chart. Quoted voice notes stay a text marker and are not transcribed as your own words. Inside a topic, posting a message does not count as quoting the topic's opening message, so its images are not attached to every message in the topic; quote a message explicitly to attach its media.
 
 ```yaml
 platforms:

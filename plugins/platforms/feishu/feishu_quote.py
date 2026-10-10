@@ -15,6 +15,8 @@ Images and files of the directly quoted message, never of its ancestors, are dow
 attached to the event (capped), as other adapters attach quoted images. The download shares the
 walk's time budget and is cached per quoted message (while its files exist), so a slow download
 is left out of that reply but reused, not repeated, by the next reply quoting the same message.
+Only an explicit quote attaches media: a message posted into a topic names the topic's root as
+its parent, and the root's images are not re-attached to every message of the topic.
 """
 
 from __future__ import annotations
@@ -59,8 +61,8 @@ class QuotedReply:
     media_types: list[str] = field(default_factory=list)
 
 
-async def fetch_quoted_reply(adapter: Any, message_id: Optional[str]) -> QuotedReply:
-    """What the event needs from the message it quotes; empty when nothing is quoted or it can't be read."""
+async def fetch_quoted_reply(adapter: Any, message_id: Optional[str], *, inbound: Any = None) -> QuotedReply:
+    """What the ``inbound`` message needs from the message it quotes; empty when nothing is quoted or it can't be read."""
     if not message_id or not adapter._client:
         return QuotedReply()
     deadline = asyncio.get_running_loop().time() + CHAIN_BUDGET_SECONDS
@@ -68,7 +70,7 @@ async def fetch_quoted_reply(adapter: Any, message_id: Optional[str]) -> QuotedR
     if quoted is None:
         return QuotedReply()
     (ancestors, complete), (media_urls, media_types) = await asyncio.gather(
-        _walk_ancestors(adapter, quoted, deadline), _attachments(adapter, quoted, deadline),
+        _walk_ancestors(adapter, quoted, deadline), _attachments(adapter, quoted, inbound, deadline),
     )
     text = await _render(adapter, quoted, ancestors, complete)
     return QuotedReply(
@@ -153,13 +155,23 @@ async def _within(adapter: Any, work: Awaitable[Any], timeout: float) -> Any:
         return None
 
 
-async def _attachments(adapter: Any, quoted: QuoteNode, deadline: float) -> tuple[list[str], list[str]]:
+def _quotes_explicitly(inbound: Any) -> bool:
+    """A message posted into a topic has the topic's root as ``parent_id`` (or none, only ``root_id``)
+    without quoting it; a direct lookup (no ``inbound``) counts as explicit."""
+    if inbound is None:
+        return True
+    parent_id = getattr(inbound, "parent_id", None)
+    in_topic = bool(getattr(inbound, "thread_id", None))
+    return bool(parent_id) and not (in_topic and parent_id == getattr(inbound, "root_id", None))
+
+
+async def _attachments(adapter: Any, quoted: QuoteNode, inbound: Any, deadline: float) -> tuple[list[str], list[str]]:
     """The quoted message's attachments as downloaded by the deadline; none when the download is still running."""
     # Quoted audio stays a text placeholder: attached, the gateway would transcribe it as the user's own voice.
     image_keys = list(quoted.image_keys[:MAX_QUOTED_MEDIA])
     files = [ref for ref in quoted.media_refs if ref.resource_type != "audio"]
     media_refs = files[:MAX_QUOTED_MEDIA - len(image_keys)]
-    if not image_keys and not media_refs:
+    if not (image_keys or media_refs) or not _quotes_explicitly(inbound):
         return [], []
     cache: OrderedDict[str, asyncio.Future] = vars(adapter).setdefault("_quote_media_cache", OrderedDict())
     download = cache.get(quoted.message_id)
@@ -232,6 +244,18 @@ async def _prefetch_names(adapter: Any, nodes: list[QuoteNode]) -> None:
 def _one_line(text: str) -> str:
     line = " ".join(text.split())
     return line if len(line) <= MAX_ANCESTOR_CHARS else line[:MAX_ANCESTOR_CHARS].rstrip() + "…"
+
+
+def merge_media(batch: Any, event: Any) -> None:
+    """Append ``event``'s attachments to the pending ``batch``, skipping files the batch already carries.
+
+    Every download lands in a fresh file, so the only repeats are a quoted message's cached
+    attachments: replies are batched together only when they quote the same message.
+    """
+    keep = [index for index, url in enumerate(event.media_urls) if url not in batch.media_urls]
+    for name in ("media_urls", "media_types", "media_text_inlined"):
+        values = getattr(event, name)
+        getattr(batch, name).extend(values[index] for index in keep if index < len(values))
 
 
 def _is_own(adapter: Any, sender: Any) -> bool:
