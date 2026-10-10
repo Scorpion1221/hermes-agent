@@ -92,8 +92,9 @@ def test_relay_backend_post_event_budget_still_honours_run_budget(tmp_path, monk
 
 @pytest.mark.parametrize("provider,base_url", [
     ("openai-codex", "https://chatgpt.com/backend-api/codex"),
+    ("openai-api", "https://api.openai.com/v1"),
     ("custom", "http://127.0.0.1:8080/v1"),
-], ids=["openai-codex", "local"])
+], ids=["openai-codex", "openai-api", "local"])
 def test_codex_backend_and_local_servers_keep_their_policy(tmp_path, monkeypatch, provider, base_url):
     from agent import chat_completion_helpers as h
 

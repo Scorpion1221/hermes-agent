@@ -1284,7 +1284,11 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
     # context scaling, reasoning floors). Once events flow the idle watchdog owns liveness and
     # the wall-clock budget, sized for a whole non-streaming call, only backstops at the hard
     # ceiling (HERMES_CODEX_HARD_TIMEOUT_SECONDS, 0 = none; still capped by a run budget).
-    compat_backend = codex and not openai_codex_backend and not local
+    # The official OpenAI API (``openai-api``) keeps the Codex tiers: like the Codex backend, a
+    # stalled stream there recovers on reconnect in seconds.
+    from hermes_cli.providers import is_official_openai_host
+    compat_backend = (codex and not openai_codex_backend and not local
+                      and not is_official_openai_host(str(base_url or "")))
     if compat_backend:
         idle_default = max(idle_default, _cloud_stale_timeout_for(agent, api_kwargs))
     idle_timeout = env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", idle_default)
