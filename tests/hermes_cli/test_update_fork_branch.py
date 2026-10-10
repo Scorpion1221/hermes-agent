@@ -54,6 +54,15 @@ def fork(update_tree, monkeypatch):  # noqa: F811 -- the imported fixture
     return t
 
 
+# GitHub spellings the channel-authority parser reads as the official repository.
+FORK_URL_SPELLINGS = [
+    "https://x-access-token:TOKEN@github.com/fork-owner/hermes-agent.git",
+    "https://fork-owner@github.com/fork-owner/hermes-agent",
+    "ssh://git@github.com:22/fork-owner/hermes-agent.git",
+    "ssh://git@ssh.github.com:443/fork-owner/hermes-agent.git",
+]
+
+
 @pytest.mark.parametrize("branch", ["develop", "next", "main"])
 def test_fork_update_follows_its_checked_out_branch_without_a_channel(fork, monkeypatch, branch):
     fork.point_origin(FORK_URL)
@@ -68,6 +77,32 @@ def test_fork_update_follows_its_checked_out_branch_without_a_channel(fork, monk
     assert git(fork.clone, "rev-parse", "HEAD") == fork.tips[branch]
     assert git(fork.clone, "branch", "--show-current") == branch
     assert fork.channel_reads == []
+
+
+@pytest.mark.parametrize("url", FORK_URL_SPELLINGS)
+def test_fork_with_credentials_or_a_port_in_its_url_still_follows_its_branch(fork, url):
+    fork.point_origin(url)
+    fork.park("develop")
+
+    cli_main.cmd_update(fork.args)
+
+    request, = fork.requests
+    assert request["branch"] == "develop"
+    assert git(fork.clone, "rev-parse", "HEAD") == fork.tips["develop"]
+    assert git(fork.clone, "branch", "--show-current") == "develop"
+    assert fork.channel_reads == []
+
+
+def test_official_origin_with_credentials_keeps_resolving_the_channel(fork, monkeypatch):
+    from hermes_cli.update_cmd import _sync_with_upstream_if_needed
+
+    fork.point_origin("https://x-access-token:TOKEN@github.com/NousResearch/hermes-agent.git")
+    fork.park("main")
+    monkeypatch.setattr(cli_main, "_sync_with_upstream_if_needed", _sync_with_upstream_if_needed)
+
+    cli_main.cmd_update(fork.args)
+
+    assert fork.channel_reads == [("main", "NousResearch/hermes-agent")]
 
 
 def test_fork_check_reports_against_its_checked_out_branch(fork, capsys):

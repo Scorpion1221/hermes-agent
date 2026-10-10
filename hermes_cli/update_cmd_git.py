@@ -6,6 +6,7 @@ test patches on ``update_cmd`` stay effective).
 """
 
 import logging
+import re
 from contextlib import nullcontext, suppress
 import subprocess
 import sys
@@ -296,6 +297,17 @@ def _is_fork(origin_url: Optional[str]) -> bool:
     return _norm(origin_url) not in {_norm(official) for official in OFFICIAL_REPO_URLS}
 
 
+# github.com in every spelling git accepts for it: credentials or a user in an HTTPS URL
+# (``https://x-access-token:TOKEN@github.com/...``), an explicit SSH port, GitHub's SSH-over-443 host.
+# The channel-authority parser (``source_releases._GITHUB_ORIGIN``) reads those as the official
+# repository, which sent such a fork through the channel flow and onto main. Other hosts, SSH host
+# aliases included, cannot be told apart from a mirror of the official repository: channels apply.
+_GITHUB_REMOTE = re.compile(
+    r"^(?:(?:https?|ssh)://(?:[^@/]+@)?(?:ssh\.)?github\.com(?::\d+)?/|(?:[^@/:]+@)?github\.com:)"
+    r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$", re.IGNORECASE,
+)
+
+
 def _fork_tracked_branch(git_cmd: list[str], cwd: Path) -> tuple[Optional[str], Optional[str]]:
     """``(repository, branch)`` a GitHub fork checkout follows instead of a release channel.
 
@@ -305,11 +317,13 @@ def _fork_tracked_branch(git_cmd: list[str], cwd: Path) -> tuple[Optional[str], 
     None for the official repository and non-GitHub mirrors (channels apply); ``branch`` is None
     when the fork's HEAD is detached or its branch is not on origin.
     """
-    from hermes_cli.source_releases import OFFICIAL_REPOSITORY, source_repository
+    from hermes_cli.source_releases import OFFICIAL_REPOSITORY
 
-    repository = source_repository(git_cmd, cwd)
-    if repository.lower() == OFFICIAL_REPOSITORY.lower():
+    # The configured URL, as source_repository reads it (``remote get-url`` applies insteadOf).
+    match = _GITHUB_REMOTE.fullmatch(_git_stdout(git_cmd, ["config", "--get", "remote.origin.url"], cwd) or "")
+    if match is None or match[1].lower() == OFFICIAL_REPOSITORY.lower():
         return None, None
+    repository = match[1]
     branch = _git_stdout(git_cmd, ["symbolic-ref", "--quiet", "--short", "HEAD"], cwd)
     if branch and _git_ok(git_cmd, ["rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"], cwd):
         return repository, branch
