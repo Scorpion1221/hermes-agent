@@ -2630,8 +2630,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
 
 def repair_tool_call(agent, tool_name: str) -> str | None:
-    """Repair a mismatched tool name (case, separators, CamelCase, ``_tool`` suffixes twice so
-    ``TodoTool_tool`` reduces fully, then fuzzy match) before aborting. Returns the repaired
+    """Repair a mismatched tool name (case, separators, CamelCase, stacked proxy ``_ide`` cloak
+    suffixes, ``_tool`` suffixes twice so ``TodoTool_tool`` reduces fully, then fuzzy match) before
+    aborting. Returns the repaired
     name if in valid_tool_names, else None."""
     from difflib import get_close_matches
     if not tool_name:
@@ -2665,6 +2666,13 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
     if normalized in agent.valid_tool_names:
         return normalized
     cands: set[str] = {tool_name, lowered, normalized, _camel_snake(tool_name)}
+    # Proxies cloaking tool names for Claude OAuth accounts (9router) append ``_ide`` to each tool
+    # and to past calls in history; a leaked name replayed gets suffixed again (``terminal_ide_ide``),
+    # beyond the fuzzy cutoff. Strip every trailing ``_ide``/``-ide``; still accepted only if real.
+    for c in list(cands):
+        uncloaked = re.sub(r"(?:[_-]ide)+$", "", c, flags=re.IGNORECASE)
+        if uncloaked and uncloaked != c:
+            cands |= {uncloaked, _norm(uncloaked), _camel_snake(uncloaked)}
     for _ in range(2):  # strip trailing tool-suffix up to twice (TodoTool_tool needs it)
         extra: set[str] = set()
         for c in cands:
