@@ -1190,6 +1190,13 @@ class _NonStreamWatchdogs:
     idle_timeout: float
     idle_requires_progress: bool
     progress_timeout: float = 0.0
+    # Wall-clock ceiling once the stream has produced an event and the idle watchdog owns
+    # liveness (0 = none: the plain stale timeout applies throughout).
+    post_event_ceiling: float = 0.0
+
+    def stale_after(self, first_event_seen: bool) -> float:
+        """Wall-clock stale budget for the current phase of the request."""
+        return max(self.stale_timeout, self.post_event_ceiling) if first_event_seen else self.stale_timeout
 
 
 def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs:
@@ -1270,14 +1277,29 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
     # default defers arming until model progress. Sentinel: env_float returns the
     # default for unset AND unparseable values, so both count as implicit.
     idle_explicit = env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", -1.0) != -1.0
+    # Hosted non-OpenAI Responses backends (a relay translating to Claude) can go silent for
+    # minutes after ``response.created`` while the model thinks — no reasoning events at all.
+    # The Codex-tuned tiers above (12s on small prompts) killed those healthy calls, so they get
+    # the chat-completions stream detector's patience (provider ``stale_timeout_seconds``,
+    # context scaling, reasoning floors). Once events flow the idle watchdog owns liveness and
+    # the wall-clock budget, sized for a whole non-streaming call, only backstops at the hard
+    # ceiling (HERMES_CODEX_HARD_TIMEOUT_SECONDS, 0 = none; still capped by a run budget).
+    compat_backend = codex and not openai_codex_backend and not local
+    if compat_backend:
+        idle_default = max(idle_default, _cloud_stale_timeout_for(agent, api_kwargs))
     idle_timeout = env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", idle_default)
+    post_event_ceiling = 0.0
+    if compat_backend and idle_timeout > 0:
+        hard_timeout = env_float("HERMES_CODEX_HARD_TIMEOUT_SECONDS", 1500.0)
+        post_event_ceiling = cap_to_run_budget(agent, hard_timeout if hard_timeout > 0 else float("inf"))
     progress_gated = codex and openai_codex_backend and codex_floor > 0 and not idle_explicit
     return _NonStreamWatchdogs(stale_timeout=stale_timeout, codex=codex, est_tokens=est_tokens,
         ttfb_enabled=ttfb_enabled, ttfb_timeout=ttfb_timeout, idle_enabled=codex and idle_timeout > 0,
         idle_timeout=idle_timeout, idle_requires_progress=progress_gated,
         # A lifecycle frame proves transport liveness, not model progress. Bound that phase
         # from the physical-attempt start; events cannot restart the grace period.
-        progress_timeout=CODEX_FIRST_PROGRESS_TIMEOUT_SECONDS if progress_gated else 0.0)
+        progress_timeout=CODEX_FIRST_PROGRESS_TIMEOUT_SECONDS if progress_gated else 0.0,
+        post_event_ceiling=post_event_ceiling)
 
 
 def _codex_silent_hang_hint(agent, api_kwargs: dict) -> Optional[str]:

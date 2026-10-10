@@ -21,7 +21,7 @@ def _nonstream_request(ttfb_timeout=300.0):
                                     _interrupt_requested=False)
     request.api_kwargs = {"model": "test-model"}
     request.call_start = 1000.0
-    request.wd = SimpleNamespace(codex=True, stale_timeout=600.0, ttfb_enabled=True, ttfb_timeout=ttfb_timeout,
+    request.wd = h._NonStreamWatchdogs(codex=True, est_tokens=0, stale_timeout=600.0, ttfb_enabled=True, ttfb_timeout=ttfb_timeout,
                                  idle_enabled=True, idle_timeout=180.0, idle_requires_progress=False,
                                  progress_timeout=0.0)
     request.codex_watchdog_state = SimpleNamespace(lock=threading.Lock(), last_event_ts=None,
