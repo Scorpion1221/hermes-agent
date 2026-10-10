@@ -116,14 +116,29 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path, *, checkout_mo
     prev_stash = _git_run(git_cmd, ["rev-parse", "--verify", "refs/stash"], cwd).stdout.strip()
     with (checkout_move or _no_move)(revert=True):  # push and reset put every tracked change back to HEAD
         stash_ref = _push_stash(git_cmd, cwd, stash_name, prev_stash)
-    _pending_autostash = (
-        stash_ref, len([entry for entry in status.stdout.split("\0") if entry]))
+    if stash_ref is not None:
+        _pending_autostash = (
+            stash_ref, len([entry for entry in status.stdout.split("\0") if entry]))
     return stash_ref
 
 
-def _push_stash(git_cmd: list[str], cwd: Path, stash_name: str, prev_stash: str) -> str:
-    """``git stash push``; the stash commit. Raises when nothing was saved; resets tracked leftovers
-    when a push saved everything but could not clean up."""
+def _stash_is_empty(git_cmd: list[str], cwd: Path, stash_ref: str) -> bool:
+    """True when *stash_ref* saved nothing: worktree and index trees equal its base, no untracked file."""
+    from hermes_cli.update_cmd_git import _git_run
+    trees = _git_run(git_cmd, ["rev-parse", f"{stash_ref}^{{tree}}", f"{stash_ref}^1^{{tree}}",
+                               f"{stash_ref}^2^{{tree}}"], cwd)
+    if trees.returncode != 0 or len(set(trees.stdout.split())) != 1:
+        return False
+    if _git_run(git_cmd, ["rev-parse", "--verify", "--quiet", f"{stash_ref}^3"], cwd).returncode != 0:
+        return True
+    untracked = _git_run(git_cmd, ["ls-tree", f"{stash_ref}^3"], cwd)
+    return untracked.returncode == 0 and not untracked.stdout.strip()
+
+
+def _push_stash(git_cmd: list[str], cwd: Path, stash_name: str, prev_stash: str) -> Optional[str]:
+    """``git stash push``; the stash commit, or None when git had nothing it could save (a dirty
+    submodule, an untracked nested repository). Raises when the push failed without saving; resets
+    tracked leftovers when a push saved everything but could not clean up."""
     from hermes_cli.update_cmd_git import _git_run
     push = _git_run(git_cmd, ["stash", "push", "--include-untracked", "-m", stash_name], cwd)
     _print_nonempty(push.stdout)
@@ -147,6 +162,13 @@ def _push_stash(git_cmd: list[str], cwd: Path, stash_name: str, prev_stash: str)
         # A partially-failed push also skips cleanup of TRACKED modifications; they'd break the following
         # pull. Safe to reset: all is in the stash.
         _reset_hard(git_cmd, cwd)
+    # `git status` lists paths `git stash` cannot capture. The push then either saves nothing (refs/stash
+    # is still an older, unrelated entry the restore must never apply) or saves an empty entry.
+    if not stash_created or _stash_is_empty(git_cmd, cwd, stash_ref):
+        if stash_created and (selector := _resolve_stash_selector(git_cmd, cwd, stash_ref)) is not None:
+            _git_run(git_cmd, ["stash", "drop", selector], cwd)
+        print("  ✓ No stashable local changes; continuing without restore.")
+        return None
     return stash_ref
 
 

@@ -729,3 +729,47 @@ def test_unrequested_park_is_never_reported_as_update_complete(monkeypatch, tmp_
 
     stash_mod._park_stashed_changes(stash_ref)
     assert stash_mod._unrestored_autostash_notice() is None
+
+
+@pytest.mark.parametrize("unstashable", ["untracked-nested-repo", "dirty-embedded-repo"])
+def test_unstashable_dirt_never_returns_an_older_stash(tmp_path, monkeypatch, capsys, unstashable):
+    """`git status` lists paths `git stash` cannot save: an untracked nested repository (git saves an
+    EMPTY entry) or a dirty embedded repository (git saves nothing at all and refs/stash stays on an
+    older, unrelated entry). Neither may come back as this run's autostash: the restore would apply
+    that older stash onto the updated tree, and the run would end "stashed and did NOT restore"."""
+    import hermes_cli.update_cmd_stash as stash_mod
+
+    monkeypatch.setattr(stash_mod, "_pending_autostash", None)
+
+    def git(*args, cwd=tmp_path):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
+                               "-c", "commit.gpgsign=false", *args],
+                              cwd=cwd, capture_output=True, text=True, check=True).stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("base\n", encoding="utf-8")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    git("init", "-q", cwd=nested)
+    (nested / "file.txt").write_text("nested\n", encoding="utf-8")
+    git("add", "file.txt", cwd=nested)
+    git("commit", "-qm", "nested", cwd=nested)
+    git("add", "tracked.txt", *(["nested"] if unstashable == "dirty-embedded-repo" else []))
+    git("commit", "-qm", "init")
+    tracked.write_text("an older, unrelated change\n", encoding="utf-8")
+    git("stash", "push", "-q", "-m", "older work")
+    older = git("rev-parse", "refs/stash")
+    if unstashable == "dirty-embedded-repo":
+        (nested / "file.txt").write_text("edited inside the embedded repo\n", encoding="utf-8")
+    dirt = git("status", "--porcelain")
+    assert dirt == ("?? nested/" if unstashable == "untracked-nested-repo" else "M nested")
+
+    assert hermes_main._stash_local_changes_if_needed(["git"], tmp_path) is None
+
+    assert stash_mod._unrestored_autostash_notice() is None
+    assert git("rev-parse", "refs/stash") == older
+    assert len(git("stash", "list").splitlines()) == 1
+    assert tracked.read_text(encoding="utf-8") == "base\n"
+    assert git("status", "--porcelain") == dirt
+    assert "No stashable local changes" in capsys.readouterr().out
