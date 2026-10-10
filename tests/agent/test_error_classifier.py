@@ -179,6 +179,33 @@ class TestClassifyApiError:
         assert result.retryable is False
         assert result.should_fallback is True
 
+    @pytest.mark.parametrize("inner_message,tokens", [
+        ("[openai/gpt-5.5] [502]: fetch connect timeout (reset after 30s)", 1_000),
+        ("[openai/gpt-5.5] [400]: Unrecognized request argument supplied: reasoning_effort", 1_000),
+        ("[anthropic/claude-opus-5-5] [400]: prompt is too long: 250000 tokens > 200000 maximum", 250_000),
+        ("[openai/gpt-5.5] [429]: Rate limit exceeded, please retry later", 1_000),
+    ], ids=["upstream-502", "reasoning-rejection", "context-overflow", "upstream-429"])
+    def test_401_wrapping_an_upstream_status_classifies_like_that_status(self, inner_message, tokens):
+        """A relay that answers 401 for any upstream failure embeds the real status; the verdict
+        (retry, compress, drop-reasoning retry, rotation) must be the one that status gets."""
+        kw = dict(provider="custom", model="gpt-combos", approx_tokens=tokens, context_length=200_000)
+        inner_status = int(inner_message.split("] [", 1)[1][:3])
+        expected = classify_api_error(MockAPIError(inner_message, status_code=inner_status), **kw)
+
+        wrapped = MockAPIError(f"Error code: 401 - {{'error': {{'message': '{inner_message}'}}}}",
+                               status_code=401, body={"error": {"message": inner_message}})
+        result = classify_api_error(wrapped, **kw)
+
+        assert expected.reason != FailoverReason.auth
+        assert (result.reason, result.retryable, result.should_compress, result.should_rotate_credential) == (
+            expected.reason, expected.retryable, expected.should_compress, expected.should_rotate_credential)
+
+    def test_401_wrapping_an_upstream_401_stays_auth(self):
+        e = MockAPIError("HTTP 401: [openai/gpt-5.5] [401]: Incorrect API key provided", status_code=401)
+        result = classify_api_error(e, provider="custom", model="gpt-combos")
+        assert result.reason == FailoverReason.auth
+        assert result.should_rotate_credential is True
+
     def test_401_with_generic_invalid_request_error_stays_auth(self):
         """Genuine OpenAI 401 key failures carry ``invalid_request_error`` too; that alone
         must not reroute a real auth failure away from rotation."""
