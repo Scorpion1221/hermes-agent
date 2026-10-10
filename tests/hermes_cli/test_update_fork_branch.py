@@ -7,6 +7,7 @@ check and exited 1. The fork follows the branch it is checked out on instead, wi
 import pytest
 
 from hermes_cli import main as cli_main, source_releases
+from hermes_cli.update_channel import set_install_channel
 from hermes_constants import get_hermes_home
 from tests.hermes_cli.test_update_target_identity import git, update_tree  # noqa: F401 -- fixture
 
@@ -16,13 +17,13 @@ OFFICIAL_URL = "https://github.com/NousResearch/hermes-agent.git"
 
 @pytest.fixture
 def fork(update_tree, monkeypatch):  # noqa: F811 -- the imported fixture
-    """``update_tree`` whose origin carries ``develop`` and ``next`` beside ``main``, each its own tip."""
+    """``update_tree`` whose origin carries ``develop``, ``next`` and ``preview`` beside ``main``, each its own tip."""
     t = update_tree
     # The owning-install redirect inspects the TEST RUNNER's venv (outside this fixture's control;
     # a PM test environment sits under the real home), not the fixture checkout under test.
     monkeypatch.setattr("hermes_cli.update_owning_install.owning_install_root", lambda _root: None)
     tips = {"main": t.newer}
-    for branch in ("develop", "next"):
+    for branch in ("develop", "next", "preview"):
         git(t.origin, "checkout", "-qb", branch, t.base)
         (t.origin / f"{branch}.txt").write_text(f"{branch} tip\n", encoding="utf-8")
         git(t.origin, "add", f"{branch}.txt")
@@ -172,3 +173,21 @@ def test_fork_check_with_update_in_place_compares_against_main(fork, capsys):
     assert "behind origin/main" in capsys.readouterr().out
     assert fork.requests == []
 
+
+@pytest.mark.parametrize("persisted", [False, True])
+def test_fork_keeps_an_explicitly_chosen_channel(fork, persisted):
+    """``--channel preview`` and a persisted ``--set-channel preview`` are the user's choice: the
+    channel is read and its branch wins over the branch the fork is checked out on."""
+    fork.point_origin(FORK_URL)
+    fork.park("develop")
+    if persisted:
+        set_install_channel("preview", fork.clone)
+    else:
+        fork.args.channel = "preview"
+
+    cli_main.cmd_update(fork.args)
+
+    request, = fork.requests
+    assert request["branch"] == "preview"
+    assert git(fork.clone, "rev-parse", "HEAD") == fork.tips["preview"]
+    assert fork.channel_reads == [("preview", "fork-owner/hermes-agent")]
