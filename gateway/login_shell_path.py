@@ -6,13 +6,14 @@ install``. Directories only the user's rc files add (nvm, pyenv, asdf, cargo, Li
 missing, so a CLI installed there is ``command not found`` for the bot until the unit is
 regenerated from the right shell — and an update run from a plain SSH session drops them again.
 
-At startup a supervised gateway runs the user's shell once as an interactive login shell and reads
-``$PATH`` between sentinel markers so profile banners can't corrupt it (the same probe as
-``apps/desktop/electron/shell-path.ts``). Unlike the desktop app, login-only entries are APPENDED:
-whatever the unit resolves today keeps priority, so the PM-managed runtimes Hermes provisions for
-itself still win over the user's copies of node/npm/uv. The probe gets a login-like environment
-without the gateway's secrets, runs in its own session and is bounded by one timeout; any failure
-leaves PATH as the unit set it. ``gateway.login_shell_path: false`` in config.yaml turns it off.
+At startup a gateway that a Hermes service started runs the user's shell once as an interactive
+login shell and reads ``$PATH`` between sentinel markers so profile banners can't corrupt it (the
+desktop app's ``apps/desktop/electron/shell-path.ts`` does the same). Unlike the desktop app,
+login-only entries are APPENDED: whatever the unit resolves today keeps priority, so the PM-managed
+runtimes Hermes provisions for itself still win over the user's copies of node/npm/uv. The probe
+gets a login-like environment without the gateway's secrets, runs in its own session and is bounded
+by one timeout; any failure leaves PATH as the unit set it. ``gateway.login_shell_path: false`` in
+config.yaml turns it off.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ import sys
 from collections.abc import Mapping, MutableMapping
 from typing import Any
 
-from gateway.restart import is_supervised_gateway_launch
+from gateway.restart import EXTERNAL_GATEWAY_SUPERVISOR_ENV, launchd_job_label
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -38,10 +39,20 @@ ATTEMPT_TIMEOUT_S = 5.0
 # What a fresh login carries. The gateway's own environment holds the secrets loaded from .env and
 # its supervisor markers; neither belongs in the user's rc files.
 _PROBE_ENV_KEYS = ("HOME", "USER", "LOGNAME", "SHELL", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR")
+# Set only by Hermes' own launchers (systemd unit, launchd plist, s6 run script) and the
+# --external-supervisor opt-in. Raw XPC_SERVICE_NAME and INVOCATION_ID are not markers here: IDE and
+# iTerm terminals export an ``application.*`` XPC label, systemd-spawned terminals and CI runners
+# inherit INVOCATION_ID, and a gateway run from those already has the user's shell PATH.
+_LAUNCH_MARKERS = ("HERMES_SUPERVISED_CHILD", "HERMES_S6_SUPERVISED_CHILD", EXTERNAL_GATEWAY_SUPERVISOR_ENV)
 
 
 class _ProbeTimeout(Exception):
     """The probe ran out of time before printing the sentinel."""
+
+
+def started_by_hermes_service(env: Mapping[str, str]) -> bool:
+    """A Hermes launch marker, or the ``ai.hermes.*`` launchd label (plists that predate the markers)."""
+    return bool(launchd_job_label(env)) or any(is_truthy_value(env.get(name)) for name in _LAUNCH_MARKERS)
 
 
 def login_shell_executable(env: Mapping[str, str]) -> str:
@@ -155,7 +166,7 @@ def apply_for_service(
     profile's config.yaml (PATH is process-wide); ``gateway.login_shell_path: false`` disables it.
     """
     env = os.environ if env is None else env
-    if not is_supervised_gateway_launch(env):
+    if not started_by_hermes_service(env):
         return None
     gateway_cfg = (config or {}).get("gateway")
     if isinstance(gateway_cfg, Mapping) and not is_truthy_value(

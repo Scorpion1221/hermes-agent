@@ -120,14 +120,39 @@ def test_gateway_secrets_and_markers_are_not_handed_to_rc_files(home, tmp_path):
     assert "HERMES_SUPERVISED_CHILD" not in seen
 
 
-def test_terminal_launch_is_left_alone(home):
+@pytest.mark.parametrize("terminal_env", [
+    {},
+    # iTerm2 / VS Code / Warp export their app-coalition launchd label to every shell they open.
+    {"XPC_SERVICE_NAME": "application.com.googlecode.iterm2.1234"},
+    # systemd-spawned terminals (gnome-terminal-server) and CI runners leak INVOCATION_ID to descendants.
+    {"INVOCATION_ID": "0123456789abcdef0123456789abcdef"},
+], ids=["plain", "macos-app-terminal", "inherited-invocation-id"])
+def test_terminal_launch_is_left_alone(home, terminal_env):
     tool = _install_tool(home / "bin")
     (home / ".profile").write_text(f'export PATH="{tool.parent}:$PATH"\n', encoding="utf-8")
-    env = _service_env(home)
+    env = _service_env(home, **terminal_env)
     del env["HERMES_SUPERVISED_CHILD"]
 
     assert apply_for_service({}, env, timeout=10) is None
     assert env["PATH"] == UNIT_PATH
+
+
+@pytest.mark.parametrize("launch_env", [
+    {"HERMES_S6_SUPERVISED_CHILD": "1"},
+    {"HERMES_GATEWAY_EXTERNAL_SUPERVISOR": "1"},
+    # A plist that predates the launcher marker: the job label itself, or the wrapper's re-export.
+    {"XPC_SERVICE_NAME": "ai.hermes.gateway"},
+    {"XPC_SERVICE_NAME": "0", "HERMES_LAUNCHD_LABEL": "ai.hermes.gateway-coder"},
+], ids=["s6", "external-supervisor", "launchd-job", "launchd-wrapper-grandchild"])
+def test_every_hermes_launcher_merges(home, launch_env):
+    tool = _install_tool(home / "bin")
+    (home / ".profile").write_text(f'export PATH="{tool.parent}:$PATH"\n', encoding="utf-8")
+    env = _service_env(home, **launch_env)
+    del env["HERMES_SUPERVISED_CHILD"]
+
+    apply_for_service({}, env, timeout=10)
+
+    assert shutil.which(tool.name, path=env["PATH"]) == str(tool)
 
 
 @pytest.mark.parametrize("value", [False, "false", "off"])
