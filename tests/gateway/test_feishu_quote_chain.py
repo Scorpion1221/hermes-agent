@@ -590,3 +590,20 @@ def test_replies_batched_together_carry_the_quoted_media_once(message_type, cont
     assert quoted == [] and len(turn.media_urls) == len(turn.media_types) == len(turn.media_text_inlined)
     assert turn.media_types == own_media + ["image/png"] + own_media
     assert [r.file_key for r in client.resource_gets].count("img_chart") == 1
+
+
+# --- arrival order ---
+
+def test_a_quoted_reply_reaches_the_agent_before_the_senders_next_message():
+    """Walking the chain awaits several GETs; a plain follow-up sent right after must not overtake it."""
+    client = ChainFeishu(alternating_chain(4))
+    client.get_delay = 0.2
+    adapter = make_adapter(client)
+
+    turns = delivered_events(
+        adapter,
+        inbound("om_a", {"text": "see this"}, parent="om_4"),
+        inbound("om_b", {"text": "and fix it"}),
+    )
+
+    assert [(turn.text, turn.reply_to_message_id) for turn in turns] == [("see this", "om_4"), ("and fix it", None)]

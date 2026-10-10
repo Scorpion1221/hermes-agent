@@ -2117,7 +2117,7 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Dropping malformed inbound event: missing message/sender")
             return
         from .feishu_forward_order import in_arrival_order
-        async with in_arrival_order(self, message, sender):  # before any await: a forward outruns its note
+        async with in_arrival_order(self, message, sender):  # before any await: a forward or quote outruns what follows
             message_id = getattr(message, "message_id", None)
             if not message_id or await self._is_duplicate(message_id):
                 logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
