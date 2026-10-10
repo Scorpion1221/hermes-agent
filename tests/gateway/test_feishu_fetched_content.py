@@ -571,6 +571,21 @@ def test_schema_1_json_card_renders_title_body_and_actions():
     assert normalized.text_content == "Approval required\n\n**Reason:** writes a config file\n\nActions: Allow, Deny"
 
 
+def test_card_tags_and_mentions_render_inline_without_breaking_the_paragraph():
+    from plugins.platforms.feishu.feishu_card_text import render_json_card
+
+    tag = lambda label: node("text_tag", color="green", text=text(label))  # noqa: E731
+    header = node("card_header", title=text("Release"), textTagList=[tag("beta"), tag("P1")])
+    elements = [markdown(
+        text("Deploy "), tag("PASSED"), text(" on staging, owner "), node("at", userID="ou_owner0001"),
+        text(" please verify"),
+    )]
+
+    rendered = render_json_card(json_card(elements, header=header))
+
+    assert rendered == "Release [beta] [P1]\n\nDeploy [PASSED] on staging, owner @user please verify"
+
+
 def test_card_text_is_bounded():
     from plugins.platforms.feishu.feishu_card_text import MAX_CARD_TEXT_CHARS, render_json_card
 

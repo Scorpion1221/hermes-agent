@@ -7,7 +7,7 @@ your client" placeholder, so quoting or forwarding one surfaced nothing readable
 
 The decoded card is a tree of ``{"tag", "id", "property": {...}}`` nodes under
 ``body.property.elements`` (2.0; ``body.elements`` in 1.0). ``markdown`` containers mix inline
-nodes (``plain_text``, ``code_span``, ``link``, ``br``) with blocks (``heading``, ``table``,
+nodes (``plain_text``, ``code_span``, ``link``, ``br``, ``text_tag``, ``at``) with blocks (``heading``, ``table``,
 ``list``, ``blockquote``, ``code_block``, ``hr``). Unknown containers recurse into their
 ``elements`` / ``columns`` / ``actions`` so new tags degrade to their text instead of vanishing;
 button labels are listed once at the end, as the legacy card walker does.
@@ -35,7 +35,9 @@ def render_json_card(payload: Any) -> str:
     if not isinstance(card, dict):
         return ""
     header = _prop(card.get("header"))
-    blocks = [_inline(header.get(key), 0).strip() for key in ("title", "subtitle")]
+    tags = (_text_tag(tag, 0) for tag in _list(header.get("textTagList")))
+    title = " ".join(part for part in (_inline(header.get("title"), 0).strip(), *tags) if part)
+    blocks = [title, _inline(header.get("subtitle"), 0).strip()]
     blocks += _render_blocks(_children(card.get("body")), 0)
     labels = _button_labels(card.get("body"), 0)
     if labels:
@@ -165,6 +167,15 @@ def _link(node: Any, depth: int) -> str:
     return f"[{text}]({url})" if text and url else text or url
 
 
+def _text_tag(node: Any, depth: int) -> str:
+    text = _inline(_prop(node).get("text"), depth + 1).strip()
+    return f"[{text}]" if text else ""
+
+
+def _mention(_node: Any, _depth: int) -> str:
+    return "@user"  # the node carries only the user's id, which never reaches the model
+
+
 # --- block nodes ---
 
 def _heading(node: Any, depth: int) -> str:
@@ -233,7 +244,10 @@ def _rule(_node: Any, _depth: int) -> str:
     return "---"
 
 
-_INLINE = {"plain_text": _plain_text, "code_span": _code_span, "br": _line_break, "link": _link}
+_INLINE = {
+    "plain_text": _plain_text, "code_span": _code_span, "br": _line_break, "link": _link,
+    "text_tag": _text_tag, "at": _mention,
+}
 _BLOCKS = {
     "heading": _heading, "code_block": _code_block, "table": _table, "list": _list_block,
     "blockquote": _blockquote, "hr": _rule,
