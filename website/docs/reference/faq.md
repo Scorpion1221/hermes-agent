@@ -513,7 +513,7 @@ For reliable auto-start, use Windows Task Scheduler to launch WSL + the gateway 
 
 #### Node.js / ffmpeg / other tools not found by the gateway service
 
-**Cause:** systemd and launchd start the gateway with the PATH written into the unit/plist, which doesn't include directories only your shell rc files add (Homebrew, nvm, pyenv, cargo, ...). On macOS the plist also snapshots the shell that last ran `hermes gateway install` or `hermes update`, so an update from a shell that didn't load them drops them again. This commonly breaks CLIs the agent runs (`command not found`) or voice transcription (`ffmpeg not found`).
+**Cause:** systemd and launchd start the gateway with the PATH written into the unit/plist, which doesn't include directories only your shell rc files add (Homebrew, nvm, pyenv, cargo, ...). On macOS the plist also snapshots the PATH of the shell that wrote it (`hermes gateway install`, or an update that rewrites the plist), so writing it from a shell that didn't load them drops them again. This commonly breaks CLIs the agent runs (`command not found`) or voice transcription (`ffmpeg not found`).
 
 **Solution:** When a service manager starts it, the gateway runs your login shell (`$SHELL -ilc`) once and appends the PATH entries the unit lacks, so tools you install later are picked up on the next gateway restart. Check `gateway.log` for `Added login-shell PATH entries`. If your rc files take longer than 5 seconds or fail, the gateway keeps the unit's PATH. To turn the merge off:
 
@@ -525,9 +525,10 @@ gateway:
 On macOS you can still re-snapshot the plist's own PATH from a shell that has everything:
 
 ```bash
-hermes gateway install    # Re-snapshots your current PATH
-hermes gateway start      # Detects the updated plist and reloads
+hermes gateway install --force   # Rewrites the plist with your current PATH and reloads it
 ```
+
+Without `--force`, `hermes gateway install` reports "Service already installed" when only the PATH differs, and `hermes gateway start` does not reload the plist for a PATH-only change.
 
 You can verify the plist has the correct PATH:
 ```bash

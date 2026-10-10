@@ -673,7 +673,7 @@ The generated plist lives at `~/Library/LaunchAgents/ai.hermes.gateway.plist`. I
 - **HERMES_HOME** — scopes the gateway to your Hermes installation.
 
 :::tip PATH changes after install
-launchd plists are static, but the gateway also appends your login shell's PATH each time it starts (`gateway.login_shell_path`, on by default), so tools you install later (e.g. a new Node.js version via nvm, or ffmpeg via Homebrew) are found after `hermes gateway restart`. To bake them into the plist itself, run `hermes gateway install` again; the gateway will detect the stale plist and reload automatically.
+launchd plists are static, but the gateway also appends your login shell's PATH each time it starts (`gateway.login_shell_path`, on by default), so tools you install later (e.g. a new Node.js version via nvm, or ffmpeg via Homebrew) are found after `hermes gateway restart`. To bake them into the plist itself, run `hermes gateway install --force` from a shell that has them; it rewrites the plist and reloads the service.
 :::
 
 :::info Installing without starting
