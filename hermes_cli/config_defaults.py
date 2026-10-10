@@ -2116,15 +2116,13 @@ DEFAULT_CONFIG = {
         # "discord connect timed out" / "Timeout waiting for connection to Discord" restart loops. ``0`` or
         # negative disables the timeout entirely (wait indefinitely).
         "platform_connect_timeout": 30,
-        # Event-loop liveness watchdog: a daemon thread probes the asyncio loop; after consecutive
-        # missed probes it dumps all-thread stacks and hard-exits with the service-restart code so
-        # systemd/launchd revives the process instead of leaving a wedged-but-alive zombie.
-        # Set to false to disable. See #69089.
+        # Event-loop liveness watchdog: a daemon thread probes the asyncio loop; after consecutive missed
+        # probes it dumps all-thread stacks and hard-exits with the service-restart code so systemd/launchd
+        # revives the process instead of leaving a wedged-but-alive zombie. false disables. See #69089.
         "loop_watchdog": True,
-        # Watchdog tuning (defaults mirror gateway/shutdown_watchdog.py): probe_interval = seconds
-        # between probes; probe_timeout = seconds before an unprocessed probe counts as a miss;
-        # max_strikes = consecutive misses before hard-exit 75 (~90-120s of sustained loop block at
-        # the defaults).
+        # Watchdog tuning (defaults mirror gateway/shutdown_watchdog.py): probe_interval = seconds between
+        # probes; probe_timeout = seconds before an unprocessed probe counts as a miss; max_strikes =
+        # consecutive misses before hard-exit 75 (~90-120s of sustained loop block at the defaults).
         "loop_watchdog_probe_interval_s": 30.0,
         "loop_watchdog_probe_timeout_s": 10.0,
         "loop_watchdog_max_strikes": 3,
@@ -2138,10 +2136,12 @@ DEFAULT_CONFIG = {
         # and re-arms the live handle; explicit env wins.
         "startup_watchdog": True,
         "startup_watchdog_timeout_seconds": 300,
-        # Keep writing the legacy ~/.hermes/sessions/sessions.json mirror of the routing index
-        # (primary copy: state.db gateway_routing table). True for external tooling and downgrade
-        # safety; False stops producing the file.
+        # Keep writing the legacy ~/.hermes/sessions/sessions.json mirror of the routing index (primary
+        # copy: state.db gateway_routing table). True for external tooling and downgrade safety.
         "write_sessions_json": True,
+        # Service-launched gateway: append the PATH entries your login shell (`$SHELL -ilc`) adds that the
+        # unit lacks (nvm, pyenv, cargo...). Unit entries keep priority; a failing/slow (>5s) rc is a no-op.
+        "login_shell_path": True,
         # One gateway for every profile on this host: the DEFAULT profile's gateway also connects
         # each named profile's bots (their own .env / config.yaml, per-profile secret scope) and
         # stamps the profile into session keys. This is the ONLY supported topology — there is no
