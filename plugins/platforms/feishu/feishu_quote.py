@@ -12,7 +12,8 @@ reply in that chain.
 Messages are fetched with card bodies as raw ``json_card``, so a quoted Card JSON 2.0 card (the
 bot's own replies) reads as its content and a quoted merge-forward as its transcript (text only).
 Images and files of the directly quoted message, never of its ancestors, are downloaded and
-attached to the event (capped), as other adapters attach quoted images. The download shares the
+attached to the event (capped), as other adapters attach quoted images; a quoted folder is listed
+(its tree follows the quoted message's text) and its files share that cap. The download shares the
 walk's time budget and is cached per quoted message (while its files exist), so a slow download
 is left out of that reply but reused, not repeated, by the next reply quoting the same message.
 Only an explicit quote attaches media: a message posted into a topic names the topic's root as
@@ -51,6 +52,7 @@ class QuoteNode:
     parent_id: str
     image_keys: tuple[str, ...] = ()
     media_refs: tuple[Any, ...] = ()
+    folder_refs: tuple[Any, ...] = ()
 
 
 @dataclass
@@ -69,9 +71,11 @@ async def fetch_quoted_reply(adapter: Any, message_id: Optional[str], *, inbound
     quoted = await fetch_node(adapter, message_id)
     if quoted is None:
         return QuotedReply()
-    (ancestors, complete), (media_urls, media_types) = await asyncio.gather(
+    (ancestors, complete), (media_urls, media_types, folder_text) = await asyncio.gather(
         _walk_ancestors(adapter, quoted, deadline), _attachments(adapter, quoted, inbound, deadline),
     )
+    if folder_text:
+        quoted = dataclasses.replace(quoted, text=f"{quoted.text}\n\n{folder_text}" if quoted.text else folder_text)
     text = await _render(adapter, quoted, ancestors, complete)
     return QuotedReply(
         text=text.replace(_POINTER_END, '"]\n \n') or None, is_own=_is_own(adapter, quoted.sender),
@@ -118,7 +122,7 @@ async def _build_node(adapter: Any, message_id: str, items: list[Any]) -> QuoteN
     normalized = adapter._normalize(msg_type, raw_content, getattr(item, "mentions", None))
     return dataclasses.replace(
         node, text=display_text(normalized), image_keys=tuple(normalized.image_keys),
-        media_refs=tuple(normalized.media_refs),
+        media_refs=tuple(normalized.media_refs), folder_refs=tuple(normalized.folder_refs),
     )
 
 
@@ -165,14 +169,14 @@ def _quotes_explicitly(inbound: Any) -> bool:
     return bool(parent_id) and not (in_topic and parent_id == getattr(inbound, "root_id", None))
 
 
-async def _attachments(adapter: Any, quoted: QuoteNode, inbound: Any, deadline: float) -> tuple[list[str], list[str]]:
-    """The quoted message's attachments as downloaded by the deadline; none when the download is still running."""
+async def _attachments(adapter: Any, quoted: QuoteNode, inbound: Any, deadline: float) -> tuple[list[str], list[str], str]:
+    """The quoted message's attachments and folder trees as fetched by the deadline; none while still running."""
     # Quoted audio stays a text placeholder: attached, the gateway would transcribe it as the user's own voice.
     image_keys = list(quoted.image_keys[:MAX_QUOTED_MEDIA])
     files = [ref for ref in quoted.media_refs if ref.resource_type != "audio"]
     media_refs = files[:MAX_QUOTED_MEDIA - len(image_keys)]
-    if not (image_keys or media_refs) or not _quotes_explicitly(inbound):
-        return [], []
+    if not (image_keys or media_refs or quoted.folder_refs) or not _quotes_explicitly(inbound):
+        return [], [], ""
     cache: OrderedDict[str, asyncio.Future] = vars(adapter).setdefault("_quote_media_cache", OrderedDict())
     download = cache.get(quoted.message_id)
     if download is None or (download.done() and not _still_cached(download)):
@@ -184,8 +188,8 @@ async def _attachments(adapter: Any, quoted: QuoteNode, inbound: Any, deadline: 
     result = download.result() if download.done() else await _within(
         adapter, download, deadline - asyncio.get_running_loop().time(),
     )
-    urls, types = result or ([], [])
-    return list(urls), list(types)
+    urls, types, folder_text = result or ([], [], "")
+    return list(urls), list(types), folder_text
 
 
 def _still_cached(download: asyncio.Future) -> bool:
@@ -196,8 +200,11 @@ def _still_cached(download: asyncio.Future) -> bool:
     return bool(urls) and all(os.path.exists(url) for url in urls)
 
 
-async def _download(adapter: Any, quoted: QuoteNode, image_keys: list[str], media_refs: list[Any]) -> tuple[list[str], list[str]]:
+async def _download(
+    adapter: Any, quoted: QuoteNode, image_keys: list[str], media_refs: list[Any],
+) -> tuple[list[str], list[str], str]:
     from .adapter import FeishuNormalizedMessage
+    from .feishu_folder import fetch_folders
 
     urls, types = await adapter._download_feishu_message_resources(
         message_id=quoted.message_id,
@@ -206,7 +213,17 @@ async def _download(adapter: Any, quoted: QuoteNode, image_keys: list[str], medi
         ),
     )
     kept = [(url, media_type) for url, media_type in zip(urls, types) if not media_type.startswith("audio/")]
-    return [url for url, _ in kept], [media_type for _, media_type in kept]
+    urls, types = [url for url, _ in kept], [media_type for _, media_type in kept]
+    if not quoted.folder_refs:
+        return urls, types, ""
+    # 1 slot per folder goes to its listing; remainder goes to files
+    n_folders = len(quoted.folder_refs)
+    room = max(MAX_QUOTED_MEDIA - len(urls), 0)
+    file_room = max(room - n_folders, 0)
+    folders = await fetch_folders(
+        adapter, quoted.message_id, list(quoted.folder_refs), max_media=room, max_files=file_room,
+    )
+    return urls + folders.media_urls, types + folders.media_types, folders.text
 
 
 async def _render(adapter: Any, quoted: QuoteNode, ancestors: list[QuoteNode], complete: bool) -> str:

@@ -1889,9 +1889,10 @@ class TestFeishuPostFileParsing(unittest.TestCase):
         })
 
         self.assertEqual([ref.file_key for ref in result.media_refs], ["file_1", "file_2"])
+        self.assertEqual([ref.file_key for ref in result.folder_refs], ["folder_1"])
         self.assertEqual(
             result.text_content,
-            "Review these[Attachment: first.md]\n[Attachment: second.txt]",
+            "Review these[Attachment: first.md]\n[Attachment: second.txt]\n[Folder: folder]",
         )
 
 class TestFeishuPostTextIsNotMarkdownEscaped(unittest.TestCase):

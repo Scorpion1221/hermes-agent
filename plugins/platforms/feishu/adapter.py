@@ -273,6 +273,7 @@ class FeishuNormalizedMessage:
     preferred_message_type: str = "text"
     image_keys: list[str] = field(default_factory=list)
     media_refs: list[FeishuPostMediaRef] = field(default_factory=list)
+    folder_refs: list[FeishuPostMediaRef] = field(default_factory=list)  # listed and downloaded by feishu_folder
     mentions: list[FeishuMentionRef] = field(default_factory=list)
     relation_kind: str = "plain"
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -452,7 +453,7 @@ def normalize_feishu_message(
         return FeishuNormalizedMessage(
             raw_type=normalized_type, text_content=parsed_post.text_content,
             image_keys=list(parsed_post.image_keys), media_refs=list(parsed_post.media_refs),
-            mentions=list(mentions_map.values()), relation_kind="post",
+            folder_refs=list(parsed_post.folder_refs), mentions=list(mentions_map.values()), relation_kind="post",
         )
     mention_refs = list(mentions_map.values())
     if normalized_type == "image":
@@ -469,6 +470,9 @@ def normalize_feishu_message(
             preferred_message_type="photo", image_keys=[image_key] if image_key else [],
             relation_kind="image", mentions=mention_refs,
         )
+    if normalized_type == "folder":
+        from .feishu_folder import normalize_folder_message
+        return normalize_folder_message(payload, mention_refs)
     if normalized_type in {"file", "audio", "media"}:
         media_ref = _build_media_ref_from_payload(payload, resource_type=normalized_type)
         return FeishuNormalizedMessage(
@@ -2820,6 +2824,12 @@ class FeishuAdapter(BasePlatformAdapter):
         if inlined_parts:
             extracted_text = "\n\n".join(inlined_parts)
             text = f"{text}\n\n{extracted_text}" if text else extracted_text
+        if normalized.folder_refs:  # listed and downloaded apart; a folder's files are never inlined
+            from .feishu_folder import fetch_folders
+            folders = await fetch_folders(self, message_id, normalized.folder_refs)
+            text = f"{text}\n\n{folders.text}" if text else folders.text
+            media_urls, media_types = media_urls + folders.media_urls, media_types + folders.media_types
+            media_text_inlined += [False] * len(folders.media_urls)
         if raw_type == "merge_forward":  # transcript and inlined documents alike are forwarded text
             from .feishu_forward import keep_references_literal
             text = keep_references_literal(text)

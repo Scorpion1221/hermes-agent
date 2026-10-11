@@ -1,11 +1,12 @@
-"""Feishu rich-text (``post``) messages parsed into text plus the images and files they carry.
+"""Feishu rich-text (``post``) messages parsed into text plus the images, files and folders they carry.
 
 A post body is ``{"title", "content": [[element, ...], ...], "files": [...]}``, either direct (as GET
 returns it) or wrapped per locale (``{"zh_cn": {...}}``, optionally under ``"post"``). ``content`` rows
 hold inline elements (text, links, mentions, images, files). ``files`` is the attachment zone the composer
 sends beside the text: ``{"file_key", "file_name", "is_folder"}`` as received, ``{"key", "name"}`` as the
 send API spells them, and a locale-wrapped post may carry it beside the locales rather than inside one.
-Folder entries there are skipped.
+A folder there is a container, not a downloadable file: it is collected apart, in ``folder_refs``
+(``feishu_folder`` lists and downloads its files).
 """
 
 from __future__ import annotations
@@ -29,6 +30,11 @@ class FeishuPostParseResult:
     text_content: str
     image_keys: list[str] = field(default_factory=list)
     media_refs: list[FeishuPostMediaRef] = field(default_factory=list)
+    folder_refs: list[FeishuPostMediaRef] = field(default_factory=list)
+
+
+def folder_placeholder(name: str) -> str:
+    return f"[Folder: {name}]" if name else "[Folder]"
 
 
 def parse_feishu_post_payload(
@@ -41,6 +47,7 @@ def parse_feishu_post_payload(
         return FeishuPostParseResult(text_content=FALLBACK_POST_TEXT)
     image_keys: list[str] = []
     media_refs: list[FeishuPostMediaRef] = []
+    folder_refs: list[FeishuPostMediaRef] = []
     parts: list[str] = []
     title = _normalize_feishu_text(str(resolved.get("title", "")).strip())
     if title:
@@ -53,25 +60,32 @@ def parse_feishu_post_payload(
         )
         if row_text:
             parts.append(row_text)
-    parts += _render_attachment_zone(resolved["files"], image_keys, media_refs)
+    parts += _render_attachment_zone(resolved["files"], image_keys, media_refs, folder_refs)
     return FeishuPostParseResult(
         text_content="\n".join(parts).strip() or FALLBACK_POST_TEXT, image_keys=image_keys, media_refs=media_refs,
+        folder_refs=folder_refs,
     )
 
 
-def _render_attachment_zone(entries: list[Any], image_keys: list[str], media_refs: list[FeishuPostMediaRef]) -> list[str]:
-    """Placeholders for the attachment zone's files, each key once (inline rows included); folders are skipped."""
-    from .adapter import _to_boolean
+def _render_attachment_zone(
+    entries: list[Any], image_keys: list[str], media_refs: list[FeishuPostMediaRef], folder_refs: list[FeishuPostMediaRef],
+) -> list[str]:
+    """Placeholders for the attachment zone's files and folders, each key once (inline rows included)."""
+    from .adapter import FeishuPostMediaRef, _to_boolean
 
     parts: list[str] = []
     for entry in entries:
         file_key = _first_text(entry, "file_key", "key")
-        if not file_key or _to_boolean(entry.get("is_folder")):
+        if not file_key:
             continue
         file_name = _first_text(entry, "file_name", "name", "title", "text")
-        parts.append(_render_post_element(
-            {"tag": "file", "file_key": file_key, "file_name": file_name}, image_keys, media_refs,
-        ))
+        if not _to_boolean(entry.get("is_folder")):
+            parts.append(_render_post_element(
+                {"tag": "file", "file_key": file_key, "file_name": file_name}, image_keys, media_refs,
+            ))
+        elif all(ref.file_key != file_key for ref in folder_refs):
+            folder_refs.append(FeishuPostMediaRef(file_key=file_key, file_name=file_name, resource_type="folder"))
+            parts.append(folder_placeholder(file_name))
     return [part for part in parts if part]
 
 
