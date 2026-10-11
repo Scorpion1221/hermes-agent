@@ -4,10 +4,11 @@ Every fetched message names the message it replies to in ``parent_id``, so a rep
 be walked up toward the root. The gateway wraps ``reply_to_text`` as ``[Replying to: "…"]``; when
 the quoted message is itself a reply, the earlier messages of that chain (oldest first, one bounded
 line each, up to ``quote_chain_max_depth`` messages in all) precede the directly quoted message,
-which keeps its full text. The ancestor walk and the name lookup after it are each time-boxed: a
-slow API yields a shorter (or less named) chain, never a late reply. Fetched messages are
-LRU-cached by id, and a fetch the budget gave up on still completes into the caches for the next
-reply in that chain.
+which keeps its full text. Fetching the quoted message (for a quoted forward, its transcript and
+sender names too) and walking its ancestors share one time budget, and the name lookup after them
+has its own: a slow API yields a shorter (or less named) chain, or no quote at all when even the
+quoted message did not arrive in time, never a late reply. Fetched messages are LRU-cached by id,
+and a fetch the budget gave up on still completes into the caches for the next reply in that chain.
 
 Messages are fetched with card bodies as raw ``json_card``, so a quoted Card JSON 2.0 card (the
 bot's own replies) reads as its content and a quoted merge-forward as its transcript (text only).
@@ -32,7 +33,7 @@ from typing import Any, Awaitable, Optional
 
 logger = logging.getLogger(__name__)
 
-CHAIN_BUDGET_SECONDS = 2.5  # quoted message + ancestor walk
+CHAIN_BUDGET_SECONDS = 2.5  # quoted message + ancestor walk + quoted media
 NAMES_BUDGET_SECONDS = 0.5  # one batch lookup naming the chain's senders
 MAX_ANCESTOR_CHARS = 500
 MAX_ANCESTORS_CHARS = 4000
@@ -73,8 +74,8 @@ async def fetch_quoted_reply(
     if not message_id or not adapter._client:
         return QuotedReply()
     deadline = asyncio.get_running_loop().time() + CHAIN_BUDGET_SECONDS
-    quoted = await fetch_node(adapter, message_id)
-    if quoted is None:
+    quoted = await _within(adapter, fetch_node(adapter, message_id), CHAIN_BUDGET_SECONDS)
+    if quoted is None:  # unreadable, or not fetched in time (the next reply finds it cached)
         return QuotedReply()
     (ancestors, complete), (media_urls, media_types, folder_text) = await asyncio.gather(
         _walk_ancestors(adapter, quoted, deadline), _attachments(adapter, quoted, inbound, deadline, media),

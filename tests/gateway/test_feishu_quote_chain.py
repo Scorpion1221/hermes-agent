@@ -327,6 +327,45 @@ def test_a_slow_ancestor_costs_at_most_the_budget_and_yields_the_partial_chain(m
     ]
 
 
+@pytest.mark.parametrize("slow", ["message", "forward-names"])
+def test_a_slow_quoted_message_costs_at_most_the_budget_and_the_next_reply_finds_it_cached(monkeypatch, slow):
+    """The quoted message's own GET (and, for a quoted forward, its transcript's name lookup) shares the
+    chain budget: a stalled Feishu delays no reply past it, and the abandoned fetch fills the cache."""
+    import plugins.platforms.feishu.feishu_quote as quote
+
+    monkeypatch.setattr(quote, "CHAIN_BUDGET_SECONDS", 0.3)
+    if slow == "message":
+        client = ChainFeishu({"om_q": [msg("om_q", {"text": "the plan"})]}, slow={"om_q"}, slow_delay=10)
+        expected = "the plan"
+    else:
+        forward = [forward_root("om_q"), item("om_c", "text", {"text": "the plan"}, upper="om_q", sender="ou_bob")]
+        client = ChainFeishu({"om_q": forward})
+        expected = "[Merged forward message]\n- Bob: the plan"
+        stalled_batch = client.request
+
+        def request(raw_request):  # contact/v3/users/batch stalls
+            client.released.wait(10)
+            return stalled_batch(raw_request)
+
+        client.request = request
+    adapter = make_adapter(client)
+
+    async def two_replies():
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        first = await quote.fetch_quoted_reply(adapter, "om_q")
+        elapsed = loop.time() - start
+        client.released.set()
+        await asyncio.gather(*adapter._quote_background_fetches)
+        return first, elapsed, await quote.fetch_quoted_reply(adapter, "om_q")
+
+    first, elapsed, second = asyncio.run(two_replies())
+
+    assert elapsed < 3  # stopped at the 0.3s budget, not after the 10s stall
+    assert first.text is None
+    assert second.text == expected
+
+
 def test_an_ancestor_fetch_the_budget_abandoned_completes_into_the_cache(monkeypatch):
     import plugins.platforms.feishu.feishu_quote as quote
 
