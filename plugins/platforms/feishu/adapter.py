@@ -1791,9 +1791,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 return fallback
             data = getattr(response, "data", None)
             raw_chat_type = str(getattr(data, "chat_type", "") or "").strip().lower()
-            info = {
-                "chat_id": chat_id, "name": str(getattr(data, "name", None) or chat_id),
-                "type": self._map_chat_type(raw_chat_type), "raw_type": raw_chat_type or None,
+            info = {  # chat_type is a group's visibility (private/public); chat_mode says p2p/group/topic
+                "chat_id": chat_id, "name": str(getattr(data, "name", None) or chat_id), "type": self._map_chat_type(raw_chat_type),
+                "raw_type": raw_chat_type or None, "chat_mode": str(getattr(data, "chat_mode", "") or "").strip().lower() or None,
             }
             self._chat_info_cache[chat_id] = info
             return dict(info)

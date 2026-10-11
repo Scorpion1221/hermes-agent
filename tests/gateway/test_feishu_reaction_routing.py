@@ -27,25 +27,37 @@ def _adapter():
     return adapter
 
 
-def _client(*, msg=None, reply=None, others=()):
-    """``GET im/v1/messages/{id}`` answers from ``msg`` and ``others`` by id."""
+# chat.get as Feishu answers it (live-probed): ``chat_mode`` is p2p / group / topic, while ``chat_type`` is
+# a group's visibility (private / public) and is absent for a DM.
+GROUP_CHAT = {"chat_mode": "group", "chat_type": "private", "name": "Ops"}
+DM_CHAT = {"chat_mode": "p2p"}
+
+
+def _client(*, msg=None, reply=None, others=(), chat=GROUP_CHAT):
+    """``GET im/v1/messages/{id}`` answers from ``msg`` and ``others`` by id; ``GET im/v1/chats/{id}`` with ``chat``."""
     messages = {m.message_id: m for m in (msg, *others) if m}
 
     def _get(request):
         found = messages.get(request.message_id)
         return SimpleNamespace(success=lambda: True, data=SimpleNamespace(items=[found] if found else []))
 
+    def _get_chat(request):
+        fields = {"chat_mode": None, "chat_type": None, "name": None, **chat}
+        return SimpleNamespace(success=lambda: True, data=SimpleNamespace(**fields))
+
     reply = reply or Mock(return_value=SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_reply")))
     return SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(
         message=SimpleNamespace(get=Mock(side_effect=_get), reply=reply),
         message_resource=SimpleNamespace(get=Mock()),
+        chat=SimpleNamespace(get=Mock(side_effect=_get_chat)),
     )))
 
 
 def _bot_message(*, thread_id=None, sender_app=_SELF_APP, msg_type="interactive", content=_BOT_CARD, parent_id=""):
-    """A message this bot sent (a Card JSON 2.0 reply by default), as ``GET im/v1/messages`` reports it."""
+    """A message this bot sent (a Card JSON 2.0 reply by default), as ``GET im/v1/messages`` reports it: the
+    item names its chat and topic but carries no chat type."""
     return SimpleNamespace(
-        message_id="om_bot", chat_id="oc_chat", chat_type="group", thread_id=thread_id, msg_type=msg_type,
+        message_id="om_bot", chat_id="oc_chat", thread_id=thread_id, msg_type=msg_type,
         parent_id=parent_id, mentions=None, body=SimpleNamespace(content=json.dumps(content)),
         sender=SimpleNamespace(sender_type="app", id=sender_app, id_type="app_id"),
     )
@@ -61,11 +73,10 @@ def _reaction(event_id, *, emoji="THUMBSUP", message_id="om_bot"):
     )
 
 
-def _wire_routing(adapter, msg, *, others=()):
-    adapter._client = _client(msg=msg, others=others)
+def _wire_routing(adapter, msg, *, others=(), chat=GROUP_CHAT):
+    adapter._client = _client(msg=msg, others=others, chat=chat)
     adapter._resolve_sender_profile = AsyncMock(
         return_value={"user_id": "ou_human", "user_name": "Human", "user_id_alt": None})
-    adapter.get_chat_info = AsyncMock(return_value={"name": "Ops", "type": "group"})
     routed = []
 
     async def _capture(event):
@@ -93,6 +104,48 @@ def test_reaction_on_own_message_replies_to_it_with_quote_and_topic():
     assert event.source.thread_id == "omt_topic"  # the topic session, not the chat's main session
     quote_get = adapter._client.im.v1.message.get.call_args_list[-1].args[0]
     assert (quote_get.message_id, quote_get.card_msg_content_type) == ("om_bot", "raw_card_content")
+
+
+def _topic_message_session_key(adapter, *, thread_id):
+    """Session key of an ordinary inbound message from the same user in that chat and topic."""
+    message = SimpleNamespace(
+        message_id="om_user", message_type="text", content=json.dumps({"text": "hi"}), mentions=None,
+        chat_id="oc_chat", chat_type="group", thread_id=thread_id, parent_id=None, upper_message_id=None,
+        root_id=None,
+    )
+    captured = []
+
+    async def _capture(event):
+        captured.append(event)
+
+    adapter._dispatch_inbound_event = _capture
+    asyncio.run(adapter._process_inbound_message(
+        data=None, message=message, sender_id=SimpleNamespace(open_id="ou_human", user_id=None, union_id=None),
+        chat_type="group", message_id="om_user",
+    ))
+    return adapter._event_session_key(captured[0])
+
+
+@pytest.mark.parametrize("thread_id", [None, "omt_topic"])
+def test_reaction_in_a_group_joins_the_session_of_that_chat_or_topic(thread_id):
+    adapter = _adapter()
+    routed = _wire_routing(adapter, _bot_message(thread_id=thread_id))
+
+    _route(adapter, _reaction("evt_1"))
+
+    [event] = routed
+    assert event.source.chat_type == "group"
+    assert adapter._event_session_key(event) == _topic_message_session_key(adapter, thread_id=thread_id)
+
+
+def test_reaction_in_a_dm_stays_in_the_dm_session():
+    adapter = _adapter()
+    routed = _wire_routing(adapter, _bot_message(), chat=DM_CHAT)
+
+    _route(adapter, _reaction("evt_1"))
+
+    [event] = routed
+    assert event.source.chat_type == "dm"
 
 
 def test_reaction_on_a_bot_reply_quotes_the_reply_chain_above_it():

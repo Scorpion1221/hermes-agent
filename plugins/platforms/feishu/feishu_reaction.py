@@ -39,10 +39,11 @@ async def handle_reaction_event(adapter: Any, event_type: str, data: Any) -> Non
     action = "added" if "created" in event_type else "removed"
     # The reacted message as a quote (its reply chain, cards as their text); a reaction attaches no media.
     reply_to_text = (await adapter._fetch_quoted_reply(message_id, media=False)).text
+    chat_info = await adapter.get_chat_info(chat_id)  # cached; reused by _dispatch_synthetic_event
     logger.info("[Feishu] Routing reaction %s:%s on bot message %s as synthetic event", action, emoji_type, message_id)
     await adapter._dispatch_synthetic_event(
         text=f"reaction:{action}:{emoji_type}", message_type=MessageType.TEXT, chat_id=chat_id,
-        sender_id=getattr(event, "user_id", None), event_chat_type=str(getattr(msg, "chat_type", "p2p") or "p2p"),
+        sender_id=getattr(event, "user_id", None), event_chat_type=_event_chat_type(chat_info),
         raw_message=data, message_id=_reaction_id(message_id, data),
         thread_id=str(getattr(msg, "thread_id", "") or "") or None,
         reply_to_message_id=message_id, reply_to_text=reply_to_text, reply_to_is_own_message=True,
@@ -64,6 +65,14 @@ async def _own_message(adapter: Any, message_id: str) -> Any:
     if msg is None or str(getattr(getattr(msg, "sender", None), "id", "") or "") != adapter._app_id:
         return None
     return msg
+
+
+def _event_chat_type(chat_info: dict[str, Any]) -> str:
+    """The ``chat_type`` an inbound message in this chat carries, so the reaction joins that chat's (topic's)
+    session: the reacted message's GET item has no chat type, and chat.get's ``chat_type`` is a group's
+    visibility (private/public), while its ``chat_mode`` is p2p, group or topic. Unknown reads as a DM."""
+    mode = chat_info.get("chat_mode")
+    return "group" if mode and mode != "p2p" else "p2p"
 
 
 def _reaction_id(message_id: str, data: Any) -> str:
