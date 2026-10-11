@@ -536,24 +536,34 @@ def test_a_note_sent_behind_a_folder_joins_its_turn_folder_first():
 
 
 def test_folder_downloads_stop_at_the_time_budget_and_say_which_files_were_cut_off(monkeypatch):
+    import threading
+
     import plugins.platforms.feishu.feishu_forward_order as forward_order
 
-    monkeypatch.setattr(forward_order, "DOWNLOAD_BUDGET_SECONDS", 0.3)
-    files = {f"fil_{n}": b"x" for n in range(12)}
-    client = SlowFolderFeishu(
-        trees={"fld_root": [leaf(key, f"{key}.txt", data) for key, data in files.items()]}, files=files, delay=0.25,
-    )
+    class StalledFolderFeishu(FolderFeishu):
+        released = threading.Event()
+
+        def _get_resource(self, request):
+            if request.file_key in {"fil_1", "fil_4"}:
+                self.released.wait(10)  # on the adapter's SDK executor thread
+            return super()._get_resource(request)
+
+    monkeypatch.setattr(forward_order, "DOWNLOAD_BUDGET_SECONDS", 1.0)
+    files = {f"fil_{n}": b"x" for n in range(6)}
+    client = StalledFolderFeishu(trees={"fld_root": [leaf(key, f"{key}.txt", data) for key, data in files.items()]}, files=files)
 
     start = time.monotonic()
-    event = send(client, folder_message())
+    try:
+        event = send(client, folder_message())
+    finally:
+        client.released.set()
     elapsed = time.monotonic() - start
 
-    assert elapsed < 3  # 12 files at 0.25s, 4 at a time, would take 0.75s+ without the budget
-    statuses = [e["status"] for e in listing_of(event)["entries"]]
-    assert "downloaded" in statuses and "not downloaded: time limit reached" in statuses
-    assert set(statuses) <= {"downloaded", "not downloaded: time limit reached"}
-    assert len(files_urls(event)) == statuses.count("downloaded")
-    assert "(not downloaded: time limit reached)" in event.text
+    assert elapsed < 5  # stopped at the budget, not after the stalled 10s downloads
+    statuses = {e["path"]: e["status"] for e in listing_of(event)["entries"]}
+    assert statuses == {f"fil_{n}.txt": "not downloaded: time limit reached" if n in (1, 4) else "downloaded" for n in range(6)}
+    assert len(files_urls(event)) == 4
+    assert "- fil_1.txt (not downloaded: time limit reached)" in event.text
 
 
 def test_a_long_folder_tree_does_not_push_its_note_into_a_turn_of_its_own():

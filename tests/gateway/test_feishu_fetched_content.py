@@ -305,15 +305,16 @@ def test_forward_child_media_is_capped_while_every_child_stays_in_the_transcript
 
 
 class SlowResources(FakeFeishu):
-    """Each forwarded file downloads in ``delay`` seconds as ``size`` bytes of PDF."""
+    """Forwarded files download as ``size`` bytes of PDF; the ``stalled`` keys hang until ``released``."""
 
-    def __init__(self, messages, users, *, delay=0.0, size=16):
+    def __init__(self, messages, users, *, stalled=(), size=16):
         super().__init__(messages, users)
-        self.delay, self.size = delay, size
+        self.stalled, self.size, self.released = set(stalled), size, threading.Event()
 
     def _get_resource(self, request):
         self.resource_gets.append(request)
-        time.sleep(self.delay)
+        if request.file_key in self.stalled:
+            self.released.wait(10)  # on the adapter's SDK executor thread
         return SimpleNamespace(
             success=lambda: True, file=io.BytesIO(b"%PDF" + b"0" * (self.size - 4)), file_name=f"{request.file_key}.pdf",
             raw=SimpleNamespace(headers={"Content-Type": "application/pdf"}),
@@ -331,17 +332,20 @@ def test_forward_downloads_stop_at_the_time_budget_and_say_how_many_were_cut_off
     answered alone and the forward arrives later as an interrupting turn."""
     import plugins.platforms.feishu.feishu_forward_order as forward_order
 
-    monkeypatch.setattr(forward_order, "DOWNLOAD_BUDGET_SECONDS", 0.3)
-    client = SlowResources({ROOT: forwarded_files(8)}, {"ou_alice": "Alice"}, delay=0.25)
+    monkeypatch.setattr(forward_order, "DOWNLOAD_BUDGET_SECONDS", 1.0)
+    client = SlowResources({ROOT: forwarded_files(6)}, {"ou_alice": "Alice"}, stalled={"file_1", "file_4"})
 
     start = time.monotonic()
-    text_out, _type, media_urls, _types, _inlined, _mentions = inbound_forward(make_adapter(client))
+    try:
+        text_out, _type, media_urls, _types, _inlined, _mentions = inbound_forward(make_adapter(client))
+    finally:
+        client.released.set()
     elapsed = time.monotonic() - start
 
-    assert elapsed < 3  # 8 files at 0.25s would take 2s one at a time, 0.5s four at a time
-    assert 1 <= len(media_urls) < 8 and all(os.path.isfile(path) for path in media_urls)
-    assert text_out.count("- Alice: [Attachment: video") == 8  # every file stays in the transcript
-    assert text_out.endswith(f"- … {8 - len(media_urls)} forwarded attachment(s) not downloaded: time or size limit reached")
+    assert elapsed < 5  # stopped at the budget, not after the stalled 10s downloads
+    assert len(media_urls) == 4 and all(os.path.isfile(path) for path in media_urls)
+    assert text_out.count("- Alice: [Attachment: video") == 6  # every file stays in the transcript
+    assert text_out.endswith("- … 2 forwarded attachment(s) not downloaded: time or size limit reached")
 
 
 def test_forward_downloads_share_the_inbound_media_byte_budget(monkeypatch):
@@ -468,7 +472,7 @@ def test_a_transient_lookup_failure_never_hides_a_colleagues_name_from_their_own
     assert profile["user_name"] == "Alice"
 
 
-def test_single_lookups_after_a_refused_batch_run_a_few_at_a_time():
+def test_per_sender_fallback_lookups_run_a_few_at_a_time():
     from plugins.platforms.feishu.feishu_names import prefetch_user_names
 
     ids = [f"ou_user{i:02d}" for i in range(12)]
