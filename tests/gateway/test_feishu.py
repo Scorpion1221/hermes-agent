@@ -1854,7 +1854,8 @@ class TestFeishuPostMentionParsing(unittest.TestCase):
         """Post <at>.user_id is a placeholder ('@_user_N'); the real display
         name comes from the mentions_map lookup. Confirmed via live
         im.v1.message.get payload."""
-        from plugins.platforms.feishu.adapter import parse_feishu_post_payload, FeishuMentionRef
+        from plugins.platforms.feishu.adapter import FeishuMentionRef
+        from plugins.platforms.feishu.feishu_post import parse_feishu_post_payload
 
         payload = {
             "en_us": {
@@ -1872,7 +1873,7 @@ class TestFeishuPostMentionParsing(unittest.TestCase):
 
 class TestFeishuPostFileParsing(unittest.TestCase):
     def test_collects_valid_top_level_files_and_dedupes_inline_refs(self):
-        from plugins.platforms.feishu.adapter import parse_feishu_post_payload
+        from plugins.platforms.feishu.feishu_post import parse_feishu_post_payload
 
         result = parse_feishu_post_payload({
             "title": "",
@@ -1899,7 +1900,7 @@ class TestFeishuPostTextIsNotMarkdownEscaped(unittest.TestCase):
     def test_text_elements_keep_markdown_characters_and_style_wrappers(self):
         """Inbound post text reaches the model verbatim (no backslash escapes) while the
         structured style flags still render as markdown (#9816)."""
-        from plugins.platforms.feishu.adapter import parse_feishu_post_payload
+        from plugins.platforms.feishu.feishu_post import parse_feishu_post_payload
 
         payload = {"zh_cn": {"content": [[
             {"tag": "text", "text": "run `print('hi')` for **emphasis** [x](y)"},

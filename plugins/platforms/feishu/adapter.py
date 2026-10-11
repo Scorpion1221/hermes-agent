@@ -99,10 +99,6 @@ from gateway.platforms._shared import (
     apply_yaml_bridge as _apply_yaml_bridge, extra_or_secret as _shared_extra_or_secret,
     get_scoped_secret as _get_scoped_secret, send_error
 )
-try:
-    from .feishu_post import parse_feishu_post_payload
-except ImportError:  # standalone load via spec_from_file_location (no __package__)
-    from plugins.platforms.feishu.feishu_post import parse_feishu_post_payload  # type: ignore[no-redef]
 
 
 logger = logging.getLogger(__name__)
@@ -450,6 +446,7 @@ def normalize_feishu_message(
             mentions=list(mentions_map.values()),
         )
     if normalized_type == "post":
+        from .feishu_post import parse_feishu_post_payload
         # The walker writes back to mentions_map if it encounters
         # <at user_id="@_all">, so reading .values() after parsing is enough.
         parsed_post = parse_feishu_post_payload(payload, mentions_map=mentions_map)
@@ -562,6 +559,7 @@ def _collect_forward_entries(payload: dict[str, Any]) -> list[str]:
         sender = _first_text_field(item, "sender_name", "user_name", "sender", "name")
         nested_type = str(item.get("message_type", "") or item.get("msg_type", "")).strip().lower()
         if nested_type == "post":
+            from .feishu_post import parse_feishu_post_payload
             body = parse_feishu_post_payload(item.get("content") or item).text_content
         else:
             body = _first_text_field(
