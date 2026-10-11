@@ -5,12 +5,18 @@ forwarded messages come from ``GET im/v1/messages/{id}``: ``items[0]`` is the fo
 followed by every descendant flattened, each naming its direct container in
 ``upper_message_id`` (a nested forward is followed by its own children). A forwarded image or
 file downloads through the *outermost* forward's message id; the child's own id and a nested
-forward's id answer 234003 "File not in msg".
+forward's id answer 234003 "File not in msg". Child media downloads run a few at a time within a
+time budget (inside the arrival-order hold, so the note sent behind the forward still joins it) and
+a byte budget (``gateway.max_inbound_media_bytes`` for the whole forward); whatever a budget cuts
+off stays a transcript line and is counted at the end of the transcript.
 """
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import logging
+import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -22,6 +28,7 @@ MAX_FORWARD_ENTRIES = 100
 MAX_FORWARD_CHARS = 10_000
 MAX_ENTRY_CHARS = 2_000
 MAX_FORWARD_MEDIA = 10
+DOWNLOAD_CONCURRENCY = 4
 VOICE_TEXT = "[Voice message]"
 # The gateway expands ``@file:``/``@url:``/``@diff``... references (built-in and plugin prefixes) in event text.
 _CONTEXT_REFERENCE = re.compile(r"(?<![\w/])@(?=[A-Za-z][\w-]*:\S|(?:diff|staged)\b)")
@@ -82,24 +89,68 @@ def display_text(normalized: Any) -> str:
     return FALLBACK_IMAGE_TEXT if normalized.raw_type == "image" else f"[{normalized.raw_type}]"
 
 
-async def expand_merge_forward(adapter: Any, message_id: str, normalized: Any) -> Any:
-    """An inbound forward as its transcript plus (bounded) child media; ``normalized`` on failure."""
+async def expand_merge_forward(adapter: Any, message_id: str, normalized: Any) -> tuple[Any, list[str], list[str]]:
+    """An inbound forward as its transcript plus its (bounded) child media; ``normalized`` and none on failure."""
     from .adapter import FeishuNormalizedMessage
 
     if not adapter._client or not message_id:
-        return normalized
+        return normalized, [], []
     try:
         items = await fetch_message_items(adapter, message_id)
         transcript = await render_merge_forward(adapter, message_id, items) if items else None
     except Exception:
         logger.warning("[Feishu] Failed to expand merge-forward %s", message_id, exc_info=True)
-        return normalized
+        return normalized, [], []
     if transcript is None:
-        return normalized
+        return normalized, [], []
+    urls, types, cut = await _download_children(adapter, message_id, transcript)
+    text = transcript.text + (f"\n- … {cut} forwarded attachment(s) not downloaded: time or size limit reached" if cut else "")
     return FeishuNormalizedMessage(
-        raw_type="merge_forward", text_content=transcript.text, image_keys=transcript.image_keys,
+        raw_type="merge_forward", text_content=text, image_keys=transcript.image_keys,
         media_refs=transcript.media_refs, relation_kind="merge_forward",
-    )
+    ), urls, types
+
+
+async def _download_children(adapter: Any, message_id: str, transcript: ForwardTranscript) -> tuple[list[str], list[str], int]:
+    """The transcript's child media through the outer forward, in order: ``(urls, types, number cut off)``.
+
+    Sizes are only known once downloaded, so a file that does not fit the byte budget is dropped after
+    the fact and no further download starts once the budget is spent."""
+    from gateway.platforms.base import get_inbound_media_max_bytes
+
+    from .feishu_forward_order import DOWNLOAD_BUDGET_SECONDS
+
+    jobs = [functools.partial(adapter._download_feishu_image, message_id=message_id, image_key=key)
+            for key in transcript.image_keys] + [
+        functools.partial(adapter._download_feishu_message_resource, message_id=message_id, file_key=ref.file_key,
+                          resource_type=ref.resource_type, fallback_filename=ref.file_name)
+        for ref in transcript.media_refs]
+    if not jobs:
+        return [], [], 0
+    limit, used = max(0, await asyncio.to_thread(get_inbound_media_max_bytes)), 0
+    semaphore, cut = asyncio.Semaphore(DOWNLOAD_CONCURRENCY), object()
+
+    async def download(job: Any) -> Any:
+        nonlocal used
+        async with semaphore:
+            if limit and used >= limit:
+                return cut
+            path, media_type = await job()
+        if path and limit:
+            size = await asyncio.to_thread(os.path.getsize, path)
+            if used + size > limit:
+                await asyncio.to_thread(os.remove, path)
+                return cut
+            used += size
+        return path, media_type
+
+    tasks = [asyncio.ensure_future(download(job)) for job in jobs]
+    await asyncio.wait(tasks, timeout=DOWNLOAD_BUDGET_SECONDS)
+    for task in tasks:
+        task.cancel()  # still running at the deadline: cut off (an abandoned file is swept with the cache)
+    results = [task.result() if task.done() and not task.cancelled() and task.exception() is None else cut for task in tasks]
+    kept = [result for result in results if result is not cut and result[0]]
+    return [path for path, _ in kept], [media_type for _, media_type in kept], sum(result is cut for result in results)
 
 
 async def render_merge_forward(adapter: Any, root_id: str, items: list[Any]) -> Optional[ForwardTranscript]:

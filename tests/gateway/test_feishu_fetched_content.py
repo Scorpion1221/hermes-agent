@@ -247,11 +247,11 @@ def test_inbound_merge_forward_downloads_child_media_through_the_outer_forward()
         make_adapter(client), inbound_message(ROOT, "merge_forward", "Merged and Forwarded Message"),
     )
 
-    assert [(r.message_id, r.file_key) for r in client.resource_gets] == [
-        (ROOT, "img_top"), (ROOT, "img_post"), (ROOT, "file_report"),
+    assert sorted((r.message_id, r.file_key) for r in client.resource_gets) == [
+        (ROOT, "file_report"), (ROOT, "img_post"), (ROOT, "img_top"),
     ]
     assert event.message_type.value == "text"
-    assert event.media_types == ["image/png", "image/png", "application/pdf"]
+    assert event.media_types == ["image/png", "image/png", "application/pdf"]  # transcript order
     assert all(os.path.isfile(path) for path in event.media_urls)
     assert "  - Alice: [Attachment: report.pdf]" in event.text.splitlines()
 
@@ -302,6 +302,56 @@ def test_forward_child_media_is_capped_while_every_child_stays_in_the_transcript
 
     assert len(client.resource_gets) == len(media_urls) == MAX_FORWARD_MEDIA
     assert text_out.count("- Alice: [Image]") == count
+
+
+class SlowResources(FakeFeishu):
+    """Each forwarded file downloads in ``delay`` seconds as ``size`` bytes of PDF."""
+
+    def __init__(self, messages, users, *, delay=0.0, size=16):
+        super().__init__(messages, users)
+        self.delay, self.size = delay, size
+
+    def _get_resource(self, request):
+        self.resource_gets.append(request)
+        time.sleep(self.delay)
+        return SimpleNamespace(
+            success=lambda: True, file=io.BytesIO(b"%PDF" + b"0" * (self.size - 4)), file_name=f"{request.file_key}.pdf",
+            raw=SimpleNamespace(headers={"Content-Type": "application/pdf"}),
+        )
+
+
+def forwarded_files(count):
+    return [forward_root()] + [
+        item(f"om_f{i}", "file", {"file_key": f"file_{i}", "file_name": f"video{i}.pdf"}, at=i) for i in range(count)
+    ]
+
+
+def test_forward_downloads_stop_at_the_time_budget_and_say_how_many_were_cut_off(monkeypatch):
+    """A forward of large files must still be dispatched inside the arrival-order hold, or its note is
+    answered alone and the forward arrives later as an interrupting turn."""
+    import plugins.platforms.feishu.feishu_forward_order as forward_order
+
+    monkeypatch.setattr(forward_order, "DOWNLOAD_BUDGET_SECONDS", 0.3)
+    client = SlowResources({ROOT: forwarded_files(8)}, {"ou_alice": "Alice"}, delay=0.25)
+
+    start = time.monotonic()
+    text_out, _type, media_urls, _types, _inlined, _mentions = inbound_forward(make_adapter(client))
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 3  # 8 files at 0.25s would take 2s one at a time, 0.5s four at a time
+    assert 1 <= len(media_urls) < 8 and all(os.path.isfile(path) for path in media_urls)
+    assert text_out.count("- Alice: [Attachment: video") == 8  # every file stays in the transcript
+    assert text_out.endswith(f"- … {8 - len(media_urls)} forwarded attachment(s) not downloaded: time or size limit reached")
+
+
+def test_forward_downloads_share_the_inbound_media_byte_budget(monkeypatch):
+    monkeypatch.setattr("gateway.platforms.base.get_inbound_media_max_bytes", lambda: 40)
+    client = SlowResources({ROOT: forwarded_files(5)}, {"ou_alice": "Alice"}, size=16)
+
+    text_out, _type, media_urls, _types, _inlined, _mentions = inbound_forward(make_adapter(client))
+
+    assert len(media_urls) == 2 and sum(os.path.getsize(path) for path in media_urls) <= 40
+    assert text_out.endswith("- … 3 forwarded attachment(s) not downloaded: time or size limit reached")
 
 
 def test_long_forward_is_cut_at_the_entry_budget_and_says_how_much_is_missing():

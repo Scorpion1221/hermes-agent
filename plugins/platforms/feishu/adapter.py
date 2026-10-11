@@ -2775,10 +2775,9 @@ class FeishuAdapter(BasePlatformAdapter):
         normalized = self._normalize(raw_type, raw_content, getattr(message, "mentions", None))
         if raw_type == "merge_forward":  # the event body is a placeholder; the forwarded messages come from GET
             from .feishu_forward import expand_merge_forward
-            normalized = await expand_merge_forward(self, message_id, normalized)
-        media_urls, media_types = await self._download_feishu_message_resources(
-            message_id=message_id, normalized=normalized,
-        )
+            normalized, media_urls, media_types = await expand_merge_forward(self, message_id, normalized)
+        else:
+            media_urls, media_types = await self._download_feishu_message_resources(message_id=message_id, normalized=normalized)
         inbound_type = self._resolve_normalized_message_type(normalized, media_types)
         text = normalized.text_content
         media_text_inlined: list[bool] = []
