@@ -460,7 +460,6 @@ def test_concurrent_downloads_stay_within_the_folder_size_cap(monkeypatch):
 
 
 def test_a_quoted_image_without_a_folder_is_attached_and_nothing_is_listed():
-    """The folder_refs short-circuit must fire: a quoted image message must not trigger any folder listing."""
     image_item = item("om_image", "image", '{"image_key": "img_chart"}', upper=None)
     image_item.parent_id = ""
     client = FolderFeishu(files={"img_chart": PNG}, types={"img_chart": "image/png"}, messages={"om_image": [image_item]})
@@ -471,7 +470,6 @@ def test_a_quoted_image_without_a_folder_is_attached_and_nothing_is_listed():
     assert client.listings == []
     assert event.reply_to_text == "[Image]"
     assert event.media_types == ["image/png"]
-
 
 
 def test_a_folder_is_listed_and_downloaded_without_blocking_the_event_loop():

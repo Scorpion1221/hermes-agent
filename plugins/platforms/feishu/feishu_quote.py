@@ -214,12 +214,9 @@ async def _download(
     )
     kept = [(url, media_type) for url, media_type in zip(urls, types) if not media_type.startswith("audio/")]
     urls, types = [url for url, _ in kept], [media_type for _, media_type in kept]
-    if not quoted.folder_refs:
-        return urls, types, ""
     # 1 slot per folder goes to its listing; remainder goes to files
-    n_folders = len(quoted.folder_refs)
     room = max(MAX_QUOTED_MEDIA - len(urls), 0)
-    file_room = max(room - n_folders, 0)
+    file_room = max(room - len(quoted.folder_refs), 0)
     folders = await fetch_folders(
         adapter, quoted.message_id, list(quoted.folder_refs), max_media=room, max_files=file_room,
     )
