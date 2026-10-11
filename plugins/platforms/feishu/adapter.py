@@ -2065,7 +2065,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 label.capitalize(), ident, expected_chat_id, callback_chat_id,
             )
             return None
-        from plugins.platforms.feishu.feishu_card_operator import card_operator_name
+        from .feishu_card_operator import card_operator_name
         return open_id, callback_chat_id, card_operator_name(self, operator)
 
     def _handle_approval_card_action(self, *, event: Any, action_value: dict[str, Any], loop: Any) -> Any:
@@ -2189,7 +2189,7 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("Failed to resolve Feishu update prompt: %s", exc)
 
     async def _handle_reaction_event(self, event_type: str, data: Any) -> None:
-        from plugins.platforms.feishu.feishu_reaction import handle_reaction_event
+        from .feishu_reaction import handle_reaction_event
         await handle_reaction_event(self, event_type, data)
 
     def _is_card_action_duplicate(self, token: str) -> bool:
@@ -2321,7 +2321,7 @@ class FeishuAdapter(BasePlatformAdapter):
         return data is not None
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        from plugins.platforms.feishu.feishu_reaction import feishu_message_id
+        from .feishu_reaction import feishu_message_id
         message_id = feishu_message_id(event.message_id)  # a reaction badges the message it reacted to
         if not self._reactions_enabled() or not message_id or message_id in self._pending_processing_reactions:
             return
@@ -2334,7 +2334,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 cache.popitem(last=False)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        from plugins.platforms.feishu.feishu_reaction import feishu_message_id
+        from .feishu_reaction import feishu_message_id
         message_id = feishu_message_id(event.message_id)
         if not self._reactions_enabled() or not message_id:
             return
@@ -3470,7 +3470,7 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _send_raw_message(
         self, *, chat_id: str, msg_type: str, payload: str, reply_to: Optional[str], metadata: Optional[dict[str, Any]],
     ) -> Any:
-        from plugins.platforms.feishu.feishu_reaction import feishu_message_id  # a reaction's id → reacted message
+        from .feishu_reaction import feishu_message_id  # a reaction's id → reacted message
         thread_id = (metadata or {}).get("thread_id")
         effective_reply_to = feishu_message_id(reply_to or ((metadata or {}).get("reply_to_message_id") if thread_id else None))
         if effective_reply_to:
