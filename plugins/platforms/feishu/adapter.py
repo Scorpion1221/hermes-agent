@@ -99,7 +99,10 @@ from gateway.platforms._shared import (
     apply_yaml_bridge as _apply_yaml_bridge, extra_or_secret as _shared_extra_or_secret,
     get_scoped_secret as _get_scoped_secret, send_error
 )
-from .feishu_post import parse_feishu_post_payload
+try:
+    from .feishu_post import parse_feishu_post_payload
+except ImportError:  # standalone load via spec_from_file_location (no __package__)
+    from plugins.platforms.feishu.feishu_post import parse_feishu_post_payload  # type: ignore[no-redef]
 
 
 logger = logging.getLogger(__name__)

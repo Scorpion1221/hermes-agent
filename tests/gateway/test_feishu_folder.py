@@ -459,6 +459,21 @@ def test_concurrent_downloads_stay_within_the_folder_size_cap(monkeypatch):
     assert len(files_urls(event)) == 3
 
 
+def test_a_quoted_image_without_a_folder_is_attached_and_nothing_is_listed():
+    """The folder_refs short-circuit must fire: a quoted image message must not trigger any folder listing."""
+    image_item = item("om_image", "image", '{"image_key": "img_chart"}', upper=None)
+    image_item.parent_id = ""
+    client = FolderFeishu(files={"img_chart": PNG}, types={"img_chart": "image/png"}, messages={"om_image": [image_item]})
+    message = inbound_message("om_reply", "text", json.dumps({"text": "what is this?"}), parent_id="om_image")
+
+    event = dispatched_event(make_adapter(client), message)
+
+    assert client.listings == []
+    assert event.reply_to_text == "[Image]"
+    assert event.media_types == ["image/png"]
+
+
+
 def test_a_folder_is_listed_and_downloaded_without_blocking_the_event_loop():
     client = FolderFeishu(trees={"fld_root": [leaf("fil_a", "a.txt", b"a")]}, files={"fil_a": b"a"})
     adapter = make_adapter(client)
