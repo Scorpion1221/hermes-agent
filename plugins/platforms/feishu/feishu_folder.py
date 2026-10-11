@@ -10,12 +10,22 @@ Files land flat in the media cache (upstream's ``cache_media_bytes``: documents 
 images, audio and video in their own caches): the cache sweep prunes only the files at the top of a
 cache directory, so a materialized tree would never be cleaned up, and a remote name never becomes a
 local path component. The hierarchy lives in the text (an indented tree naming each
-downloaded file's path) and in a JSON listing file beside the files. Listing and downloads are
-bounded (entries, depth, files, and both ``gateway.max_inbound_media_bytes`` and a download time
-budget for all the folders of a message together); whatever a bound or a failure leaves out is said
-in the text. Up to ``max_media``
-files are attached to the event, never audio (attached, it would be transcribed as the user's own
-voice); none is inlined. A quoted folder downloads only the files it may attach (``feishu_quote``).
+downloaded file's path) and in a JSON listing file beside the files, whose paths are relative to
+the listing's own directory. Listing and downloads are bounded (entries, depth, files, and both
+``gateway.max_inbound_media_bytes`` and a download time budget for all the folders of a message
+together); whatever a bound or a failure leaves out is said in the text. Up to ``max_media`` files
+are attached to the event, never audio (attached, it would be transcribed as the user's own voice);
+none is inlined. A quoted folder downloads only the files it may attach (``feishu_quote``).
+
+On a gateway serving several profiles the turn's profile is chosen after the adapter caches the
+files, and the gateway then moves only the event's attachments into that profile's cache, rewriting
+their paths in the text (``rehome_inbound_media``). There the listing's relative paths stay valid,
+only files that will be attached are downloaded, and a downloaded file that is not attached (audio)
+is not kept: anything left behind would be another profile's file in the launch profile's cache,
+under a path the turn's sandbox does not mount. Nor does the text name a full path: which sandbox
+sees the file is only known once the turn is routed, and a quoted folder's text is never rewritten.
+It names each file by its cache file name, which the gateway's note for that attachment carries
+with the full path.
 """
 
 from __future__ import annotations
@@ -23,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -112,6 +123,7 @@ async def fetch_folders(
     ``MAX_MEDIA``) attached files. Listings count toward the cap (listing first, then files). At most
     ``max_files`` (default ``MAX_FILES``) files of each folder are downloaded, all of them by
     ``DOWNLOAD_BUDGET_SECONDS`` after the first listing; the tree names the rest."""
+    from agent.secret_scope import is_multiplex_active
     from gateway.platforms.base import get_inbound_media_max_bytes
 
     from .feishu_forward_order import DOWNLOAD_BUDGET_SECONDS
@@ -120,54 +132,70 @@ async def fetch_folders(
     max_media = MAX_MEDIA if max_media is None else max_media
     max_files = MAX_FILES if max_files is None else max_files
     budget = _Budget(max(0, await asyncio.to_thread(get_inbound_media_max_bytes)), deadline=deadline)
+    attached_only = is_multiplex_active()  # see the module docstring
     content = FolderContent()
     blocks: list[str] = []
     for ref in refs:
-        block, listing_path, files = await _fetch_folder(adapter, message_id, ref, budget, max_files)
+        room = max(max_media - len(content.media_urls), 0)
+        block, urls, types = await _fetch_folder(adapter, message_id, ref, budget, max_files, room, attached_only)
         blocks.append(block)
-        slot = max(max_media - len(content.media_urls), 0)
-        if listing_path and slot:  # JSON as text; the gateway's note tells the agent to read it
-            content.media_urls.append(listing_path)
-            content.media_types.append("text/plain")
-            slot -= 1
-        for entry in files:
-            if slot and entry.local_path and not entry.media_type.startswith("audio/"):
-                content.media_urls.append(entry.local_path)
-                content.media_types.append(entry.media_type)
-                slot -= 1
+        content.media_urls += urls
+        content.media_types += types
     content.text = "\n\n".join(blocks)
     return content
 
 
 async def _fetch_folder(
-    adapter: Any, message_id: str, ref: Any, budget: _Budget, max_files: int,
-) -> tuple[str, str, list[_Entry]]:
-    """``(text block, listing path or "", listed files)`` for one folder."""
+    adapter: Any, message_id: str, ref: Any, budget: _Budget, max_files: int, room: int, attached_only: bool,
+) -> tuple[str, list[str], list[str]]:
+    """``(text block, attached paths, their types)`` for one folder; ``room`` attachment slots are left."""
     name = _safe_name(ref.file_name, "folder")
     if not adapter._client or not message_id:
-        return f'Folder "{name}" could not be read: Feishu is not connected.', "", []
+        return f'Folder "{name}" could not be read: Feishu is not connected.', [], []
     try:
         items, partial = await _list(adapter, message_id, ref.file_key)
     except _Unlisted as exc:
-        return f'Folder "{name}" could not be read ({exc}); none of its files were downloaded.', "", []
+        return f'Folder "{name}" could not be read ({exc}); none of its files were downloaded.', [], []
     except Exception:
         logger.warning("[Feishu] Failed to list folder %s of message %s", ref.file_key, message_id, exc_info=True)
-        return f'Folder "{name}" could not be read; none of its files were downloaded.', "", []
+        return f'Folder "{name}" could not be read; none of its files were downloaded.', [], []
     walk = _Walk()
     if partial:
         walk.notices.append("Feishu listed only part of the folder.")
     walk.add(items, "", 1)
     if not walk.entries:
-        return "\n".join([f'Folder "{name}" {"has no readable entries" if walk.notices else "is empty"}.', *walk.notices]), "", []
+        return "\n".join([f'Folder "{name}" {"has no readable entries" if walk.notices else "is empty"}.', *walk.notices]), [], []
     files = [entry for entry in walk.entries if not entry.is_folder]
+    file_room = max(room - 1, 0)  # the listing takes the first slot
+    if attached_only:
+        max_files = min(max_files, file_room)
     for entry in files[max_files:]:
         entry.status = "not downloaded: file limit reached"
     await _download_all(adapter, message_id, files[:max_files], budget)
-    downloaded = sum(1 for entry in files if entry.local_path)
+    attached = [entry for entry in files if entry.local_path and not entry.media_type.startswith("audio/")][:file_room]
+    if attached_only:
+        await _drop_unattached(files, attached)
     logger.info("[Feishu] Folder of message %s: %d entries listed, %d/%d files downloaded",
-                message_id, len(walk.entries), downloaded, len(files))
-    listing_path = await _write_listing(name, walk)
-    return _render(name, walk, listing_path), listing_path, files
+                message_id, len(walk.entries), sum(1 for entry in files if entry.local_path), len(files))
+    listing_path = await _write_listing(name, walk) if room or not attached_only else ""
+    urls, types = ([listing_path], ["text/plain"]) if listing_path and room else ([], [])  # JSON read as text
+    text = _render(name, walk, listing_path, attached_only)
+    return text, urls + [e.local_path for e in attached], types + [e.media_type for e in attached]
+
+
+async def _drop_unattached(files: list[_Entry], attached: list[_Entry]) -> None:
+    """Remove downloaded files that are not attached: only attachments follow the turn to its profile."""
+    for entry in files:
+        if entry.local_path and entry not in attached:
+            await asyncio.to_thread(_remove_quietly, entry.local_path)
+            entry.local_path, entry.status = "", "not kept: never attached"
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        logger.debug("[Feishu] Could not remove unattached folder file %s", path, exc_info=True)
 
 
 async def _list(adapter: Any, message_id: str, folder_key: str) -> tuple[list[Any], bool]:
@@ -321,18 +349,24 @@ async def _cache(entry: _Entry, data: bytes, content_type: str) -> None:
 
 
 async def _write_listing(name: str, walk: _Walk) -> str:
-    """The JSON listing file (every entry, its status and agent-visible path); "" when it can't be written."""
-    from gateway.platforms.base import cache_document_from_bytes_async
-    from tools.credential_files import to_agent_visible_cache_path
+    """The JSON listing file (every entry and its status); "" when it can't be written.
 
+    A downloaded file's ``local_path`` is relative to the listing's directory: the cache layout around
+    it survives a move to another profile's cache and a sandbox's mount, an absolute path would not."""
+    from gateway.platforms.base import cache_document_from_bytes_async, get_document_cache_dir
+
+    listing_dir = await asyncio.to_thread(get_document_cache_dir)  # where cache_document_from_bytes writes
     entries = [
         {"path": entry.path, "type": "folder"} if entry.is_folder else {
             "path": entry.path, "type": "file", "size": entry.size, "status": entry.status,
-            **({"local_path": to_agent_visible_cache_path(entry.local_path)} if entry.local_path else {}),
+            **({"local_path": _relative(entry.local_path, listing_dir)} if entry.local_path else {}),
         }
         for entry in walk.entries
     ]
-    body = json.dumps({"folder": name, "entries": entries, "notices": walk.notices}, ensure_ascii=False, indent=1)
+    body = json.dumps({
+        "folder": name, "local_paths_relative_to": "the directory of this listing file", "entries": entries,
+        "notices": walk.notices,
+    }, ensure_ascii=False, indent=1)
     try:
         return await cache_document_from_bytes_async(body.encode("utf-8"), f"{name}.folder.json")
     except (OSError, ValueError):
@@ -340,8 +374,16 @@ async def _write_listing(name: str, walk: _Walk) -> str:
         return ""
 
 
-def _render(name: str, walk: _Walk, listing_path: str) -> str:
+def _relative(path: str, start: Any) -> str:
+    """``path`` relative to directory ``start`` (both absolute cache paths; pure string arithmetic)."""
+    return os.path.relpath(path, start).replace(os.sep, "/")
+
+
+def _render(name: str, walk: _Walk, listing_path: str, attached_only: bool) -> str:
     from tools.credential_files import to_agent_visible_cache_path
+
+    def shown(path: str) -> str:  # see the module docstring
+        return f"attached as {os.path.basename(path)}" if attached_only else to_agent_visible_cache_path(path)
 
     files = sum(1 for entry in walk.entries if not entry.is_folder)
     folders = len(walk.entries) - files
@@ -351,14 +393,14 @@ def _render(name: str, walk: _Walk, listing_path: str) -> str:
         if entry.is_folder:
             lines.append(f"{indent}- {entry.name}/")
         elif entry.local_path:
-            lines.append(f"{indent}- {entry.name} → {to_agent_visible_cache_path(entry.local_path)}")
+            lines.append(f"{indent}- {entry.name} → {shown(entry.local_path)}")
         else:
             lines.append(f"{indent}- {entry.name} ({entry.status})")
     if len(walk.entries) > MAX_TREE_LINES:
         lines.append(f"- … {len(walk.entries) - MAX_TREE_LINES} more entries, in the full listing")
     lines += walk.notices
     if listing_path:
-        lines.append(f"Full listing (JSON): {to_agent_visible_cache_path(listing_path)}")
+        lines.append(f"Full listing (JSON): {shown(listing_path)}")
     return "\n".join(lines)
 
 

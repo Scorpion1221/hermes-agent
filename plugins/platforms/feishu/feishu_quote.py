@@ -16,7 +16,8 @@ Images and files of the directly quoted message, never of its ancestors, are dow
 attached to the event (capped), as other adapters attach quoted images; a quoted folder is listed
 (its tree follows the quoted message's text) and its files share that cap. The download shares the
 walk's time budget and is cached per quoted message (while its files exist), so a slow download
-is left out of that reply but reused, not repeated, by the next reply quoting the same message.
+is left out of that reply but reused, not repeated, by the next reply quoting the same message
+(not on a gateway serving several profiles, which moves each event's files to its own profile).
 Only an explicit quote attaches media: a message posted into a topic names the topic's root as
 its parent, and the root's images are not re-attached to every message of the topic.
 """
@@ -191,9 +192,13 @@ async def _attachments(
     media_refs = files[:MAX_QUOTED_MEDIA - len(image_keys)]
     if not media or not (image_keys or media_refs or quoted.folder_refs) or not _quotes_explicitly(inbound):
         return [], [], ""
+    from agent.secret_scope import is_multiplex_active
+
     cache: OrderedDict[str, asyncio.Future] = vars(adapter).setdefault("_quote_media_cache", OrderedDict())
     download = cache.get(quoted.message_id)
-    if download is None or (download.done() and not _still_cached(download)):
+    # Serving several profiles, the gateway MOVES each event's attachments into its turn's profile, so
+    # two events must never be handed the same files: each downloads its own.
+    if download is None or is_multiplex_active() or (download.done() and not _still_cached(download)):
         download = asyncio.ensure_future(_download(adapter, quoted, image_keys, media_refs))
     cache[quoted.message_id] = download
     cache.move_to_end(quoted.message_id)

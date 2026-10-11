@@ -138,7 +138,8 @@ def test_a_folder_message_lists_its_tree_and_attaches_its_files_from_the_carryin
         ("docs", "folder", None), ("docs/guide.md", "file", "downloaded"), ("docs/notes.txt", "file", "downloaded"),
         ("notes.txt", "file", "downloaded"), ("empty", "folder", None),
     ]
-    assert [e["local_path"] for e in listing["entries"] if e["type"] == "file"] == file_urls
+    listing_dir = Path(event.media_urls[0]).parent  # local_path is relative to the listing's directory
+    assert [str(listing_dir / e["local_path"]) for e in listing["entries"] if e["type"] == "file"] == file_urls
 
 
 def test_an_empty_folder_says_so_and_downloads_nothing():
@@ -351,7 +352,9 @@ def test_tree_and_listing_name_the_files_where_a_sandboxed_agent_sees_them(monke
     assert tree_path(event, "a.txt") == agent_path
     listing_line = next(line for line in event.text.splitlines() if line.startswith("Full listing (JSON): "))
     assert listing_line.startswith("Full listing (JSON): /root/.hermes/cache/documents/")
-    assert listing_of(event)["entries"][0]["local_path"] == agent_path
+    listing_agent_path = listing_line.removeprefix("Full listing (JSON): ")
+    entry_path = listing_of(event)["entries"][0]["local_path"]  # relative: valid wherever the cache is mounted
+    assert str(PurePosixPath(listing_agent_path).parent / entry_path) == agent_path
 
 
 # --- folders inside a post ---
