@@ -2797,9 +2797,9 @@ class FeishuAdapter(BasePlatformAdapter):
             text = f"{text}\n\n{folders.text}" if text else folders.text
             media_urls, media_types = media_urls + folders.media_urls, media_types + folders.media_types
             media_text_inlined += [False] * len(folders.media_urls)
-        if raw_type == "merge_forward":  # transcript and inlined documents alike are forwarded text
-            from .feishu_forward import keep_references_literal
-            text = keep_references_literal(text)
+        if raw_type == "merge_forward":  # the transcript, inlined documents and attachments are someone else's
+            from .feishu_forward import forwarded_content
+            text, media_urls, media_types, media_text_inlined = forwarded_content(text, media_urls, media_types, media_text_inlined)
         return text, inbound_type, media_urls, media_types, media_text_inlined, list(normalized.mentions)
 
     async def _download_feishu_message_resources(

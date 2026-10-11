@@ -252,6 +252,41 @@ def test_inbound_merge_forward_downloads_child_media_through_the_outer_forward()
     assert "  - Alice: [Attachment: report.pdf]" in event.text.splitlines()
 
 
+def test_forwarded_voice_and_audio_are_never_transcribed_as_the_forwarders_own_words():
+    """A forward reaches the agent as the forwarder's TEXT event: an audio attachment on it would go to STT
+    and read exactly like the forwarder's own voice note, so forwarded audio stays a transcript line."""
+    from gateway.run_inbound import GatewayInboundMixin
+
+    class AudioFeishu(FakeFeishu):
+        def _get_resource(self, request):
+            if request.file_key == "file_song":
+                self.resource_gets.append(request)
+                return SimpleNamespace(
+                    success=lambda: True, file=io.BytesIO(b"ID3 synthetic"), file_name="song.mp3",
+                    raw=SimpleNamespace(headers={"Content-Type": "audio/mpeg"}),
+                )
+            return super()._get_resource(request)
+
+    items = [
+        forward_root(),
+        item("om_v", "audio", {"file_key": "file_voice", "duration": 2000}, sender="ou_bob", at=1),
+        item("om_s", "file", {"file_key": "file_song", "file_name": "song.mp3"}, sender="ou_bob", at=2),
+        item("om_r", "file", {"file_key": "file_report", "file_name": "report.pdf"}, sender="ou_bob", at=3),
+    ]
+    client = AudioFeishu({ROOT: items}, users={"ou_bob": "Bob"})
+
+    event = dispatched_event(make_adapter(client), inbound_message(ROOT, "merge_forward", "Merged and Forwarded Message"))
+
+    assert event.text.splitlines()[1:] == [
+        "- Bob: [Voice message]", "- Bob: [Attachment: song.mp3]", "- Bob: [Attachment: report.pdf]",
+    ]
+    assert event.media_types == ["application/pdf"]
+    assert len(event.media_urls) == len(event.media_text_inlined) == 1
+    _images, stt_paths, audio_files, _videos = GatewayInboundMixin._classify_inbound_media(event, False)
+    assert stt_paths == [] and audio_files == []
+    assert "file_voice" not in [r.file_key for r in client.resource_gets]
+
+
 def test_forward_child_media_is_capped_while_every_child_stays_in_the_transcript():
     from plugins.platforms.feishu.feishu_forward import MAX_FORWARD_MEDIA
 

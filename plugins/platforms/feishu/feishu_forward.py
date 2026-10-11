@@ -22,6 +22,7 @@ MAX_FORWARD_ENTRIES = 100
 MAX_FORWARD_CHARS = 10_000
 MAX_ENTRY_CHARS = 2_000
 MAX_FORWARD_MEDIA = 10
+VOICE_TEXT = "[Voice message]"
 # The gateway expands ``@file:``/``@url:``/``@diff``... references (built-in and plugin prefixes) in event text.
 _CONTEXT_REFERENCE = re.compile(r"(?<![\w/])@(?=[A-Za-z][\w-]*:\S|(?:diff|staged)\b)")
 
@@ -57,6 +58,18 @@ def keep_references_literal(text: str) -> str:
     """Forwarded text is other people's: a reference in it must not read a file or fetch a URL on the
     forwarder's behalf, so its ``@`` becomes a full-width ``＠`` (the expander no longer matches it)."""
     return _CONTEXT_REFERENCE.sub("＠", text)
+
+
+def forwarded_content(
+    text: str, media_urls: list[str], media_types: list[str], inlined: list[bool],
+) -> tuple[str, list[str], list[str], list[bool]]:
+    """An expanded forward as the forwarder's TEXT event carries it: references kept literal, and no audio
+    (a forwarded audio file attached there would be transcribed as the forwarder's own voice)."""
+    kept = [index for index, media_type in enumerate(media_types) if not media_type.startswith("audio/")]
+    return (
+        keep_references_literal(text), [media_urls[i] for i in kept], [media_types[i] for i in kept],
+        [inlined[i] for i in kept],
+    )
 
 
 def display_text(normalized: Any) -> str:
@@ -160,11 +173,14 @@ class _Transcript:
             normalized = self._adapter._normalize(
                 msg_type, getattr(getattr(item, "body", None), "content", "") or "", getattr(item, "mentions", None),
             )
-            body = display_text(normalized) or "[message]"
+            # Someone else's voice note stays text: attached to the forwarder's TEXT event, the gateway
+            # would transcribe it as the forwarder's own words.
+            body = VOICE_TEXT if msg_type == "audio" else display_text(normalized) or "[message]"
+            files = [ref for ref in normalized.media_refs if ref.resource_type != "audio"]
             room = max(MAX_FORWARD_MEDIA - len(self.image_keys) - len(self.media_refs), 0)
             self.image_keys.extend(normalized.image_keys[:room])
             room = max(MAX_FORWARD_MEDIA - len(self.image_keys) - len(self.media_refs), 0)
-            self.media_refs.extend(normalized.media_refs[:room])
+            self.media_refs.extend(files[:room])
         body = body.strip()
         limit = min(MAX_ENTRY_CHARS, MAX_FORWARD_CHARS - self._chars)
         if len(body) > limit:
