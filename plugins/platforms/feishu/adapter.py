@@ -197,7 +197,7 @@ _FEISHU_REACTION_FAILURE = "CrossMark"
 # drain on completion; the cap is a safeguard against unbounded growth from
 # delete-failures, not a capacity plan.
 _FEISHU_PROCESSING_REACTION_CACHE_SIZE = 1024
-_FEISHU_MESSAGE_TEXT_CACHE_SIZE = 512       # LRU cap for reply-context message text lookups
+_FEISHU_MESSAGE_TEXT_CACHE_SIZE = 512       # LRU cap for quoted-message (reply chain) lookups
 
 # QR onboarding constants
 _ONBOARD_ACCOUNTS_URLS = {
@@ -216,8 +216,6 @@ FALLBACK_INTERACTIVE_TEXT = "[Interactive message]"
 FALLBACK_IMAGE_TEXT = "[Image]"
 FALLBACK_ATTACHMENT_TEXT = "[Attachment]"
 # --- Post/card parsing helpers ---
-_PREFERRED_LOCALES = ("zh_cn", "en_us")
-_MARKDOWN_SPECIAL_CHARS_RE = re.compile(r"([\\`*_{}\[\]()#+\-!|>~])")
 _MENTION_PLACEHOLDER_RE = re.compile(r"@_user_\d+")
 _MENTION_BOUNDARY_CHARS = frozenset(" \t\n\r.,;:!?、，。；：！？()[]{}<>\"'`")
 _TRAILING_TERMINAL_PUNCT = frozenset(" \t\n\r.!?。！？")
@@ -268,19 +266,13 @@ class _FeishuBotIdentity:
 
 
 @dataclass(frozen=True)
-class FeishuPostParseResult:
-    text_content: str
-    image_keys: list[str] = field(default_factory=list)
-    media_refs: list[FeishuPostMediaRef] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
 class FeishuNormalizedMessage:
     raw_type: str
     text_content: str
     preferred_message_type: str = "text"
     image_keys: list[str] = field(default_factory=list)
     media_refs: list[FeishuPostMediaRef] = field(default_factory=list)
+    folder_refs: list[FeishuPostMediaRef] = field(default_factory=list)  # listed and downloaded by feishu_folder
     mentions: list[FeishuMentionRef] = field(default_factory=list)
     relation_kind: str = "plain"
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -320,6 +312,7 @@ class FeishuAdapterSettings:
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
     allow_all_dm: bool = False  # resolved per-profile so multiplexed adapters honor their own .env
+    quote_chain_max_depth: int = 20  # quoted messages walked toward the root; 0/1 = the direct quote only
 
 
 @dataclass
@@ -359,57 +352,8 @@ def _sender_identity(sender: Any) -> frozenset:
 
 # --- Markdown rendering helpers ---
 
-def _escape_markdown_text(text: str) -> str:
-    return _MARKDOWN_SPECIAL_CHARS_RE.sub(r"\\\1", text)
-
-
 def _to_boolean(value: Any) -> bool:
     return value is True or value == 1 or value == "true"
-
-
-def _is_style_enabled(style: dict[str, Any] | None, key: str) -> bool:
-    if not style:
-        return False
-    return _to_boolean(style.get(key))
-
-
-def _wrap_inline_code(text: str) -> str:
-    max_run = max([0, *[len(run) for run in re.findall(r"`+", text)]])
-    fence = "`" * (max_run + 1)
-    body = f" {text} " if text.startswith("`") or text.endswith("`") else text
-    return f"{fence}{body}{fence}"
-
-
-def _sanitize_fence_language(language: str) -> str:
-    return language.strip().replace("\n", " ").replace("\r", " ")
-
-
-_TEXT_STYLE_WRAPPERS = (("bold", "**", "**"), ("italic", "*", "*"), ("underline", "<u>", "</u>"), ("strikethrough", "~~", "~~"))
-
-
-def _render_text_element(element: dict[str, Any]) -> str:
-    text = str(element.get("text", "") or "")
-    style = element.get("style")
-    style_dict = style if isinstance(style, dict) else None
-    if _is_style_enabled(style_dict, "code"):
-        return _wrap_inline_code(text)
-    # Post text elements carry raw text plus separate style flags; the style wrappers below
-    # re-create the markdown. Escaping the text here put `\*\*bold\*\*` / `\`code\`` into the
-    # model's context and those backslashes came straight back out in replies (#9816).
-    rendered = text
-    if not rendered:
-        return ""
-    for key, prefix, suffix in _TEXT_STYLE_WRAPPERS:  # order matters for nesting
-        if _is_style_enabled(style_dict, key):
-            rendered = f"{prefix}{rendered}{suffix}"
-    return rendered
-
-
-def _render_code_block_element(element: dict[str, Any]) -> str:
-    language = _sanitize_fence_language(str(element.get("language", "") or "") or str(element.get("lang", "") or ""))
-    code = (str(element.get("text", "") or "") or str(element.get("content", "") or "")).replace("\r\n", "\n")
-    trailing_newline = "" if code.endswith("\n") else "\n"
-    return f"```{language}\n{code}{trailing_newline}```"
 
 
 def _strip_markdown_to_plain_text(text: str) -> str:
@@ -481,167 +425,6 @@ def _build_markdown_post_rows(content: str) -> list[list[dict[str, str]]]:
     return rows or [[{"tag": "md", "text": content}]]
 
 
-def parse_feishu_post_payload(
-    payload: Any, *, mentions_map: Optional[dict[str, FeishuMentionRef]] = None,
-) -> FeishuPostParseResult:
-    resolved = _resolve_post_payload(payload)
-    if not resolved:
-        return FeishuPostParseResult(text_content=FALLBACK_POST_TEXT)
-    image_keys: list[str] = []
-    media_refs: list[FeishuPostMediaRef] = []
-    parts: list[str] = []
-    title = _normalize_feishu_text(str(resolved.get("title", "")).strip())
-    if title:
-        parts.append(title)
-    for row in resolved.get("content", []) or []:
-        if not isinstance(row, list):
-            continue
-        row_text = _normalize_feishu_text(
-            "".join(_render_post_element(item, image_keys, media_refs, mentions_map) for item in row)
-        )
-        if row_text:
-            parts.append(row_text)
-    for entry in resolved.get("files", []) or []:
-        if (
-            not isinstance(entry, dict)
-            or _to_boolean(entry.get("is_folder"))
-            or not str(entry.get("file_key", "")).strip()
-        ):
-            continue
-        placeholder = _render_post_element(
-            {**entry, "tag": "file"}, image_keys, media_refs, mentions_map,
-        )
-        if placeholder:
-            parts.append(placeholder)
-    return FeishuPostParseResult(
-        text_content="\n".join(parts).strip() or FALLBACK_POST_TEXT, image_keys=image_keys, media_refs=media_refs,
-    )
-
-
-def _resolve_post_payload(payload: Any) -> dict[str, Any]:
-    direct = _to_post_payload(payload)
-    if direct:
-        return direct
-    if not isinstance(payload, dict):
-        return {}
-    return _resolve_locale_payload(payload.get("post")) or _resolve_locale_payload(payload)
-
-
-def _resolve_locale_payload(payload: Any) -> dict[str, Any]:
-    direct = _to_post_payload(payload)
-    if direct:
-        return direct
-    if not isinstance(payload, dict):
-        return {}
-    # Preferred locales first, then any locale that carries a content list.
-    preferred = (payload.get(key) for key in _PREFERRED_LOCALES)
-    for candidate in map(_to_post_payload, itertools.chain(preferred, payload.values())):
-        if candidate:
-            return candidate
-    return {}
-
-
-def _to_post_payload(candidate: Any) -> dict[str, Any]:
-    if not isinstance(candidate, dict):
-        return {}
-    content = candidate.get("content")
-    if not isinstance(content, list):
-        return {}
-    files = candidate.get("files")
-    return {
-        "title": str(candidate.get("title", "") or ""),
-        "content": content,
-        "files": files if isinstance(files, list) else [],
-    }
-
-
-_STATIC_POST_TAGS = {"br": "\n", "hr": "\n\n---\n\n", "divider": "\n\n---\n\n"}
-
-
-def _render_post_element(
-    element: Any, image_keys: list[str], media_refs: list[FeishuPostMediaRef],
-    mentions_map: Optional[dict[str, FeishuMentionRef]] = None,
-) -> str:
-    if isinstance(element, str):
-        return element
-    if not isinstance(element, dict):
-        return ""
-
-    tag = str(element.get("tag", "")).strip().lower()
-    if tag in _STATIC_POST_TAGS:
-        return _STATIC_POST_TAGS[tag]
-    if tag == "text":
-        return _render_text_element(element)
-    if tag in {"code_block", "pre"}:
-        return _render_code_block_element(element)
-    if tag == "a":
-        href = str(element.get("href", "")).strip()
-        label = str(element.get("text", href) or "").strip()
-        if not label:
-            return ""
-        escaped_label = _escape_markdown_text(label)
-        return f"[{escaped_label}]({href})" if href else escaped_label
-    if tag == "at":
-        # <at>.user_id is a placeholder ("@_user_N" / "@_all"); mentions_map has the real ref.
-        placeholder = str(element.get("user_id", "")).strip()
-        if placeholder == "@_all":
-            # The SDK sometimes omits @_all from top-level mentions; record it so callers see it.
-            if mentions_map is not None and "@_all" not in mentions_map:
-                mentions_map["@_all"] = FeishuMentionRef(is_all=True)
-            return "@all"
-        ref = (mentions_map or {}).get(placeholder)
-        display_name = (ref.name or ref.open_id or "user") if ref is not None else (
-            str(element.get("user_name", "")).strip() or "user"
-        )
-        return f"@{_escape_markdown_text(display_name)}"
-    if tag in {"img", "image"}:
-        image_key = str(element.get("image_key", "")).strip()
-        if image_key and image_key not in image_keys:
-            image_keys.append(image_key)
-        alt = str(element.get("text", "")).strip() or str(element.get("alt", "")).strip()
-        return f"[Image: {alt}]" if alt else "[Image]"
-    if tag in {"media", "file", "audio", "video"}:
-        file_key = str(element.get("file_key", "")).strip()
-        names = (str(element.get(k, "")).strip() for k in ("file_name", "title", "text"))
-        file_name = next((n for n in names if n), "")
-        placeholder = f"[Attachment: {file_name}]" if file_name else "[Attachment]"
-        if not file_key:
-            return placeholder
-        if not any(ref.file_key == file_key for ref in media_refs):
-            media_refs.append(FeishuPostMediaRef(
-                file_key=file_key, file_name=file_name, resource_type=tag if tag in {"audio", "video"} else "file",
-            ))
-            return placeholder
-        return ""
-    if tag in {"emotion", "emoji"}:
-        label = str(element.get("text", "")).strip() or str(element.get("emoji_type", "")).strip()
-        return f":{_escape_markdown_text(label)}:" if label else "[Emoji]"
-    if tag == "code":
-        code = str(element.get("text", "") or "") or str(element.get("content", "") or "")
-        return _wrap_inline_code(code) if code else ""
-    nested = (element.get(key) for key in ("text", "title", "content", "children", "elements"))
-    return _join_nested_posts(nested, image_keys, media_refs, mentions_map)
-
-
-def _join_nested_posts(values: Any, image_keys: Any, media_refs: Any, mentions_map: Any) -> str:
-    parts = (_render_nested_post(item, image_keys, media_refs, mentions_map) for item in values)
-    return " ".join(part for part in parts if part)
-
-
-def _render_nested_post(
-    value: Any, image_keys: list[str], media_refs: list[FeishuPostMediaRef],
-    mentions_map: Optional[dict[str, FeishuMentionRef]] = None,
-) -> str:
-    if isinstance(value, str):
-        return _escape_markdown_text(value)
-    if isinstance(value, list):
-        return _join_nested_posts(value, image_keys, media_refs, mentions_map)
-    if isinstance(value, dict):
-        direct = _render_post_element(value, image_keys, media_refs, mentions_map)
-        return direct or _join_nested_posts(value.values(), image_keys, media_refs, mentions_map)
-    return ""
-
-
 # --- Message normalization ---
 
 def normalize_feishu_message(
@@ -663,13 +446,14 @@ def normalize_feishu_message(
             mentions=list(mentions_map.values()),
         )
     if normalized_type == "post":
+        from .feishu_post import parse_feishu_post_payload
         # The walker writes back to mentions_map if it encounters
         # <at user_id="@_all">, so reading .values() after parsing is enough.
         parsed_post = parse_feishu_post_payload(payload, mentions_map=mentions_map)
         return FeishuNormalizedMessage(
             raw_type=normalized_type, text_content=parsed_post.text_content,
             image_keys=list(parsed_post.image_keys), media_refs=list(parsed_post.media_refs),
-            mentions=list(mentions_map.values()), relation_kind="post",
+            folder_refs=list(parsed_post.folder_refs), mentions=list(mentions_map.values()), relation_kind="post",
         )
     mention_refs = list(mentions_map.values())
     if normalized_type == "image":
@@ -686,6 +470,9 @@ def normalize_feishu_message(
             preferred_message_type="photo", image_keys=[image_key] if image_key else [],
             relation_kind="image", mentions=mention_refs,
         )
+    if normalized_type == "folder":
+        from .feishu_folder import normalize_folder_message
+        return normalize_folder_message(payload, mention_refs)
     if normalized_type in {"file", "audio", "media"}:
         media_ref = _build_media_ref_from_payload(payload, resource_type=normalized_type)
         return FeishuNormalizedMessage(
@@ -735,6 +522,9 @@ def _normalize_share_chat_message(payload: dict[str, Any]) -> FeishuNormalizedMe
 
 
 def _normalize_interactive_message(message_type: str, payload: dict[str, Any]) -> FeishuNormalizedMessage:
+    from .feishu_card_text import render_json_card
+    if card_text := render_json_card(payload):  # GET with card_msg_content_type=raw_card_content
+        return FeishuNormalizedMessage(raw_type=message_type, text_content=card_text, relation_kind="interactive")
     card_payload = payload.get("card") if isinstance(payload.get("card"), dict) else payload
     title = _first_non_empty_text(
         _find_header_title(card_payload), payload.get("title"),
@@ -769,6 +559,7 @@ def _collect_forward_entries(payload: dict[str, Any]) -> list[str]:
         sender = _first_text_field(item, "sender_name", "user_name", "sender", "name")
         nested_type = str(item.get("message_type", "") or item.get("msg_type", "")).strip().lower()
         if nested_type == "post":
+            from .feishu_post import parse_feishu_post_payload
             body = parse_feishu_post_payload(item.get("content") or item).text_content
         else:
             body = _first_text_field(
@@ -1328,7 +1119,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._pending_inbound_max_depth = 1000  # cap queue; drop oldest beyond
         self._chat_locks: collections.OrderedDict[str, asyncio.Lock] = collections.OrderedDict()  # chat_id → lock (per-chat serial processing, LRU-bounded)
         self._chat_info_cache: dict[str, dict[str, Any]] = {}
-        self._message_text_cache: OrderedDict[str, Optional[str]] = OrderedDict()
+        self._quote_node_cache: OrderedDict[str, Any] = OrderedDict()  # message_id → feishu_quote.QuoteNode (LRU)
         self._app_lock_identity: Optional[str] = None
         self._text_batch_state = FeishuBatchState()
         self._pending_text_batches = self._text_batch_state.events
@@ -1416,6 +1207,7 @@ class FeishuAdapter(BasePlatformAdapter):
             default_group_policy=str(extra.get("default_group_policy", "")).strip().lower(),
             group_rules=group_rules, allow_bots=allow_bots, allow_all_dm=allow_all_dm,
             require_mention=_to_boolean(extra.get("require_mention", _get_scoped_secret("FEISHU_REQUIRE_MENTION", "true"))),
+            quote_chain_max_depth=_coerce_required_int(extra.get("quote_chain_max_depth"), default=20, min_value=0),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -2111,20 +1903,23 @@ class FeishuAdapter(BasePlatformAdapter):
         if not message or not sender or not getattr(sender, "sender_id", None):
             logger.debug("[Feishu] Dropping malformed inbound event: missing message/sender")
             return
-        message_id = getattr(message, "message_id", None)
-        if not message_id or await self._is_duplicate(message_id):
-            logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
-            return
-        reason = self._admit(sender, message)
-        if reason is not None:
-            logger.debug("[Feishu] dropping inbound event: %s", reason)
-            if reason == "group_policy_rejected":
-                self._warn_once_empty_allowlist_deny(getattr(message, "chat_id", "") or "")
-            return
-        await self._process_inbound_message(
-            data=data, message=message, sender_id=getattr(sender, "sender_id", None),
-            chat_type=getattr(message, "chat_type", "p2p"), message_id=message_id, is_bot=_is_bot_sender(sender),
-        )
+        from .feishu_forward_order import in_arrival_order
+        async with in_arrival_order(self, message, sender):  # before any await: a forward or quote outruns what follows
+            message_id = getattr(message, "message_id", None)
+            if not message_id or await self._is_duplicate(message_id):
+                logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
+                return
+            reason = self._admit(sender, message)
+            if reason is not None:
+                logger.debug("[Feishu] dropping inbound event: %s", reason)
+                if reason == "group_policy_rejected":
+                    self._warn_once_empty_allowlist_deny(getattr(message, "chat_id", "") or "")
+                return
+            await self._process_inbound_message(
+                data=data, message=message, sender_id=getattr(sender, "sender_id", None),
+                chat_type=getattr(message, "chat_type", "p2p"), message_id=message_id,
+                is_bot=_is_bot_sender(sender),
+            )
 
     def _on_message_read_event(self, data: P2ImMessageMessageReadV1) -> None:
         """Ignore read-receipt events that Hermes does not act on."""
@@ -2638,7 +2433,7 @@ class FeishuAdapter(BasePlatformAdapter):
             getattr(message, "parent_id", None) or getattr(message, "upper_message_id", None)
             or getattr(message, "root_id", None) or None
         )
-        reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
+        quote = await self._fetch_quoted_reply(reply_to_message_id, message)
         sender_primary = (
             getattr(sender_id, "open_id", None) or getattr(sender_id, "user_id", None)
             or getattr(sender_id, "union_id", None) or "<unknown>"
@@ -2665,9 +2460,9 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         normalized = MessageEvent(
             text=text, message_type=inbound_type, source=source, raw_message=data,
-            message_id=message_id, media_urls=media_urls, media_types=media_types,
-            media_text_inlined=media_text_inlined,
-            reply_to_message_id=reply_to_message_id, reply_to_text=reply_to_text,
+            message_id=message_id, media_urls=media_urls + quote.media_urls, media_types=media_types + quote.media_types,
+            media_text_inlined=media_text_inlined + [False] * len(quote.media_urls),
+            reply_to_message_id=reply_to_message_id, reply_to_text=quote.text, reply_to_is_own_message=quote.is_own,
             channel_prompt=self._resolve_channel_prompt(chat_id, thread_id or None),
             timestamp=datetime.now(),
         )
@@ -2707,9 +2502,8 @@ class FeishuAdapter(BasePlatformAdapter):
             self._pending_media_batches[key] = event
             self._schedule_media_batch_flush(key)
             return
-        existing.media_urls.extend(event.media_urls)
-        existing.media_types.extend(event.media_types)
-        existing.media_text_inlined.extend(event.media_text_inlined)
+        from .feishu_quote import merge_media  # a quoted message's cached files must not repeat
+        merge_media(existing, event)
         if event.text:
             existing.text = self._merge_caption(existing.text, event.text)
         existing.timestamp = event.timestamp
@@ -2964,15 +2758,15 @@ class FeishuAdapter(BasePlatformAdapter):
         next_count = self._pending_text_batch_counts.get(key, 1) + 1
         appended_text = event.text or ""
         next_text = f"{existing.text}\n{appended_text}" if existing.text and appended_text else (existing.text or appended_text)
-        if next_count > self._text_batch_max_messages or len(next_text) > self._text_batch_max_chars:
+        from .feishu_forward_order import batch_chars  # a forward's transcript does not count
+        if next_count > self._text_batch_max_messages or batch_chars(existing, next_text) > self._text_batch_max_chars:
             await self._flush_text_batch_now(key)
             _start_batch()
             return
 
         existing.text = next_text
-        existing.media_urls.extend(event.media_urls)
-        existing.media_types.extend(event.media_types)
-        existing.media_text_inlined.extend(event.media_text_inlined)
+        from .feishu_quote import merge_media  # a quoted message's cached files must not repeat
+        merge_media(existing, event)
         existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
         existing.timestamp = event.timestamp
         if event.message_id:
@@ -3013,6 +2807,9 @@ class FeishuAdapter(BasePlatformAdapter):
         message_id = str(getattr(message, "message_id", "") or "")
         logger.info("[Feishu] Received raw message type=%s message_id=%s", raw_type, message_id)
         normalized = self._normalize(raw_type, raw_content, getattr(message, "mentions", None))
+        if raw_type == "merge_forward":  # the event body is a placeholder; the forwarded messages come from GET
+            from .feishu_forward import expand_merge_forward
+            normalized = await expand_merge_forward(self, message_id, normalized)
         media_urls, media_types = await self._download_feishu_message_resources(
             message_id=message_id, normalized=normalized,
         )
@@ -3028,6 +2825,15 @@ class FeishuAdapter(BasePlatformAdapter):
         if inlined_parts:
             extracted_text = "\n\n".join(inlined_parts)
             text = f"{text}\n\n{extracted_text}" if text else extracted_text
+        if normalized.folder_refs:  # listed and downloaded apart; a folder's files are never inlined
+            from .feishu_folder import fetch_folders
+            folders = await fetch_folders(self, message_id, normalized.folder_refs)
+            text = f"{text}\n\n{folders.text}" if text else folders.text
+            media_urls, media_types = media_urls + folders.media_urls, media_types + folders.media_types
+            media_text_inlined += [False] * len(folders.media_urls)
+        if raw_type == "merge_forward":  # transcript and inlined documents alike are forwarded text
+            from .feishu_forward import keep_references_literal
+            text = keep_references_literal(text)
         return text, inbound_type, media_urls, media_types, media_text_inlined, list(normalized.mentions)
 
     async def _download_feishu_message_resources(
@@ -3308,62 +3114,13 @@ class FeishuAdapter(BasePlatformAdapter):
         return getattr(getattr(resp, "raw", None), "content", None)
 
     async def _fetch_bot_names(self, bot_ids: list[str]) -> Optional[dict[str, str]]:
-        if not self._client or not bot_ids:
-            return None
-        try:
-            content = await self._tenant_get_raw(
-                "/open-apis/bot/v3/bots/basic_batch", queries=[("bot_ids", oid) for oid in bot_ids],
-            )
-            if not content:
-                return None
-            payload = json.loads(content)
-            if payload.get("code") != 0:
-                return None
-            bots = (payload.get("data") or {}).get("bots") or {}
-            return {oid: str(info.get("name") or "").strip() for oid, info in bots.items() if oid}
-        except Exception:
-            logger.debug("[Feishu] Failed to fetch bot names for %s", bot_ids, exc_info=True)
-            return None
+        from .feishu_names import fetch_bot_names
+        return await fetch_bot_names(self, bot_ids)
 
-    async def _fetch_message_text(self, message_id: str) -> Optional[str]:
-        if not self._client or not message_id:
-            return None
-        if message_id in self._message_text_cache:
-            self._message_text_cache.move_to_end(message_id)
-            return self._message_text_cache[message_id]
-        try:
-            request = self._build_get_message_request(message_id)
-            response = await self._run_blocking(self._client.im.v1.message.get, request)
-            if not response or getattr(response, "success", lambda: False)() is False:
-                code = getattr(response, "code", "unknown")
-                msg = getattr(response, "msg", "message lookup failed")
-                logger.warning("[Feishu] Failed to fetch parent message %s: [%s] %s", message_id, code, msg)
-                return None
-            items = getattr(getattr(response, "data", None), "items", None) or []
-            parent = items[0] if items else None
-            body = getattr(parent, "body", None)
-            msg_type = getattr(parent, "msg_type", "") or ""
-            raw_content = getattr(body, "content", "") or ""
-            parent_mentions = getattr(parent, "mentions", None) if parent else None
-            text = self._extract_text_from_raw_content(
-                msg_type=msg_type, raw_content=raw_content, mentions=parent_mentions,
-            )
-            self._message_text_cache[message_id] = text
-            while len(self._message_text_cache) > _FEISHU_MESSAGE_TEXT_CACHE_SIZE:
-                self._message_text_cache.popitem(last=False)
-            return text
-        except Exception:
-            logger.warning("[Feishu] Failed to fetch parent message %s", message_id, exc_info=True)
-            return None
-
-    def _extract_text_from_raw_content(
-        self, *, msg_type: str, raw_content: str, mentions: Optional[Sequence[Any]] = None,
-    ) -> Optional[str]:
-        normalized = self._normalize(msg_type, raw_content, mentions)
-        if normalized.text_content:
-            return normalized.text_content
-        placeholder = normalized.metadata.get("placeholder_text") if isinstance(normalized.metadata, dict) else None
-        return str(placeholder).strip() or None
+    async def _fetch_quoted_reply(self, message_id: Optional[str], inbound: Any = None) -> Any:
+        """The quoted message's chain text, own-message flag and media; see ``feishu_quote``."""
+        from .feishu_quote import fetch_quoted_reply
+        return await fetch_quoted_reply(self, message_id, inbound=inbound)
 
     @staticmethod
     def _default_image_media_type(ext: str) -> str:

@@ -7,7 +7,6 @@ import socket
 import tempfile
 import time
 import unittest
-from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -16,6 +15,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from gateway.platforms.event import ProcessingOutcome
+from plugins.platforms.feishu.feishu_quote import QuotedReply
 
 
 if TYPE_CHECKING:
@@ -1854,7 +1854,8 @@ class TestFeishuPostMentionParsing(unittest.TestCase):
         """Post <at>.user_id is a placeholder ('@_user_N'); the real display
         name comes from the mentions_map lookup. Confirmed via live
         im.v1.message.get payload."""
-        from plugins.platforms.feishu.adapter import parse_feishu_post_payload, FeishuMentionRef
+        from plugins.platforms.feishu.adapter import FeishuMentionRef
+        from plugins.platforms.feishu.feishu_post import parse_feishu_post_payload
 
         payload = {
             "en_us": {
@@ -1872,7 +1873,7 @@ class TestFeishuPostMentionParsing(unittest.TestCase):
 
 class TestFeishuPostFileParsing(unittest.TestCase):
     def test_collects_valid_top_level_files_and_dedupes_inline_refs(self):
-        from plugins.platforms.feishu.adapter import parse_feishu_post_payload
+        from plugins.platforms.feishu.feishu_post import parse_feishu_post_payload
 
         result = parse_feishu_post_payload({
             "title": "",
@@ -1889,16 +1890,17 @@ class TestFeishuPostFileParsing(unittest.TestCase):
         })
 
         self.assertEqual([ref.file_key for ref in result.media_refs], ["file_1", "file_2"])
+        self.assertEqual([ref.file_key for ref in result.folder_refs], ["folder_1"])
         self.assertEqual(
             result.text_content,
-            "Review these[Attachment: first.md]\n[Attachment: second.txt]",
+            "Review these[Attachment: first.md]\n[Attachment: second.txt]\n[Folder: folder]",
         )
 
 class TestFeishuPostTextIsNotMarkdownEscaped(unittest.TestCase):
     def test_text_elements_keep_markdown_characters_and_style_wrappers(self):
         """Inbound post text reaches the model verbatim (no backslash escapes) while the
         structured style flags still render as markdown (#9816)."""
-        from plugins.platforms.feishu.adapter import parse_feishu_post_payload
+        from plugins.platforms.feishu.feishu_post import parse_feishu_post_payload
 
         payload = {"zh_cn": {"content": [[
             {"tag": "text", "text": "run `print('hi')` for **emphasis** [x](y)"},
@@ -2027,7 +2029,7 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         adapter._bot_user_id = ""
         adapter._bot_name = "Hermes"
         adapter._download_feishu_message_resources = AsyncMock(return_value=([], []))
-        adapter._fetch_message_text = AsyncMock(return_value=None)
+        adapter._fetch_quoted_reply = AsyncMock(return_value=QuotedReply())
         adapter.get_chat_info = AsyncMock(return_value={"name": "Test Chat"})
         adapter._resolve_sender_profile = AsyncMock(
             return_value={"user_id": "u1", "user_name": "Alice", "user_id_alt": None}
@@ -2152,7 +2154,7 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
 
     def test_regular_reply_root_id_does_not_become_thread_id(self):
         adapter = self._build_adapter()
-        adapter._fetch_message_text = AsyncMock(return_value="parent text")
+        adapter._fetch_quoted_reply = AsyncMock(return_value=QuotedReply(text="parent text"))
         message = SimpleNamespace(
             content=json.dumps({"text": "regular reply"}),
             message_type="text",
@@ -2208,45 +2210,6 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         adapter.build_source.assert_called_once()
         self.assertEqual(adapter.build_source.call_args.kwargs["thread_id"], "omt_thread")
 
-class TestFeishuFetchMessageText(unittest.TestCase):
-    def _build_adapter(self):
-        from plugins.platforms.feishu.adapter import FeishuAdapter
-
-        adapter = FeishuAdapter.__new__(FeishuAdapter)
-        adapter._bot_open_id = "ou_bot"
-        adapter._bot_user_id = ""
-        adapter._bot_name = "Hermes"
-        adapter._message_text_cache = OrderedDict()
-        adapter._client = Mock()
-        adapter._build_get_message_request = Mock(return_value=object())
-        return adapter
-
-    def test_fetch_message_text_marks_is_self_via_string_id_shape(self):
-        """History-path Mention objects carry id as str + id_type; is_self must still work."""
-        adapter = self._build_adapter()
-        # bot_name is empty — is_self must be detected via open_id alone
-        adapter._bot_name = ""
-
-        bot_mention = SimpleNamespace(
-            key="@_user_1",
-            id="ou_bot",
-            id_type="open_id",
-            name="Hermes",
-        )
-        parent = SimpleNamespace(
-            body=SimpleNamespace(content=json.dumps({"text": "@_user_1 hi"})),
-            msg_type="text",
-            mentions=[bot_mention],
-        )
-        response = Mock()
-        response.success = Mock(return_value=True)
-        response.data = SimpleNamespace(items=[parent])
-        adapter._client.im.v1.message.get = Mock(return_value=response)
-
-        # The rendered text should still have the bot name substituted.
-        result = asyncio.run(adapter._fetch_message_text("m_parent"))
-        self.assertEqual(result, "@Hermes hi")
-
 class TestFeishuMentionEndToEnd(unittest.TestCase):
     """High-level scenarios from the design spec — verify the full pipeline."""
 
@@ -2258,7 +2221,7 @@ class TestFeishuMentionEndToEnd(unittest.TestCase):
         adapter._bot_user_id = ""
         adapter._bot_name = "Hermes"
         adapter._download_feishu_message_resources = AsyncMock(return_value=([], []))
-        adapter._fetch_message_text = AsyncMock(return_value=None)
+        adapter._fetch_quoted_reply = AsyncMock(return_value=QuotedReply())
         adapter.get_chat_info = AsyncMock(return_value={"name": "Test Chat"})
         adapter._resolve_sender_profile = AsyncMock(
             return_value={"user_id": "u1", "user_name": "Alice", "user_id_alt": None}
