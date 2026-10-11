@@ -5,7 +5,7 @@ The client is faked at the SDK boundary (``im.v1.message.get``, ``im.v1.message_
 the live API: ``GET im/v1/messages/{forward}`` returns the forward followed by every descendant
 flattened (``upper_message_id`` = direct container), a forwarded resource downloads only through
 the outermost forward's id, and ``contact/v3/users/batch`` rejects the whole call when any id is
-unknown. All names, ids and texts are synthetic.
+unknown, naming those ids in ``error.field_violations``. All names, ids and texts are synthetic.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import io
 import json
 import os
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
@@ -110,8 +111,11 @@ class FakeFeishu:
     def request(self, request):  # raw tenant GET: contact/v3/users/batch
         self.batch_gets.append(request)
         ids = [value for key, value in request.queries if key == "user_ids"]
-        if any(oid not in self.users for oid in ids):
-            body = {"code": 99992351, "msg": "not a valid {open_id}"}
+        unknown = [oid for oid in ids if oid not in self.users]
+        if unknown:  # as live-probed: the whole call is refused, naming each unknown id
+            body = {"code": 99992351, "msg": "not a valid {open_id}", "error": {"field_violations": [
+                {"field": "user_ids", "value": oid, "description": "id not exist"} for oid in unknown
+            ]}}
         else:
             body = {"code": 0, "data": {"items": [{"open_id": oid, "name": self.users[oid]} for oid in ids]}}
         return SimpleNamespace(raw=SimpleNamespace(content=json.dumps(body).encode()))
@@ -326,8 +330,11 @@ def test_unresolvable_forward_senders_get_neutral_labels_never_raw_ids():
 
     text_out = inbound_forward(make_adapter(client))[0]
 
-    # One unknown id makes Feishu refuse the whole batch; each sender then gets its own lookup.
-    assert len(client.batch_gets) == 1 and sorted(client.user_gets) == ["ou_alice", "ou_external"]
+    # One unknown id makes Feishu refuse the whole batch, naming it; the rest are batched again.
+    assert [[v for k, v in r.queries if k == "user_ids"] for r in client.batch_gets] == [
+        ["ou_alice", "ou_external"], ["ou_alice"],
+    ]
+    assert client.user_gets == []
     assert text_out.splitlines()[1:] == [
         "- Alice: from a colleague",
         "- Participant 1: from outside",
@@ -351,7 +358,75 @@ def test_a_sender_no_lookup_can_name_is_not_looked_up_again_on_the_next_forward(
     second = inbound_forward(adapter)[0]
 
     assert first == second == "[Merged forward message]\n- Alice: from a colleague\n- Participant 1: from someone who left"
-    assert len(client.batch_gets) == 1 and sorted(client.user_gets) == ["ou_alice", "ou_departed"]
+    assert len(client.batch_gets) == 2 and client.user_gets == []  # refused, then the rest; none on the second
+
+
+class FlakyContact(FakeFeishu):
+    """Feishu under load: each batch answer comes from ``batch_answers`` in turn (then rate-limited), and
+    each sender's first single lookup fails transiently (99991400) before it succeeds."""
+
+    def __init__(self, messages, users, batch_answers):
+        super().__init__(messages, users)
+        self.batch_answers = list(batch_answers)
+        self.failed_once: set[str] = set()
+        self.in_flight = self.peak_in_flight = 0
+        self.lock = threading.Lock()
+
+    def request(self, request):
+        self.batch_gets.append(request)
+        body = self.batch_answers.pop(0) if self.batch_answers else RATE_LIMITED
+        return SimpleNamespace(raw=SimpleNamespace(content=json.dumps(body).encode()))
+
+    def _get_user(self, request):
+        with self.lock:
+            self.in_flight += 1
+            self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
+        try:
+            time.sleep(0.02)
+            if request.user_id not in self.failed_once:
+                self.failed_once.add(request.user_id)
+                self.user_gets.append(request.user_id)
+                return SimpleNamespace(success=lambda: False, code=99991400)
+            return super()._get_user(request)
+        finally:
+            with self.lock:
+                self.in_flight -= 1
+
+
+RATE_LIMITED = {"code": 99991400, "msg": "request trigger frequency limit"}
+REFUSED_EXTERNAL = {"code": 99992351, "msg": "not a valid {open_id}", "error": {"field_violations": [
+    {"field": "user_ids", "value": "ou_external", "description": "id not exist"},
+]}}
+
+
+@pytest.mark.parametrize("batch_answers", [[RATE_LIMITED], [REFUSED_EXTERNAL, RATE_LIMITED]],
+                         ids=["batch-rate-limited", "refused-then-rate-limited"])
+def test_a_transient_lookup_failure_never_hides_a_colleagues_name_from_their_own_messages(batch_answers):
+    """Only an id Feishu reports unknown is remembered as nameless: the adapter never looks up a
+    nameless id again, so a guess would strip a real colleague's name from their own messages."""
+    items = [
+        forward_root(),
+        item("om_a", "text", {"text": "from a colleague"}, sender="ou_alice", at=1),
+        item("om_x", "text", {"text": "from outside"}, sender="ou_external", at=2),
+    ]
+    client = FlakyContact({ROOT: items}, {"ou_alice": "Alice"}, batch_answers)
+    adapter = make_adapter(client)
+
+    inbound_forward(adapter)
+    profile = asyncio.run(adapter._resolve_sender_profile(SimpleNamespace(open_id="ou_alice", user_id=None, union_id=None)))
+
+    assert profile["user_name"] == "Alice"
+
+
+def test_single_lookups_after_a_refused_batch_run_a_few_at_a_time():
+    from plugins.platforms.feishu.feishu_names import prefetch_user_names
+
+    ids = [f"ou_user{i:02d}" for i in range(12)]
+    client = FlakyContact({}, {oid: oid for oid in ids}, [RATE_LIMITED])
+
+    asyncio.run(prefetch_user_names(make_adapter(client), ids))
+
+    assert len(client.user_gets) == len(ids) and 1 <= client.peak_in_flight <= 4
 
 
 def test_forward_sender_names_come_from_one_batch_call_and_are_cached():

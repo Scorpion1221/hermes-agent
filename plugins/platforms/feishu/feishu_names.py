@@ -2,10 +2,13 @@
 
 A merge-forward transcript names every distinct sender, so one ``contact/v3/users/batch`` call
 replaces a ``contact/v3/users/{id}`` GET per sender. Feishu rejects the whole batch when any id is
-unknown to the tenant (an external contact, a departed user), so a refused batch falls back to the
-adapter's single lookup for that chunk, and the ids neither call could name are cached as nameless
-("") for the usual TTL: the next forward from that chat does not repeat the refused round trip.
-A transport failure also falls back to single lookups but remembers no misses.
+unknown to the tenant (an external contact, a departed user) and names those ids in the error's
+``field_violations``; they are cached as nameless ("") for the usual TTL, so the next forward does
+not repeat the refused call, and the rest of the chunk is batched again. Only an id Feishu itself
+reported unknown, or one a successful batch answered without a name, is cached as nameless: the
+adapter treats "" as known and never looks the id up again, so a guess there would hide a real
+sender's name from their own messages. A refusal that names no ids, or a failed call, falls back to
+the adapter's single lookup per sender (a few at a time), which caches only the names it finds.
 
 Bot names come from ``bot/v3/bots/basic_batch`` instead: the contact API does not know bots.
 """
@@ -17,14 +20,22 @@ import itertools
 import json
 import logging
 import time
+from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
 _BATCH_SIZE = 50  # contact/v3/users/batch accepts at most 50 user_ids per call
+_SINGLE_LOOKUP_CONCURRENCY = 4  # fallback users/{id} GETs in flight at once
 NAME_CACHE_MAX = 2048
 _NAME_FIELDS = ("name", "display_name", "nickname", "en_name")
-_REFUSED = object()  # Feishu answered, but rejected the batch (some id is unknown to the tenant)
+
+
+@dataclass(frozen=True)
+class _Refused:
+    """Feishu answered but rejected the batch; ``unknown`` = the ids it named as invalid (may be empty)."""
+
+    unknown: frozenset[str]
 
 
 async def prefetch_user_names(adapter: Any, open_ids: Iterable[str]) -> None:
@@ -35,20 +46,34 @@ async def prefetch_user_names(adapter: Any, open_ids: Iterable[str]) -> None:
     for start in range(0, len(pending), _BATCH_SIZE):
         chunk = pending[start:start + _BATCH_SIZE]
         names = await _fetch_user_names(adapter, chunk)
-        if not isinstance(names, dict):  # refused or failed: one lookup per sender
-            await asyncio.gather(*(adapter._resolve_sender_name_from_api(oid) for oid in chunk))
-            if names is None:
-                continue  # transport failure: remember no misses, the next forward retries
-            names = {}
+        unknown: frozenset[str] = frozenset()
+        if isinstance(names, _Refused) and names.unknown:
+            unknown = names.unknown & set(chunk)
+            rest = [oid for oid in chunk if oid not in unknown]
+            names = await _fetch_user_names(adapter, rest) if rest else {}
+        answered: Iterable[str] = chunk
+        if not isinstance(names, dict):  # no usable answer: per-sender lookups, which remember no misses
+            await _resolve_each(adapter, [oid for oid in chunk if oid not in unknown])
+            names, answered = {}, unknown
         expire_at = time.time() + _FEISHU_SENDER_NAME_TTL_SECONDS
         adapter._sender_name_cache.update(
-            (oid, (names.get(oid, ""), expire_at)) for oid in chunk if adapter._get_cached_sender_name(oid) is None
+            (oid, (names.get(oid, ""), expire_at)) for oid in answered if adapter._get_cached_sender_name(oid) is None
         )
     _trim(adapter._sender_name_cache)
 
 
+async def _resolve_each(adapter: Any, open_ids: list[str]) -> None:
+    semaphore = asyncio.Semaphore(_SINGLE_LOOKUP_CONCURRENCY)
+
+    async def resolve(oid: str) -> None:
+        async with semaphore:
+            await adapter._resolve_sender_name_from_api(oid)
+
+    await asyncio.gather(*(resolve(oid) for oid in open_ids))
+
+
 async def _fetch_user_names(adapter: Any, open_ids: list[str]) -> Any:
-    """``{open_id: name}`` for the ids Feishu named, ``_REFUSED``, or None on a transport failure."""
+    """``{open_id: name}`` for the ids Feishu named, a ``_Refused``, or None on a transport failure."""
     try:
         content = await adapter._tenant_get_raw(
             "/open-apis/contact/v3/users/batch",
@@ -58,10 +83,14 @@ async def _fetch_user_names(adapter: Any, open_ids: list[str]) -> Any:
     except Exception:
         logger.debug("[Feishu] Batch user-name lookup failed", exc_info=True)
         return None
-    code = payload.get("code") if isinstance(payload, dict) else None
-    if code != 0:
-        logger.debug("[Feishu] Batch user-name lookup refused: code=%s", code)
-        return _REFUSED
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("code") != 0:
+        logger.debug("[Feishu] Batch user-name lookup refused: code=%s", payload.get("code"))
+        violations = (payload.get("error") or {}).get("field_violations") or []
+        return _Refused(frozenset(
+            str(v["value"]) for v in violations if isinstance(v, dict) and v.get("field") == "user_ids" and v.get("value")
+        ))
     names: dict[str, str] = {}
     for user in (payload.get("data") or {}).get("items") or []:
         if not isinstance(user, dict):
