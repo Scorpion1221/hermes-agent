@@ -3,8 +3,9 @@
 A post body is ``{"title", "content": [[element, ...], ...], "files": [...]}``, either direct (as GET
 returns it) or wrapped per locale (``{"zh_cn": {...}}``, optionally under ``"post"``). ``content`` rows
 hold inline elements (text, links, mentions, images, files). ``files`` is the attachment zone the composer
-sends beside the text (``{"file_key", "file_name", "is_folder"}``);
-folder entries there are skipped.
+sends beside the text: ``{"file_key", "file_name", "is_folder"}`` as received, ``{"key", "name"}`` as the
+send API spells them, and a locale-wrapped post may carry it beside the locales rather than inside one.
+Folder entries there are skipped.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ class FeishuPostParseResult:
 def parse_feishu_post_payload(
     payload: Any, *, mentions_map: Optional[dict[str, FeishuMentionRef]] = None,
 ) -> FeishuPostParseResult:
-    from .adapter import FALLBACK_POST_TEXT, _normalize_feishu_text, _to_boolean
+    from .adapter import FALLBACK_POST_TEXT, _normalize_feishu_text
 
     resolved = _resolve_post_payload(payload)
     if not resolved:
@@ -52,44 +53,59 @@ def parse_feishu_post_payload(
         )
         if row_text:
             parts.append(row_text)
-    for entry in resolved.get("files", []) or []:
-        if (
-            not isinstance(entry, dict)
-            or _to_boolean(entry.get("is_folder"))
-            or not str(entry.get("file_key", "")).strip()
-        ):
-            continue
-        placeholder = _render_post_element(
-            {**entry, "tag": "file"}, image_keys, media_refs, mentions_map,
-        )
-        if placeholder:
-            parts.append(placeholder)
+    parts += _render_attachment_zone(resolved["files"], image_keys, media_refs)
     return FeishuPostParseResult(
         text_content="\n".join(parts).strip() or FALLBACK_POST_TEXT, image_keys=image_keys, media_refs=media_refs,
     )
 
 
+def _render_attachment_zone(entries: list[Any], image_keys: list[str], media_refs: list[FeishuPostMediaRef]) -> list[str]:
+    """Placeholders for the attachment zone's files, each key once (inline rows included); folders are skipped."""
+    from .adapter import _to_boolean
+
+    parts: list[str] = []
+    for entry in entries:
+        file_key = _first_text(entry, "file_key", "key")
+        if not file_key or _to_boolean(entry.get("is_folder")):
+            continue
+        file_name = _first_text(entry, "file_name", "name", "title", "text")
+        parts.append(_render_post_element(
+            {"tag": "file", "file_key": file_key, "file_name": file_name}, image_keys, media_refs,
+        ))
+    return [part for part in parts if part]
+
+
+def _first_text(entry: Any, *keys: str) -> str:
+    values = (entry.get(key) for key in keys) if isinstance(entry, dict) else ()
+    return next((value.strip() for value in values if isinstance(value, str) and value.strip()), "")
+
+
 def _resolve_post_payload(payload: Any) -> dict[str, Any]:
     direct = _to_post_payload(payload)
-    if direct:
+    if direct or not isinstance(payload, dict):
         return direct
-    if not isinstance(payload, dict):
-        return {}
-    return _resolve_locale_payload(payload.get("post")) or _resolve_locale_payload(payload)
+    wrapped = _resolve_locale_payload(payload.get("post"))
+    return _with_outer_files(wrapped, payload) if wrapped else _resolve_locale_payload(payload)
 
 
 def _resolve_locale_payload(payload: Any) -> dict[str, Any]:
     direct = _to_post_payload(payload)
-    if direct:
+    if direct or not isinstance(payload, dict):
         return direct
-    if not isinstance(payload, dict):
-        return {}
     # Preferred locales first, then any locale that carries a content list.
     preferred = (payload.get(key) for key in _PREFERRED_LOCALES)
     for candidate in map(_to_post_payload, itertools.chain(preferred, payload.values())):
         if candidate:
-            return candidate
+            return _with_outer_files(candidate, payload)
     return {}
+
+
+def _with_outer_files(resolved: dict[str, Any], container: dict[str, Any]) -> dict[str, Any]:
+    """A locale-wrapped post's attachment zone beside the locales joins the one inside the chosen locale."""
+    outer = container.get("files")
+    if isinstance(outer, list):
+        resolved["files"] = [*outer, *resolved["files"]]
+    return resolved
 
 
 def _to_post_payload(candidate: Any) -> dict[str, Any]:
