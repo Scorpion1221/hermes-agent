@@ -3083,10 +3083,10 @@ class FeishuAdapter(BasePlatformAdapter):
         from .feishu_names import fetch_bot_names
         return await fetch_bot_names(self, bot_ids)
 
-    async def _fetch_quoted_reply(self, message_id: Optional[str], inbound: Any = None) -> Any:
-        """The quoted message's chain text, own-message flag and media; see ``feishu_quote``."""
+    async def _fetch_quoted_reply(self, message_id: Optional[str], inbound: Any = None, *, media: bool = True) -> Any:
+        """The quoted message's chain text, own-message flag and (unless ``media=False``) media; see ``feishu_quote``."""
         from .feishu_quote import fetch_quoted_reply
-        return await fetch_quoted_reply(self, message_id, inbound=inbound)
+        return await fetch_quoted_reply(self, message_id, inbound=inbound, media=media)
 
     @staticmethod
     def _default_image_media_type(ext: str) -> str:

@@ -37,7 +37,8 @@ async def handle_reaction_event(adapter: Any, event_type: str, data: Any) -> Non
         return
     emoji_type = str(getattr(getattr(event, "reaction_type", None), "emoji_type", "") or "UNKNOWN")
     action = "added" if "created" in event_type else "removed"
-    reply_to_text = await adapter._fetch_message_text(message_id)
+    # The reacted message as a quote (its reply chain, cards as their text); a reaction attaches no media.
+    reply_to_text = (await adapter._fetch_quoted_reply(message_id, media=False)).text
     logger.info("[Feishu] Routing reaction %s:%s on bot message %s as synthetic event", action, emoji_type, message_id)
     await adapter._dispatch_synthetic_event(
         text=f"reaction:{action}:{emoji_type}", message_type=MessageType.TEXT, chat_id=chat_id,

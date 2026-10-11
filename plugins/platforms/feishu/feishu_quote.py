@@ -63,8 +63,13 @@ class QuotedReply:
     media_types: list[str] = field(default_factory=list)
 
 
-async def fetch_quoted_reply(adapter: Any, message_id: Optional[str], *, inbound: Any = None) -> QuotedReply:
-    """What the ``inbound`` message needs from the message it quotes; empty when nothing is quoted or it can't be read."""
+async def fetch_quoted_reply(
+    adapter: Any, message_id: Optional[str], *, inbound: Any = None, media: bool = True,
+) -> QuotedReply:
+    """What the ``inbound`` message needs from the message it quotes; empty when nothing is quoted or it can't be read.
+
+    ``media=False`` reads the chain text only: nothing is downloaded (a reaction quotes without attaching).
+    """
     if not message_id or not adapter._client:
         return QuotedReply()
     deadline = asyncio.get_running_loop().time() + CHAIN_BUDGET_SECONDS
@@ -72,7 +77,7 @@ async def fetch_quoted_reply(adapter: Any, message_id: Optional[str], *, inbound
     if quoted is None:
         return QuotedReply()
     (ancestors, complete), (media_urls, media_types, folder_text) = await asyncio.gather(
-        _walk_ancestors(adapter, quoted, deadline), _attachments(adapter, quoted, inbound, deadline),
+        _walk_ancestors(adapter, quoted, deadline), _attachments(adapter, quoted, inbound, deadline, media),
     )
     if folder_text:
         quoted = dataclasses.replace(quoted, text=f"{quoted.text}\n\n{folder_text}" if quoted.text else folder_text)
@@ -169,13 +174,15 @@ def _quotes_explicitly(inbound: Any) -> bool:
     return bool(parent_id) and not (in_topic and parent_id == getattr(inbound, "root_id", None))
 
 
-async def _attachments(adapter: Any, quoted: QuoteNode, inbound: Any, deadline: float) -> tuple[list[str], list[str], str]:
+async def _attachments(
+    adapter: Any, quoted: QuoteNode, inbound: Any, deadline: float, media: bool,
+) -> tuple[list[str], list[str], str]:
     """The quoted message's attachments and folder trees as fetched by the deadline; none while still running."""
     # Quoted audio stays a text placeholder: attached, the gateway would transcribe it as the user's own voice.
     image_keys = list(quoted.image_keys[:MAX_QUOTED_MEDIA])
     files = [ref for ref in quoted.media_refs if ref.resource_type != "audio"]
     media_refs = files[:MAX_QUOTED_MEDIA - len(image_keys)]
-    if not (image_keys or media_refs or quoted.folder_refs) or not _quotes_explicitly(inbound):
+    if not media or not (image_keys or media_refs or quoted.folder_refs) or not _quotes_explicitly(inbound):
         return [], [], ""
     cache: OrderedDict[str, asyncio.Future] = vars(adapter).setdefault("_quote_media_cache", OrderedDict())
     download = cache.get(quoted.message_id)

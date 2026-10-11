@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -11,8 +13,10 @@ import pytest
 from gateway.config import PlatformConfig
 from gateway.platforms.base import _reply_anchor_for_event
 from gateway.platforms.event import MessageEvent, MessageType
+from tests.gateway.test_feishu_fetched_content import json_card, markdown, text
 
 _SELF_APP = "cli_self_app"
+_BOT_CARD = json_card([markdown(text("Shall I book the "), text("9:00", "bold"), text(" slot?"))])
 
 
 def _adapter():
@@ -23,15 +27,26 @@ def _adapter():
     return adapter
 
 
-def _client(*, msg=None, reply=None):
-    get = Mock(return_value=SimpleNamespace(success=lambda: True, data=SimpleNamespace(items=[msg] if msg else [])))
+def _client(*, msg=None, reply=None, others=()):
+    """``GET im/v1/messages/{id}`` answers from ``msg`` and ``others`` by id."""
+    messages = {m.message_id: m for m in (msg, *others) if m}
+
+    def _get(request):
+        found = messages.get(request.message_id)
+        return SimpleNamespace(success=lambda: True, data=SimpleNamespace(items=[found] if found else []))
+
     reply = reply or Mock(return_value=SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_reply")))
-    return SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=SimpleNamespace(get=get, reply=reply))))
+    return SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(
+        message=SimpleNamespace(get=Mock(side_effect=_get), reply=reply),
+        message_resource=SimpleNamespace(get=Mock()),
+    )))
 
 
-def _bot_message(*, thread_id=None, sender_app=_SELF_APP):
+def _bot_message(*, thread_id=None, sender_app=_SELF_APP, msg_type="interactive", content=_BOT_CARD, parent_id=""):
+    """A message this bot sent (a Card JSON 2.0 reply by default), as ``GET im/v1/messages`` reports it."""
     return SimpleNamespace(
-        message_id="om_bot", chat_id="oc_chat", chat_type="group", thread_id=thread_id,
+        message_id="om_bot", chat_id="oc_chat", chat_type="group", thread_id=thread_id, msg_type=msg_type,
+        parent_id=parent_id, mentions=None, body=SimpleNamespace(content=json.dumps(content)),
         sender=SimpleNamespace(sender_type="app", id=sender_app, id_type="app_id"),
     )
 
@@ -46,9 +61,8 @@ def _reaction(event_id, *, emoji="THUMBSUP", message_id="om_bot"):
     )
 
 
-def _wire_routing(adapter, msg):
-    adapter._client = _client(msg=msg)
-    adapter._fetch_message_text = AsyncMock(return_value="Shall I book the 9:00 slot?")
+def _wire_routing(adapter, msg, *, others=()):
+    adapter._client = _client(msg=msg, others=others)
     adapter._resolve_sender_profile = AsyncMock(
         return_value={"user_id": "ou_human", "user_name": "Human", "user_id_alt": None})
     adapter.get_chat_info = AsyncMock(return_value={"name": "Ops", "type": "group"})
@@ -74,10 +88,45 @@ def test_reaction_on_own_message_replies_to_it_with_quote_and_topic():
     [event] = routed
     assert event.text == "reaction:added:DONE"
     assert event.reply_to_message_id == "om_bot"
-    assert event.reply_to_text == "Shall I book the 9:00 slot?"
+    assert event.reply_to_text == "Shall I book the **9:00** slot?"  # the card's content, not "please upgrade"
     assert event.reply_to_is_own_message is True
     assert event.source.thread_id == "omt_topic"  # the topic session, not the chat's main session
-    adapter._fetch_message_text.assert_awaited_once_with("om_bot")
+    quote_get = adapter._client.im.v1.message.get.call_args_list[-1].args[0]
+    assert (quote_get.message_id, quote_get.card_msg_content_type) == ("om_bot", "raw_card_content")
+
+
+def test_reaction_on_a_bot_reply_quotes_the_reply_chain_above_it():
+    adapter = _adapter()
+    adapter._sender_name_cache["ou_human"] = ("Human", time.time() + 600)
+    question = SimpleNamespace(
+        message_id="om_question", msg_type="text", parent_id="", mentions=None,
+        body=SimpleNamespace(content=json.dumps({"text": "Can you find a room for Monday?"})),
+        sender=SimpleNamespace(sender_type="user", id="ou_human", id_type="open_id"),
+    )
+    routed = _wire_routing(adapter, _bot_message(parent_id="om_question"), others=[question])
+
+    _route(adapter, _reaction("evt_1"))
+
+    [event] = routed
+    assert event.reply_to_text.splitlines() == [
+        "Earlier messages in this reply chain, oldest first:",
+        "- Human (text): Can you find a room for Monday?",
+        "Directly quoted message (card, from You):",
+        "Shall I book the **9:00** slot?",
+    ]
+
+
+def test_reaction_on_a_bot_image_quotes_it_without_downloading_it():
+    """The synthetic event carries no media, so the reacted message's files are not fetched."""
+    adapter = _adapter()
+    routed = _wire_routing(adapter, _bot_message(msg_type="image", content={"image_key": "img_chart"}))
+
+    _route(adapter, _reaction("evt_1"))
+
+    [event] = routed
+    assert event.reply_to_text == "[Image]"
+    assert event.media_urls == []
+    adapter._client.im.v1.message_resource.get.assert_not_called()
 
 
 def test_removed_reaction_routes_as_removed():
@@ -97,7 +146,7 @@ def test_reaction_on_peer_bot_message_is_not_routed():
     _route(adapter, _reaction("evt_1"))
 
     assert routed == []
-    adapter._fetch_message_text.assert_not_awaited()
+    assert adapter._client.im.v1.message.get.call_count == 1  # the sender check only; nothing quoted
 
 
 def test_each_reaction_is_its_own_inbound_message_and_a_redelivery_is_not():
