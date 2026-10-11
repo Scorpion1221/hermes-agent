@@ -607,3 +607,76 @@ def test_a_quoted_reply_reaches_the_agent_before_the_senders_next_message():
     )
 
     assert [(turn.text, turn.reply_to_message_id) for turn in turns] == [("see this", "om_4"), ("and fix it", None)]
+
+
+
+def handled_order(client, *events):
+    """Deliver ``events`` concurrently, in arrival order, through the real inbound path; return the ids
+    in the order they reach dispatch (before any batching). The client's slow calls are released as
+    soon as one event is dispatched, so a held event costs the test nothing once it is let through."""
+    from unittest.mock import AsyncMock
+
+    adapter = make_adapter(client)
+    adapter._admit = lambda sender, message: None
+    adapter.get_chat_info = AsyncMock(return_value={"name": "Group", "type": "group"})
+    order = []
+
+    async def record(event):
+        order.append(event.message_id)
+        client.released.set()
+
+    adapter._dispatch_inbound_event = record
+
+    async def deliver():
+        await asyncio.gather(*(adapter._handle_message_event_data(event) for event in events))
+
+    try:
+        asyncio.run(deliver())
+    finally:
+        client.released.set()
+    return order
+
+
+@pytest.mark.parametrize("command", ["/stop", "/approve"])
+def test_a_command_is_not_held_behind_the_senders_slow_quote(command):
+    """Control commands must reach the busy guard at once, not after a slow quote's chain walk."""
+    client = ChainFeishu(alternating_chain(2), slow={"om_2"}, slow_delay=10)
+
+    order = handled_order(
+        client, inbound("om_quote", {"text": "about this"}, parent="om_2"), inbound("om_cmd", {"text": command}),
+    )
+
+    assert order == ["om_cmd", "om_quote"]
+
+
+def test_a_slow_topic_post_does_not_hold_the_senders_next_message_in_that_topic():
+    """A topic post only names the topic's root (``root_id``): it quotes nothing, so a slow one (here
+    a video still downloading) does not hold back the sender's next message."""
+    client = ChainFeishu(
+        {"om_root": [msg("om_root", {"text": "topic"})]}, slow={"file_video"}, slow_delay=10,
+        resource_types={"file_video": "video/mp4"},
+    )
+
+    order = handled_order(
+        client,
+        inbound("om_t1", {"file_key": "file_video", "file_name": "demo.mp4"}, root="om_root", thread="omt_topic",
+                message_type="media"),
+        inbound("om_t2", {"text": "what happens at 0:42?"}, root="om_root", thread="omt_topic"),
+    )
+
+    assert order == ["om_t2", "om_t1"]
+
+
+def test_a_slow_quote_in_one_topic_does_not_hold_the_senders_message_in_another():
+    client = ChainFeishu(
+        {"om_root": [msg("om_root", {"text": "topic"})], "om_img": [msg("om_img", {"text": "q"}, parent="om_root")]},
+        slow={"om_img"}, slow_delay=10,
+    )
+
+    order = handled_order(
+        client,
+        inbound("om_a", {"text": "this one?"}, parent="om_img", root="om_root", thread="omt_one"),
+        inbound("om_b", {"text": "unrelated"}, root="om_other", thread="omt_two"),
+    )
+
+    assert order == ["om_b", "om_a"]
