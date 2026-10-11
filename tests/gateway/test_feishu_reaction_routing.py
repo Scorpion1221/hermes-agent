@@ -182,6 +182,18 @@ def test_reaction_on_a_bot_image_quotes_it_without_downloading_it():
     adapter._client.im.v1.message_resource.get.assert_not_called()
 
 
+def test_a_reaction_fetches_the_reacted_message_once():
+    adapter = _adapter()
+    routed = _wire_routing(adapter, _bot_message())
+
+    _route(adapter, _reaction("evt_1"))
+
+    [event] = routed
+    assert event.reply_to_text == "Shall I book the **9:00** slot?"
+    gets = [call.args[0] for call in adapter._client.im.v1.message.get.call_args_list]
+    assert [(r.message_id, getattr(r, "card_msg_content_type", None)) for r in gets] == [("om_bot", "raw_card_content")]
+
+
 def test_removed_reaction_routes_as_removed():
     adapter = _adapter()
     routed = _wire_routing(adapter, _bot_message())

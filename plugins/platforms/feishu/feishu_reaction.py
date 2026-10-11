@@ -51,19 +51,25 @@ async def handle_reaction_event(adapter: Any, event_type: str, data: Any) -> Non
 
 
 async def _own_message(adapter: Any, message_id: str) -> Any:
-    """The reacted-to message when this bot sent it, else None."""
+    """The reacted-to message when this bot sent it, else None. Fetched once, as the quote reads it: the
+    node is cached, so quoting the message below costs no second GET."""
+    from .feishu_forward import fetch_message_items
+    from .feishu_quote import cache_node
+
     try:
-        request = adapter._build_get_message_request(message_id)
-        response = await adapter._run_blocking(adapter._client.im.v1.message.get, request)
+        items = await fetch_message_items(adapter, message_id)
     except Exception:
         logger.debug("[Feishu] Failed to fetch message for reaction routing", exc_info=True)
         return None
-    items = getattr(getattr(response, "data", None), "items", None) if adapter._response_succeeded(response) else None
     msg = items[0] if items else None
     # GET im/v1/messages reports sender.id=app_id for bot messages — peer bots share sender_type="app"
     # with us but differ on app_id. Only route our own messages.
     if msg is None or str(getattr(getattr(msg, "sender", None), "id", "") or "") != adapter._app_id:
         return None
+    try:
+        await cache_node(adapter, message_id, items)
+    except Exception:  # the quote then fetches it again
+        logger.debug("[Feishu] Failed to read reacted message %s as a quote", message_id, exc_info=True)
     return msg
 
 

@@ -91,7 +91,6 @@ async def fetch_quoted_reply(
 
 async def fetch_node(adapter: Any, message_id: str) -> Optional[QuoteNode]:
     """``message_id`` as a chain node (LRU-cached on the adapter); None when it can't be fetched."""
-    from .adapter import _FEISHU_MESSAGE_TEXT_CACHE_SIZE
     from .feishu_forward import fetch_message_items
 
     cache = adapter._quote_node_cache
@@ -100,13 +99,20 @@ async def fetch_node(adapter: Any, message_id: str) -> Optional[QuoteNode]:
         return cache[message_id]
     try:
         items = await fetch_message_items(adapter, message_id)
-        if not items:
-            return None
-        node = await _build_node(adapter, message_id, items)
+        return await cache_node(adapter, message_id, items) if items else None
     except Exception:
         logger.warning("[Feishu] Failed to fetch quoted message %s", message_id, exc_info=True)
         return None
+
+
+async def cache_node(adapter: Any, message_id: str, items: list[Any]) -> QuoteNode:
+    """``items`` (a raw-card GET of ``message_id``) as a chain node, cached for whatever quotes it next."""
+    from .adapter import _FEISHU_MESSAGE_TEXT_CACHE_SIZE
+
+    node = await _build_node(adapter, message_id, items)
+    cache = adapter._quote_node_cache
     cache[message_id] = node
+    cache.move_to_end(message_id)
     while len(cache) > _FEISHU_MESSAGE_TEXT_CACHE_SIZE:
         cache.popitem(last=False)
     return node
