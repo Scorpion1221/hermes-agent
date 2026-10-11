@@ -16,6 +16,7 @@ import os
 import time
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
+from urllib.parse import unquote
 
 import pytest
 
@@ -51,7 +52,7 @@ class FolderFeishu(FakeFeishu):
 
     def request(self, request):  # raw tenant GET: the folder listing
         self.listings.append(request)
-        folder_key = PurePosixPath(request.uri).parent.name
+        folder_key = unquote(PurePosixPath(request.uri).parent.name)  # Feishu decodes the path segment
         body = self.bodies.get(folder_key, {"code": 0, "data": {"all_count": 0, "items": self.trees.get(folder_key, [])}})
         return SimpleNamespace(raw=SimpleNamespace(content=body if isinstance(body, bytes) else json.dumps(body).encode()))
 
@@ -291,7 +292,7 @@ def test_a_file_named_as_an_image_that_is_not_one_is_still_kept_as_a_file():
     assert event.media_types[1:] == ["application/octet-stream"]
 
 
-def test_malformed_entries_are_reported_and_a_key_listed_twice_is_downloaded_once():
+def test_malformed_entries_are_reported_and_the_readable_ones_still_arrive():
     incomplete = folder_node("fld_partial", "partial", [])
     incomplete["children_count"] = 3
     client = FolderFeishu(
@@ -306,6 +307,38 @@ def test_malformed_entries_are_reported_and_a_key_listed_twice_is_downloaded_onc
     listing = listing_of(event)
     assert [e["path"] for e in listing["entries"]] == ["a.txt", "partial", "bad"]
     assert "Some entries of the folder could not be read and are not listed." in event.text
+
+
+def test_a_key_listed_twice_is_listed_and_downloaded_once_even_a_folder_listed_inside_itself():
+    def looping(levels):  # a folder listed again inside itself, as a listing that loops would show it
+        children = [leaf("fil_b", "b.txt", b"b")]
+        return folder_node("fld_loop", "loop", children + ([looping(levels - 1)] if levels else []))
+
+    client = FolderFeishu(
+        trees={"fld_root": [leaf("fil_a", "a.txt", b"a"), looping(5), leaf("fil_a", "a-again.txt", b"a")]},
+        files={"fil_a": b"a", "fil_b": b"b"},
+    )
+
+    event = send(client, folder_message())
+
+    assert sorted(client.downloaded) == ["fil_a", "fil_b"]
+    listing = listing_of(event)
+    assert [e["path"] for e in listing["entries"]] == ["a.txt", "loop", "loop/b.txt"]
+    assert listing["notices"] == []
+    assert event.text.splitlines()[0] == 'Contents of folder "project" (2 files, 1 subfolder):'
+    assert [Path(path).read_bytes() for path in files_urls(event)] == [b"a", b"b"]
+
+
+def test_a_folder_key_is_sent_as_one_encoded_path_segment():
+    key = "fld/../x?y=1#z"
+    client = FolderFeishu(trees={key: [leaf("fil_a", "a.txt", b"a")]}, files={"fil_a": b"a"})
+
+    event = send(client, folder_message(key=key))
+
+    request, = client.listings
+    assert request.uri == "/open-apis/im/v1/files/fld%2F..%2Fx%3Fy%3D1%23z/folder"
+    assert dict(request.queries) == {"srctype": "message", "srcid": "om_folder", "recursive": "true"}
+    assert [Path(path).read_bytes() for path in files_urls(event)] == [b"a"]
 
 
 @pytest.mark.parametrize("marker", [{"has_more": True}, {"page_token": "next"}])
@@ -478,29 +511,50 @@ def test_a_quoted_image_without_a_folder_is_attached_and_nothing_is_listed():
     assert event.media_types == ["image/png"]
 
 
-def test_a_folder_is_listed_and_downloaded_without_blocking_the_event_loop():
-    client = FolderFeishu(trees={"fld_root": [leaf("fil_a", "a.txt", b"a")]}, files={"fil_a": b"a"})
-    adapter = make_adapter(client)
+def _on_event_loop_thread():
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
 
-    async def run():
-        from plugins.platforms.feishu.adapter import FeishuPostMediaRef
-        from plugins.platforms.feishu.feishu_folder import fetch_folders
 
-        ticks = 0
+def test_a_folder_is_listed_downloaded_and_cached_off_the_event_loop(monkeypatch):
+    """Listing, downloads and every cache write (file, not-an-image fallback, listing) run on worker threads."""
+    import gateway.platforms.base as base
 
-        async def ticker():
-            nonlocal ticks
-            while True:
-                ticks += 1
-                await asyncio.sleep(0)
+    calls = []
 
-        task = asyncio.ensure_future(ticker())
-        content = await fetch_folders(adapter, "om_folder", [FeishuPostMediaRef(file_key="fld_root", file_name="p", resource_type="folder")])
-        task.cancel()
-        return content, ticks
+    class WatchedFolderFeishu(FolderFeishu):
+        def request(self, request):
+            calls.append(("listing", _on_event_loop_thread()))
+            return super().request(request)
 
-    content, ticks = asyncio.run(run())
-    assert len(files_urls(content)) == 1 and ticks > 0
+        def _get_resource(self, request):
+            calls.append(("download", _on_event_loop_thread()))
+            return super()._get_resource(request)
+
+    def watched(name):
+        real = getattr(base, name)
+
+        def write(*args, **kwargs):
+            calls.append((name, _on_event_loop_thread()))
+            return real(*args, **kwargs)
+
+        return write
+
+    for name in ("cache_media_bytes", "cache_document_from_bytes"):
+        monkeypatch.setattr(base, name, watched(name))
+    client = WatchedFolderFeishu(
+        trees={"fld_root": [leaf("fil_a", "a.txt", b"a"), leaf("fil_fake", "photo.png", b"not an image")]},
+        files={"fil_a": b"a", "fil_fake": b"not an image"}, types={"fil_fake": "image/png"},
+    )
+
+    event = send(client, folder_message())
+
+    assert [Path(path).read_bytes() for path in files_urls(event)] == [b"a", b"not an image"]
+    assert {name for name, _ in calls} == {"listing", "download", "cache_media_bytes", "cache_document_from_bytes"}
+    assert [name for name, on_loop in calls if on_loop] == []
 
 
 # --- a folder and the note behind it ---

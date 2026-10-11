@@ -76,6 +76,26 @@ def test_a_folder_routed_to_another_profile_leaves_nothing_behind_and_its_listin
     assert str(a) not in event.text
 
 
+def test_a_folder_with_more_files_than_attachment_room_downloads_only_those_it_attaches(two_homes):
+    """Not just "nothing left behind": a file that could never be attached is never requested from Feishu."""
+    from plugins.platforms.feishu.feishu_folder import MAX_MEDIA
+
+    a, b = two_homes
+    count = MAX_MEDIA + 4
+    files = {f"fil_{n:02d}": f"file {n}".encode() for n in range(count)}
+    client = FolderFeishu(trees={"fld_root": [leaf(key, f"{key}.txt", data) for key, data in files.items()]}, files=files)
+    event = dispatched_event(make_adapter(client), folder_message())
+
+    room = MAX_MEDIA - 1  # the listing takes the first slot
+    assert sorted(client.downloaded) == list(files)[:room]  # a few download at once, in any order
+    assert f"- fil_{count - 1:02d}.txt (not downloaded: file limit reached)" in event.text
+    with _profile_runtime_scope(b):
+        rehome_inbound_media(event)
+    attached = [Path(url) for url in event.media_urls if not url.endswith(".folder.json")]
+    assert [path.read_bytes() for path in attached] == list(files.values())[:room]
+    assert launch_cache_files(a) == []
+
+
 def test_two_events_quoting_one_image_each_carry_their_own_file_to_their_profile(two_homes):
     a, b = two_homes
     client = ChainFeishu({"om_img": [msg("om_img", {"image_key": "img_chart"}, msg_type="image")]})
