@@ -366,6 +366,48 @@ def test_a_slow_quoted_message_costs_at_most_the_budget_and_the_next_reply_finds
     assert second.text == expected
 
 
+def test_a_stalled_sender_name_lookup_costs_at_most_its_budget_and_leaves_neutral_labels():
+    """The chain arrived in time but naming its senders stalls: the reply goes out with neutral labels
+    (never raw ids), and the names the abandoned lookup finds serve the next reply."""
+    import plugins.platforms.feishu.feishu_quote as quote
+
+    messages = {
+        "om_1": [msg("om_1", {"text": "the question"}, sender="ou_alice")],
+        "om_2": [msg("om_2", {"text": "the answer"}, parent="om_1", sender="ou_bob")],
+    }
+    client = ChainFeishu(messages)
+    batch_lookup, lookup_started = client.request, threading.Event()
+
+    def stalled_batch_lookup(raw_request):  # contact/v3/users/batch, on the adapter's SDK executor thread
+        lookup_started.set()
+        client.released.wait(10)
+        return batch_lookup(raw_request)
+
+    client.request = stalled_batch_lookup
+    adapter = make_adapter(client)
+
+    async def two_replies():
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        first = await quote.fetch_quoted_reply(adapter, "om_2")
+        elapsed = loop.time() - start
+        client.released.set()
+        await asyncio.gather(*adapter._quote_background_fetches)
+        return first, elapsed, await quote.fetch_quoted_reply(adapter, "om_2")
+
+    first, elapsed, second = asyncio.run(two_replies())
+
+    assert lookup_started.is_set()
+    assert elapsed < 3  # stopped at the names' 0.5s budget, not after the 10s stall
+    assert first.text.split("\n") == [
+        "Earlier messages in this reply chain, oldest first:",
+        "- Participant 1 (text): the question",
+        "Directly quoted message (text, from Participant 2):",
+        "the answer",
+    ]
+    assert second.text.split("\n")[1:3] == ["- Alice (text): the question", "Directly quoted message (text, from Bob):"]
+
+
 def test_an_ancestor_fetch_the_budget_abandoned_completes_into_the_cache(monkeypatch):
     import plugins.platforms.feishu.feishu_quote as quote
 

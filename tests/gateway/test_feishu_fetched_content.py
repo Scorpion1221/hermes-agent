@@ -371,6 +371,26 @@ def test_long_forward_is_cut_at_the_entry_budget_and_says_how_much_is_missing():
     assert lines[-1] == "- … 30 more forwarded message(s) not shown"
 
 
+def test_long_forward_is_cut_at_the_char_budget_and_says_how_much_is_missing():
+    """Entries each within the per-entry cap, few enough for the entry cap, together over the char budget."""
+    from plugins.platforms.feishu.feishu_forward import MAX_ENTRY_CHARS, MAX_FORWARD_CHARS, MAX_FORWARD_ENTRIES
+
+    body = "x" * (MAX_ENTRY_CHARS // 2)
+    count = MAX_FORWARD_CHARS // len(body) + 3
+    assert count < MAX_FORWARD_ENTRIES
+    items = [forward_root()] + [item(f"om_t{i}", "text", {"text": body}, at=i) for i in range(count)]
+    client = FakeFeishu({ROOT: items}, users={"ou_alice": "Alice"})
+
+    header, *entries, more = inbound_forward(make_adapter(client))[0].split("\n")
+
+    assert header == "[Merged forward message]"
+    assert 0 < len(entries) < count
+    assert more == f"- … {count - len(entries)} more forwarded message(s) not shown"
+    assert entries[:-1] == [f"- Alice: {body}"] * (len(entries) - 1)  # whole until the budget runs out
+    assert entries[-1].startswith(f"- Alice: {body[:10]}") and entries[-1].endswith("…")
+    assert sum(len(line) + 1 for line in entries) < MAX_FORWARD_CHARS + 100  # the budget plus one line's label
+
+
 def test_unresolvable_forward_senders_get_neutral_labels_never_raw_ids():
     items = [
         forward_root(),
