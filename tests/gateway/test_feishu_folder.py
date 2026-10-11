@@ -13,6 +13,7 @@ import asyncio
 import io
 import json
 import os
+import time
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
@@ -21,7 +22,9 @@ import pytest
 from tests.gateway.test_feishu_fetched_content import (  # noqa: F401  (autouse SDK fakes)
     FakeFeishu,
     _fake_lark_requests,
+    delivered_turns,
     dispatched_event,
+    inbound_event,
     inbound_message,
     item,
     make_adapter,
@@ -114,7 +117,7 @@ def test_a_folder_message_lists_its_tree_and_attaches_its_files_from_the_carryin
     assert request.uri == "/open-apis/im/v1/files/fld_root/folder"
     assert dict(request.queries) == {"srctype": "message", "srcid": "om_folder", "recursive": "true"}
     assert [(r.message_id, r.type) for r in client.resource_gets] == [("om_folder", "file")] * 3
-    assert event.message_type.value == "document"
+    assert event.message_type.value == "text"  # so the note Feishu sends behind it joins its turn
     file_urls = files_urls(event)
     assert event.text.splitlines()[:6] == [
         'Contents of folder "project" (3 files, 2 subfolders):',
@@ -495,3 +498,75 @@ def test_a_folder_is_listed_and_downloaded_without_blocking_the_event_loop():
 
     content, ticks = asyncio.run(run())
     assert len(files_urls(content)) == 1 and ticks > 0
+
+
+# --- a folder and the note behind it ---
+
+class SlowFolderFeishu(FolderFeishu):
+    """File downloads take ``delay`` seconds each (on the adapter's SDK executor thread)."""
+
+    def __init__(self, *args, delay, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.delay = delay
+
+    def _get_resource(self, request):
+        time.sleep(self.delay)
+        return super()._get_resource(request)
+
+
+def test_a_note_sent_behind_a_folder_joins_its_turn_folder_first():
+    """Feishu sends a folder without a caption, so "folder, then instruction" is the normal use."""
+    files = {f"fil_{n}": f"file {n}".encode() for n in range(4)}
+    client = SlowFolderFeishu(
+        trees={"fld_root": [leaf(key, f"{key}.txt", data) for key, data in files.items()]}, files=files, delay=0.2,
+    )
+
+    turns = delivered_turns(
+        make_adapter(client),
+        inbound_event("om_folder", "folder", json.dumps({"file_key": "fld_root", "file_name": "project"})),
+        inbound_event("om_note", "text", json.dumps({"text": "please review these"})),
+    )
+
+    (turn,) = turns
+    assert turn.startswith('Contents of folder "project" (4 files, 0 subfolders):\n')
+    assert turn.endswith("\nplease review these")
+
+
+def test_folder_downloads_stop_at_the_time_budget_and_say_which_files_were_cut_off(monkeypatch):
+    import plugins.platforms.feishu.feishu_forward_order as forward_order
+
+    monkeypatch.setattr(forward_order, "DOWNLOAD_BUDGET_SECONDS", 0.3)
+    files = {f"fil_{n}": b"x" for n in range(12)}
+    client = SlowFolderFeishu(
+        trees={"fld_root": [leaf(key, f"{key}.txt", data) for key, data in files.items()]}, files=files, delay=0.25,
+    )
+
+    start = time.monotonic()
+    event = send(client, folder_message())
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 3  # 12 files at 0.25s, 4 at a time, would take 0.75s+ without the budget
+    statuses = [e["status"] for e in listing_of(event)["entries"]]
+    assert "downloaded" in statuses and "not downloaded: time limit reached" in statuses
+    assert set(statuses) <= {"downloaded", "not downloaded: time limit reached"}
+    assert len(files_urls(event)) == statuses.count("downloaded")
+    assert "(not downloaded: time limit reached)" in event.text
+
+
+def test_a_long_folder_tree_does_not_push_its_note_into_a_turn_of_its_own():
+    from plugins.platforms.feishu.adapter import _DEFAULT_TEXT_BATCH_MAX_CHARS
+
+    long_name = "n" * 120
+    count = _DEFAULT_TEXT_BATCH_MAX_CHARS // len(long_name) + 1
+    files = {f"fil_{n}": b"x" for n in range(count)}
+    client = FolderFeishu(trees={"fld_root": [leaf(key, f"{long_name}{key}.txt") for key in files]}, files=files)
+
+    turns = delivered_turns(
+        make_adapter(client),
+        inbound_event("om_folder", "folder", json.dumps({"file_key": "fld_root", "file_name": "project"})),
+        inbound_event("om_note", "text", json.dumps({"text": "please review these"})),
+    )
+
+    assert len(turns) == 1 and len(turns[0]) > _DEFAULT_TEXT_BATCH_MAX_CHARS
+    assert turns[0].endswith("\nplease review these")
+

@@ -2724,8 +2724,8 @@ class FeishuAdapter(BasePlatformAdapter):
         next_count = self._pending_text_batch_counts.get(key, 1) + 1
         appended_text = event.text or ""
         next_text = f"{existing.text}\n{appended_text}" if existing.text and appended_text else (existing.text or appended_text)
-        from .feishu_forward_order import batch_chars  # a forward's transcript does not count
-        if next_count > self._text_batch_max_messages or batch_chars(existing, next_text) > self._text_batch_max_chars:
+        from .feishu_forward_order import batch_chars  # a forward's or folder's expansion does not count
+        if next_count > self._text_batch_max_messages or batch_chars(self, existing, next_text) > self._text_batch_max_chars:
             await self._flush_text_batch_now(key)
             _start_batch()
             return

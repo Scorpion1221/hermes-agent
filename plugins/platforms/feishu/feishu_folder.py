@@ -11,8 +11,9 @@ images, audio and video in their own caches): the cache sweep prunes only the fi
 cache directory, so a materialized tree would never be cleaned up, and a remote name never becomes a
 local path component. The hierarchy lives in the text (an indented tree naming each
 downloaded file's path) and in a JSON listing file beside the files. Listing and downloads are
-bounded (entries, depth, files, and ``gateway.max_inbound_media_bytes`` for all the folders of a
-message together); whatever a bound or a failure leaves out is said in the text. Up to ``max_media``
+bounded (entries, depth, files, and both ``gateway.max_inbound_media_bytes`` and a download time
+budget for all the folders of a message together); whatever a bound or a failure leaves out is said
+in the text. Up to ``max_media``
 files are attached to the event, never audio (attached, it would be transcribed as the user's own
 voice); none is inlined. A quoted folder downloads only the files it may attach (``feishu_quote``).
 """
@@ -61,9 +62,10 @@ class _Entry:
 
 @dataclass
 class _Budget:
-    """Bytes every folder of one message may download together; 0 = unlimited."""
+    """Bytes (0 = unlimited) and time (loop-clock ``deadline``) every folder of one message shares."""
 
     limit: int
+    deadline: float
     used: int = 0
     reserved: int = 0  # declared sizes of the downloads in flight
 
@@ -86,14 +88,17 @@ class _Unlisted(Exception):
 
 
 def normalize_folder_message(payload: dict[str, Any], mentions: list[Any]) -> Any:
-    """A native ``folder`` message (content ``{"file_key", "file_name"}``): listed and downloaded apart."""
+    """A native ``folder`` message (content ``{"file_key", "file_name"}``): listed and downloaded apart.
+
+    It is dispatched as text, like a forward: Feishu sends a folder without a caption, so the note sent
+    behind it joins its turn in the text batch (``feishu_forward_order``)."""
     from .adapter import FeishuNormalizedMessage, FeishuPostMediaRef
     from .feishu_post import folder_placeholder
 
     file_key = str(payload.get("file_key") or "").strip()
     name = str(payload.get("file_name") or "").strip()
     return FeishuNormalizedMessage(
-        raw_type="folder", text_content="", preferred_message_type="document",
+        raw_type="folder", text_content="",
         folder_refs=[FeishuPostMediaRef(file_key=file_key, file_name=name, resource_type="folder")] if file_key else [],
         relation_kind="folder", metadata={"placeholder_text": folder_placeholder(name)}, mentions=mentions,
     )
@@ -105,12 +110,16 @@ async def fetch_folders(
 ) -> FolderContent:
     """The folders of message ``message_id``: a text block each, plus up to ``max_media`` (default
     ``MAX_MEDIA``) attached files. Listings count toward the cap (listing first, then files). At most
-    ``max_files`` (default ``MAX_FILES``) files of each folder are downloaded; the tree names the rest."""
+    ``max_files`` (default ``MAX_FILES``) files of each folder are downloaded, all of them by
+    ``DOWNLOAD_BUDGET_SECONDS`` after the first listing; the tree names the rest."""
     from gateway.platforms.base import get_inbound_media_max_bytes
 
+    from .feishu_forward_order import DOWNLOAD_BUDGET_SECONDS
+
+    deadline = asyncio.get_running_loop().time() + DOWNLOAD_BUDGET_SECONDS
     max_media = MAX_MEDIA if max_media is None else max_media
     max_files = MAX_FILES if max_files is None else max_files
-    budget = _Budget(max(0, await asyncio.to_thread(get_inbound_media_max_bytes)))
+    budget = _Budget(max(0, await asyncio.to_thread(get_inbound_media_max_bytes)), deadline=deadline)
     content = FolderContent()
     blocks: list[str] = []
     for ref in refs:
@@ -153,8 +162,7 @@ async def _fetch_folder(
     files = [entry for entry in walk.entries if not entry.is_folder]
     for entry in files[max_files:]:
         entry.status = "not downloaded: file limit reached"
-    semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
-    await asyncio.gather(*(_download(adapter, message_id, entry, budget, semaphore) for entry in files[:max_files]))
+    await _download_all(adapter, message_id, files[:max_files], budget)
     downloaded = sum(1 for entry in files if entry.local_path)
     logger.info("[Feishu] Folder of message %s: %d entries listed, %d/%d files downloaded",
                 message_id, len(walk.entries), downloaded, len(files))
@@ -245,6 +253,19 @@ def _size(value: Any) -> int:
         return max(0, int(value))
     except (TypeError, ValueError):
         return 0
+
+
+async def _download_all(adapter: Any, message_id: str, files: list[_Entry], budget: _Budget) -> None:
+    """Download ``files`` (a few at a time) until the budget's deadline; the rest are named as cut off."""
+    semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
+    tasks = [asyncio.ensure_future(_download(adapter, message_id, entry, budget, semaphore)) for entry in files]
+    if tasks:
+        _done, pending = await asyncio.wait(tasks, timeout=max(budget.deadline - asyncio.get_running_loop().time(), 0))
+        for task in pending:
+            task.cancel()
+    for entry in files:
+        if not entry.status:
+            entry.status = "not downloaded: time limit reached"
 
 
 async def _download(adapter: Any, message_id: str, entry: _Entry, budget: _Budget, semaphore: asyncio.Semaphore) -> None:
