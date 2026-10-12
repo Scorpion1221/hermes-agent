@@ -405,6 +405,9 @@ class StreamFallbackMixin:
         # (e.g. from an eager re-seed) with an empty finalize so it doesn't hang.
         if self._native_stream_opened:
             await self._close_empty_native_bubble("Silence-marker native stream close failed: %s")
+        # A stream-is-the-message draft has no deletable preview id here: seal it in place with what it
+        # already shows (never the marker), or it stays live with its loading indicator forever.
+        await self._abandon_native_stream()
 
         await self._delete_previews(self._stale_preview_ids(), label="Silence-marker")
         self._preview_message_ids = set()

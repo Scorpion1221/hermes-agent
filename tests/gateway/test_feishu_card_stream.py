@@ -85,6 +85,14 @@ def _adapter(fake: FakeFeishu, **extra) -> FeishuAdapter:
     return adapter
 
 
+FINAL = {"notify": True}  # the gateway's turn-final marker
+
+
+def _only_stream(adapter: FeishuAdapter):
+    (stream,) = adapter._card_streams.open.values()
+    return stream
+
+
 def _final_text(body: dict) -> str:
     return body["body"]["elements"][0]["content"]
 
@@ -161,7 +169,7 @@ async def test_a_send_for_another_turn_never_seals_this_card():
     await adapter.send_draft("oc_chat", 7, "turn A text", metadata={"reply_to_message_id": "om_a"})
 
     await adapter.send("oc_chat", "an ack with no turn id")
-    await adapter.send("oc_chat", "turn B's reply", reply_to="om_b")
+    await adapter.send("oc_chat", "turn B's reply", reply_to="om_b", metadata=FINAL)
 
     assert not fake.final_bodies()
 
@@ -202,11 +210,11 @@ async def test_an_old_card_rolls_over_into_a_new_one_with_a_continued_footer(mon
     adapter = _adapter(fake)
     md = {"reply_to_message_id": "om_user_1"}
     await adapter.send_draft("oc_chat", 5, "first part", metadata=md)
-    stream = adapter._card_streams.open["oc_chat:turn:om_user_1"]
+    stream = _only_stream(adapter)
     stream.card.created_at -= feishu_stream.MAX_CARD_AGE_SECONDS + 1
 
     await adapter.send_draft("oc_chat", 5, "first part, second part", metadata=md)
-    await adapter.send("oc_chat", "first part, second part, end", reply_to="om_user_1")
+    await adapter.send("oc_chat", "first part, second part, end", reply_to="om_user_1", metadata=FINAL)
 
     first, last = fake.final_bodies()
     assert _final_text(first) == "first part" and len(first["body"]["elements"]) == 2
@@ -223,7 +231,7 @@ async def test_an_expired_streaming_window_continues_in_a_fresh_card():
     fake.refuse["element.content"] = [_refused(200850, "card streaming timeout")]
 
     result = await adapter.send_draft("oc_chat", 9, "head and tail", metadata=md)
-    await adapter.send("oc_chat", "head and tail.", reply_to="om_user_1")
+    await adapter.send("oc_chat", "head and tail.", reply_to="om_user_1", metadata=FINAL)
 
     assert result.success
     sealed_head, final = fake.final_bodies()
@@ -343,7 +351,7 @@ async def test_an_approval_prompt_splits_the_card_and_later_text_streams_below_i
         chat_id="oc_chat", session_key="s", text="rm -rf build", actions=[("OK", "once", "primary")],
         command="rm -rf build", description="dangerous", smart_denied=False))
     await adapter.send_draft("oc_chat", 21, "I need to run a command. It ran; build cleaned.", metadata=md)
-    await adapter.send("oc_chat", "I need to run a command. It ran; build cleaned.", reply_to="om_user_1")
+    await adapter.send("oc_chat", "I need to run a command. It ran; build cleaned.", reply_to="om_user_1", metadata=FINAL)
 
     above, below = fake.final_bodies()
     assert _final_text(above) == "I need to run a command." and len(above["body"]["elements"]) == 1
@@ -372,7 +380,7 @@ async def test_a_quiet_card_is_sealed_before_its_streaming_window_closes():
     adapter = _adapter(fake)
     md = {"reply_to_message_id": "om_user_1"}
     await adapter.send_draft("oc_chat", 23, "running a long tool…", metadata=md)
-    stream = adapter._card_streams.open["oc_chat:turn:om_user_1"]
+    stream = _only_stream(adapter)
 
     await feishu_stream.seal_quiet_cards(adapter)
     assert not fake.final_bodies(), "a young card is left alone"
@@ -424,3 +432,153 @@ async def test_without_the_opt_in_a_draft_stream_does_not_take_tool_progress():
     assert consumer.accepts_tool_progress is False
     consumer.finish("text")
     await task
+
+
+@pytest.mark.asyncio
+async def test_in_a_topic_a_status_bubble_replying_to_the_root_does_not_seal_the_card():
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    topic = {"thread_id": "omt_1", "reply_to_message_id": "om_root"}
+    await adapter.send_draft("oc_chat", 31, "working in the topic", metadata=topic)
+
+    # Status callbacks, progress bubbles, command replies: same root anchor, no notify.
+    await adapter.send("oc_chat", "🗜 compressing context", metadata=dict(topic))
+    await adapter.send("oc_chat", "/status: running", reply_to="om_root", metadata=dict(topic))
+
+    assert not fake.final_bodies()
+    await adapter.send("oc_chat", "working in the topic, done", reply_to="om_root", metadata={**topic, **FINAL})
+    (body,) = fake.final_bodies()
+    assert _final_text(body) == "working in the topic, done"
+
+
+@pytest.mark.asyncio
+async def test_two_turns_in_one_topic_each_keep_their_own_card():
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    topic = {"thread_id": "omt_1", "reply_to_message_id": "om_root"}
+    await adapter.send_draft("oc_chat", 41, "turn A", metadata=topic)
+    await adapter.send_draft("oc_chat", 42, "turn B", metadata=topic)
+    await adapter.send_draft("oc_chat", 41, "turn A grows", metadata=topic)
+
+    assert fake.names().count("card.create") == 2
+    await adapter.abandon_open_draft("oc_chat", "turn A grows", metadata=topic)
+    await adapter.abandon_open_draft("oc_chat", "turn B", metadata=topic)
+    assert sorted(_final_text(b) for b in fake.final_bodies()) == ["turn A grows", "turn B"]
+
+
+@pytest.mark.asyncio
+async def test_a_frame_waiting_while_the_card_rolls_over_streams_into_the_new_card():
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    md = {"reply_to_message_id": "om_user_1"}
+    await adapter.send_draft("oc_chat", 51, "before the prompt", metadata=md)
+    stream = _only_stream(adapter)
+    release = asyncio.Event()
+    original = feishu_stream._seal
+
+    async def _slow_seal(*args, **kwargs):
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    feishu_stream._seal = _slow_seal
+    try:
+        prompt = asyncio.create_task(feishu_stream.seal_for_prompt(adapter, "oc_chat"))
+        await asyncio.sleep(0.01)
+        frame = asyncio.create_task(adapter.send_draft("oc_chat", 51, "before the prompt after it", metadata=md))
+        await asyncio.sleep(0.01)
+        release.set()
+        await prompt
+        result = await frame
+    finally:
+        feishu_stream._seal = original
+
+    assert result.success
+    assert stream.card is not None and stream.card.shown == "after it"
+    assert fake.names().count("card.create") == 2
+
+
+@pytest.mark.asyncio
+async def test_a_final_that_straddles_a_rollover_is_not_repeated():
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    md = {"reply_to_message_id": "om_user_1"}
+    await adapter.send_draft("oc_chat", 52, "Pre. Answer part one ", metadata=md)
+    _only_stream(adapter).card.created_at -= feishu_stream.MAX_CARD_AGE_SECONDS + 1
+    await adapter.send_draft("oc_chat", 52, "Pre. Answer part one part two", metadata=md)
+
+    await adapter.send("oc_chat", "Answer part one part two.", reply_to="om_user_1", metadata=FINAL)
+
+    first, last = fake.final_bodies()
+    assert _final_text(first).strip() == "Pre. Answer part one"
+    assert _final_text(last) == "part two."
+
+
+@pytest.mark.asyncio
+async def test_a_transient_cardkit_error_keeps_the_card_streaming():
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    md = {"reply_to_message_id": "om_user_1"}
+    await adapter.send_draft("oc_chat", 53, "one", metadata=md)
+    fake.refuse["element.content"] = [_refused(300317, "sequence conflict"), _refused(500, "server error")]
+
+    assert (await adapter.send_draft("oc_chat", 53, "one two", metadata=md)).success
+    assert (await adapter.send_draft("oc_chat", 53, "one two three", metadata=md)).success
+    assert (await adapter.send_draft("oc_chat", 53, "one two three four", metadata=md)).success
+
+    assert _only_stream(adapter).card.shown == "one two three four"
+    assert fake.names().count("card.create") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_ends_in_a_silence_marker_does_not_leave_the_card_spinning():
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    consumer = _consumer(adapter)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("Checking the queue.")
+    await asyncio.sleep(0.05)
+    consumer.on_tool_progress("💻 terminal: ls")
+    await asyncio.sleep(0.05)
+    consumer.finish("[SILENT]")
+    await task
+
+    (body,) = fake.final_bodies()
+    assert body["config"]["streaming_mode"] is False
+    assert "SILENT" not in json.dumps(body)
+    assert not adapter._card_streams.open
+
+
+@pytest.mark.asyncio
+async def test_two_turns_replying_to_the_same_root_each_seal_their_own_card():
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    topic = {"thread_id": "omt_1", "reply_to_message_id": "om_root"}
+    await adapter.send_draft("oc_chat", 61, "older turn", metadata=topic)
+    await adapter.send_draft("oc_chat", 62, "newer turn", metadata=topic)
+
+    await adapter.send("oc_chat", "newer turn, final", reply_to="om_root", metadata={**topic, **FINAL})
+
+    (body,) = fake.final_bodies()
+    assert _final_text(body) == "newer turn, final"
+    (still_open,) = adapter._card_streams.open.values()
+    assert still_open.card.shown == "older turn"
+
+
+@pytest.mark.asyncio
+async def test_after_a_rollover_a_failed_card_create_never_resends_what_sealed_cards_show():
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    md = {"reply_to_message_id": "om_user_1"}
+    await adapter.send_draft("oc_chat", 63, "sealed head", metadata=md)
+    _only_stream(adapter).card.created_at -= feishu_stream.MAX_CARD_AGE_SECONDS + 1
+    fake.refuse["card.create"] = [_refused(99991400, "no permission")] * 5
+
+    result = await adapter.send_draft("oc_chat", 63, "sealed head and tail", metadata=md)
+    sent = await adapter.send("oc_chat", "sealed head and tail", reply_to="om_user_1", metadata=FINAL)
+
+    assert result.success and sent.success
+    posted = [json.loads(r.request_body.content) for name, r in fake.calls
+              if name in {"message.create", "message.reply"} and r.request_body.msg_type == "interactive"
+              and "schema" in json.loads(r.request_body.content)]
+    (plain_tail,) = posted
+    assert plain_tail["body"]["elements"][0]["content"] == "and tail"
