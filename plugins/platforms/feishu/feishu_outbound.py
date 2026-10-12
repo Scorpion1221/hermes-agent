@@ -9,6 +9,7 @@ a ``post`` with an ``md`` element, or ``text``.
 Fallbacks: a card Feishu refuses for a mention it cannot resolve (100290) is resent once with every mention
 as plain ``@name``; a card or post refused for its content is resent as plain text with the Markdown
 stripped. Edits PATCH a card (the PUT update API cannot edit ``interactive`` messages) and PUT text/post.
+A cron delivery becomes a notification card instead (``feishu_cron_card``).
 """
 
 from __future__ import annotations
@@ -153,7 +154,9 @@ async def send_message(adapter: Any, chat_id: str, content: str, *, reply_to: An
         return SendResult(success=False, error="Not connected")
 
     formatted = adapter.format_message(content)
-    chunks = adapter.truncate_message(formatted, adapter.MAX_MESSAGE_LENGTH)
+    from .feishu_cron_card import parse_cron_delivery
+    cron = parse_cron_delivery(formatted) if getattr(adapter, "_render_mode", "card") == "card" else None
+    chunks = adapter.truncate_message(cron.body if cron else formatted, adapter.MAX_MESSAGE_LENGTH)
     # Decide markdown-vs-text once for the whole message: a chunk of a long markdown reply may be plain
     # prose that fails the per-chunk regex and would otherwise render as literal ``**bold`` / fences while
     # other chunks render. See #26841.
@@ -169,8 +172,12 @@ async def send_message(adapter: Any, chat_id: str, content: str, *, reply_to: An
         return await _send("text", json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False))
 
     try:
-        for chunk in chunks:
+        if cron:
+            from .feishu_cron_card import cron_card
+        for index, chunk in enumerate(chunks):
             msg_type, payload = outbound_payload(adapter, chunk, prefer_post=prefer_post)
+            if cron:
+                payload = cron_card(cron, chunk, header=index == 0, footer=index == len(chunks) - 1)
             try:
                 response = await _send(msg_type, payload)
             except Exception as exc:

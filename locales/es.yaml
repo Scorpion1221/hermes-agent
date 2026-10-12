@@ -1378,6 +1378,11 @@ platform:
     media:
       gif_downgraded: "[GIF convertido a archivo]"
       gif_downgraded_caption: "[GIF convertido a archivo]\n{caption}"
+    cron:
+      subtitle: "Tarea programada"
+      notified_at: "Notificado: {time}"
+      job_id: "ID del trabajo: {job_id}"
+      manage_hint: "Para cambiarla o pausarla, responde con el nombre del trabajo."
   google_chat:
     clarify:
       other_button: "Otro / escribir respuesta"

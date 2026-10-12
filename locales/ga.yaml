@@ -1378,6 +1378,11 @@ platform:
     media:
       gif_downgraded: "[GIF íosghrádaithe go comhad]"
       gif_downgraded_caption: "[GIF íosghrádaithe go comhad]\n{caption}"
+    cron:
+      subtitle: "Tasc sceidealaithe"
+      notified_at: "Fógartha: {time}"
+      job_id: "Aitheantas an tasc: {job_id}"
+      manage_hint: "Chun é a athrú nó a chur ar sos, freagair le hainm an tasc."
   google_chat:
     clarify:
       other_button: "Eile / clóscríobh freagra"

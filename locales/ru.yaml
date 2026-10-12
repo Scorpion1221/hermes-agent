@@ -1378,6 +1378,11 @@ platform:
     media:
       gif_downgraded: "[GIF отправлен как файл]"
       gif_downgraded_caption: "[GIF отправлен как файл]\n{caption}"
+    cron:
+      subtitle: "Запланированная задача"
+      notified_at: "Уведомление: {time}"
+      job_id: "ID задачи: {job_id}"
+      manage_hint: "Чтобы изменить или приостановить, ответьте с названием задачи."
   google_chat:
     clarify:
       other_button: "Другое / ввести ответ"

@@ -1378,6 +1378,11 @@ platform:
     media:
       gif_downgraded: "[GIF as lêer gestuur]"
       gif_downgraded_caption: "[GIF as lêer gestuur]\n{caption}"
+    cron:
+      subtitle: "Geskeduleerde taak"
+      notified_at: "Kennisgewing: {time}"
+      job_id: "Taak-ID: {job_id}"
+      manage_hint: "Om dit te verander of te onderbreek, antwoord met die taaknaam."
   google_chat:
     clarify:
       other_button: "Ander / tik antwoord"

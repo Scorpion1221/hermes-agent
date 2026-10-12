@@ -1378,6 +1378,11 @@ platform:
     media:
       gif_downgraded: "[GIF dosyaya dönüştürüldü]"
       gif_downgraded_caption: "[GIF dosyaya dönüştürüldü]\n{caption}"
+    cron:
+      subtitle: "Zamanlanmış görev"
+      notified_at: "Bildirim: {time}"
+      job_id: "Görev kimliği: {job_id}"
+      manage_hint: "Değiştirmek veya duraklatmak için görev adıyla yanıtlayın."
   google_chat:
     clarify:
       other_button: "Diğer / yanıt yazın"

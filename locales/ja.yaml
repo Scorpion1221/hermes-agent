@@ -1378,6 +1378,11 @@ platform:
     media:
       gif_downgraded: "[GIF をファイルとして送信]"
       gif_downgraded_caption: "[GIF をファイルとして送信]\n{caption}"
+    cron:
+      subtitle: "定期タスクの通知"
+      notified_at: "通知日時：{time}"
+      job_id: "ジョブ ID：{job_id}"
+      manage_hint: "変更や一時停止は、ジョブ名を添えて返信してください。"
   google_chat:
     clarify:
       other_button: "その他 / 回答を入力"

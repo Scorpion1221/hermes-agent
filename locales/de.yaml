@@ -1378,6 +1378,11 @@ platform:
     media:
       gif_downgraded: "[GIF als Datei gesendet]"
       gif_downgraded_caption: "[GIF als Datei gesendet]\n{caption}"
+    cron:
+      subtitle: "Geplante Aufgabe"
+      notified_at: "Benachrichtigt: {time}"
+      job_id: "Job-ID: {job_id}"
+      manage_hint: "Zum Ändern oder Pausieren mit dem Jobnamen antworten."
   google_chat:
     clarify:
       other_button: "Sonstiges / Antwort eingeben"

@@ -1378,6 +1378,11 @@ platform:
     media:
       gif_downgraded: "[GIF 已降級為檔案]"
       gif_downgraded_caption: "[GIF 已降級為檔案]\n{caption}"
+    cron:
+      subtitle: "排程任務通知"
+      notified_at: "通知時間：{time}"
+      job_id: "任務 ID：{job_id}"
+      manage_hint: "需要調整或暫停？回覆並說明任務名稱即可。"
   google_chat:
     clarify:
       other_button: "其他／輸入答案"

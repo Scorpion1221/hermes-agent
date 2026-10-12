@@ -369,6 +369,8 @@ python -m gateway.platforms.feishu_comment_rules pairing remove <user_open_id>
 
 飞书无法解析的提及会让整张卡片被拒，所以 id 是占位符的提及会以纯文本 `@名字` 发出；如果飞书仍然拒绝某个提及，回复会把所有提及改成纯文本再发一次。如果飞书拒绝卡片本身，回复会去掉 markdown 以纯文本发送，确保总能送达。
 
+定时任务的投递会渲染成通知卡片：标题是任务名，正文是任务输出，页脚是通知时间、任务 ID，以及如何调整或暂停任务。这需要 cron 默认的包装格式（`cron.wrap_response: true`）；cron 不会传递运行状态和耗时，所以卡片上不显示这两项。
+
 如果想用原来的方式发送（markdown 用带 `md` 元素的 **post** 消息，其余用纯 `text`），设置：
 
 ```yaml

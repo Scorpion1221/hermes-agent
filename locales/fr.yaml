@@ -1604,6 +1604,11 @@ platform:
       gif_downgraded_caption: |-
         [GIF converti en fichier]
         {caption}
+    cron:
+      subtitle: "Tâche planifiée"
+      notified_at: "Notifié : {time}"
+      job_id: "ID de la tâche : {job_id}"
+      manage_hint: "Pour la modifier ou la suspendre, répondez avec le nom de la tâche."
   google_chat:
     clarify:
       other_button: "Autre / saisir une réponse"

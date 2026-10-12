@@ -1378,6 +1378,11 @@ platform:
     media:
       gif_downgraded: "[GIF를 파일로 전환했어요]"
       gif_downgraded_caption: "[GIF를 파일로 전환했어요]\n{caption}"
+    cron:
+      subtitle: "예약 작업 알림"
+      notified_at: "알림 시간: {time}"
+      job_id: "작업 ID: {job_id}"
+      manage_hint: "변경하거나 일시 중지하려면 작업 이름과 함께 답장하세요."
   google_chat:
     clarify:
       other_button: "기타 / 직접 입력"

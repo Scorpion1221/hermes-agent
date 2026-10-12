@@ -1378,6 +1378,11 @@ platform:
     media:
       gif_downgraded: "[GIF convertita in file]"
       gif_downgraded_caption: "[GIF convertita in file]\n{caption}"
+    cron:
+      subtitle: "Attività pianificata"
+      notified_at: "Notificato: {time}"
+      job_id: "ID attività: {job_id}"
+      manage_hint: "Per modificarla o metterla in pausa, rispondi con il nome dell'attività."
   google_chat:
     clarify:
       other_button: "Altro / digita la risposta"

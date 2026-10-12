@@ -1440,6 +1440,11 @@ platform:
     media:
       gif_downgraded: "[GIF downgraded to file]"
       gif_downgraded_caption: "[GIF downgraded to file]\n{caption}"
+    cron:
+      subtitle: "Scheduled task"
+      notified_at: "Notified: {time}"
+      job_id: "Job ID: {job_id}"
+      manage_hint: "To change or pause it, reply with the job name."
 
   google_chat:
     clarify:

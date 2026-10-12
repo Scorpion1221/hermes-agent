@@ -443,6 +443,8 @@ Replies are sent as Feishu **Card JSON 2.0** cards with a single `markdown` elem
 
 A mention whose user Feishu cannot resolve makes it reject the whole card, so a mention with a placeholder id is sent as plain `@name`, and if Feishu still refuses a mention the reply is resent once with every mention as plain text. If Feishu rejects the card itself, the reply is sent as plain text with the markdown stripped, so it is always delivered.
 
+A scheduled-task delivery becomes a notification card: the job name in the header, the output in the body, and the notification time, the job id and how to change or pause the job in the footer. This needs cron's default wrapper (`cron.wrap_response: true`); cron does not pass the run's status or duration, so the card shows neither.
+
 To send the classic way instead, a **post** message with an `md` element for markdown and plain `text` otherwise, set:
 
 ```yaml
