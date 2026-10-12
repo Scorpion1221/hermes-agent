@@ -382,3 +382,45 @@ async def test_a_quiet_card_is_sealed_before_its_streaming_window_closes():
     (body,) = fake.final_bodies()
     assert body["config"]["streaming_mode"] is False and len(body["body"]["elements"]) == 2
     assert stream.card is None and stream.sealed_prefix == "running a long tool…"
+
+
+@pytest.mark.asyncio
+async def test_tool_progress_lines_stay_in_the_card_between_the_text_and_repeats_collapse():
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    consumer = _consumer(adapter)
+    assert consumer.accepts_tool_progress is False  # not before the draft transport is up
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("Let me check.")
+    await asyncio.sleep(0.05)
+    assert consumer.accepts_tool_progress is True
+    consumer.on_tool_progress("💻 terminal: ls")
+    consumer.on_tool_progress("💻 terminal: ls (×2)")
+    consumer.on_tool_progress("📄 read_file: a.py")
+    await asyncio.sleep(0.05)
+    consumer.on_segment_break()
+    consumer.on_delta("Done: a.py is fine.")
+    await asyncio.sleep(0.05)
+    consumer.finish("Done: a.py is fine.")
+    await task
+
+    (body,) = fake.final_bodies()
+    assert _final_text(body) == (
+        "Let me check.\n\n> 💻 terminal: ls (×2)\n\n> 📄 read_file: a.py\n\nDone: a.py is fine.")
+    assert consumer.delivered_final_matches("Done: a.py is fine.") is True
+
+
+@pytest.mark.asyncio
+async def test_without_the_opt_in_a_draft_stream_does_not_take_tool_progress():
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    adapter_cls = type("NoInline", (type(adapter),), {"inline_tool_progress": False})
+    adapter.__class__ = adapter_cls
+    consumer = _consumer(adapter)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("text")
+    await asyncio.sleep(0.05)
+
+    assert consumer.accepts_tool_progress is False
+    consumer.finish("text")
+    await task

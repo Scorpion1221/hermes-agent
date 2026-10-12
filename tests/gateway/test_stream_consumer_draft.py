@@ -508,3 +508,71 @@ class TestRichAwareOverflow:
         adapter.delete_message.assert_awaited_once_with("12345", "preview1")
         assert consumer.final_response_sent is True
 
+
+
+class TestInlineToolProgress:
+    """Stream-is-the-message drafts whose adapter declares ``inline_tool_progress`` keep tool-progress
+    lines in the streamed message, in order with the text; the recorded final stays the model's answer."""
+
+    @staticmethod
+    def _adapter(inline: bool):
+        adapter = _make_draft_capable_adapter()
+        adapter.draft_stream_is_message = True
+        type(adapter).inline_tool_progress = inline
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_progress_lines_join_the_stream_and_a_repeat_rewrites_its_line(self):
+        adapter = self._adapter(True)
+        cfg = StreamConsumerConfig(transport="auto", chat_type="dm", edit_interval=0.01,
+                                   buffer_threshold=1, cursor="")
+        consumer = GatewayStreamConsumer(adapter, "C1", cfg)
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("Checking.")
+        await asyncio.sleep(0.05)
+        assert consumer.accepts_tool_progress is True
+        consumer.on_tool_progress("🔍 search")
+        consumer.on_tool_progress("🔍 search (×2)")
+        await asyncio.sleep(0.05)
+        consumer.on_delta("Found it.")
+        await asyncio.sleep(0.05)
+        consumer.finish("Checking.Found it.")
+        await task
+
+        frames = [call["content"] for call in adapter.draft_calls]
+        assert "Checking.\n\n> 🔍 search (×2)\n" in frames
+        assert all("> 🔍 search\n\n> 🔍 search" not in frame for frame in frames)
+        assert frames[-1] == "Checking.\n\n> 🔍 search (×2)\n\nFound it."  # text after progress: own paragraph
+        assert consumer.delivered_final_matches("Checking.Found it.") is not False
+
+    @pytest.mark.asyncio
+    async def test_without_the_declaration_progress_stays_out_of_the_stream(self):
+        adapter = self._adapter(False)
+        cfg = StreamConsumerConfig(transport="auto", chat_type="dm", edit_interval=0.01,
+                                   buffer_threshold=1, cursor="")
+        consumer = GatewayStreamConsumer(adapter, "C1", cfg)
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("text")
+        await asyncio.sleep(0.05)
+        assert consumer.accepts_tool_progress is False
+        consumer.finish()
+        await task
+
+    @pytest.mark.asyncio
+    async def test_progress_never_enters_the_recorded_final_of_a_split_turn(self):
+        adapter = self._adapter(True)
+        cfg = StreamConsumerConfig(transport="auto", chat_type="dm", edit_interval=0.01,
+                                   buffer_threshold=1, cursor="")
+        consumer = GatewayStreamConsumer(adapter, "C1", cfg)
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("Answer part one. ")
+        await asyncio.sleep(0.05)
+        consumer.on_tool_progress("🔍 search")
+        await asyncio.sleep(0.05)
+        consumer.on_delta("Part two.")
+        await asyncio.sleep(0.05)
+        consumer._turn_split_delivery = True  # as after an overflow split: the ledger is what is recorded
+        consumer.finish()
+        await task
+
+        assert "search" not in (consumer._delivered_final_text or "")

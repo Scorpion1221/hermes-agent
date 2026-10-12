@@ -458,6 +458,8 @@ platforms:
 
 With `streaming.enabled: true`, a reply streams into one Feishu CardKit card: the text appears as it is written, with a loading icon under it, and when the reply is complete the same card is sealed with the final text — the card is the reply, no second message is sent. `/stop` or `/new` seals the card with what it already shows. Feishu closes a card's streaming window after about ten minutes and a card holds about 30,000 characters, so a long-running or very long reply continues in a fresh card below one that ends with "Continued below ↓".
 
+Tool progress (`display.tool_progress`) shows inside the card as quote lines, in order with the reply text; a repeated call updates its line with a count instead of adding another.
+
 Streaming uses cards only with `render_mode: card` (the default). To stream with edit-based previews instead:
 
 ```yaml

@@ -204,6 +204,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # Tool-progress overlay (native only): shown in the bubble until text arrives.
         self._tool_progress_lines: list[str] = []
         self._tool_progress_active: bool = False
+        # Inline progress (stream-is-the-message drafts that keep it): the last line shown, for repeats.
+        self._inline_progress_last = self._inline_progress_base = ""
         self._clear_turn_final_flags()
 
     def _clear_turn_final_flags(self) -> None:
@@ -240,11 +242,18 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
     @property
     def accepts_tool_progress(self) -> bool:
-        """True only when native streaming is active (gates in-stream tool progress)."""
-        return self._use_native_streaming
+        """True when tool progress goes into the stream itself: native streaming (an overlay), or a
+        stream-is-the-message draft whose adapter keeps progress inline (``inline_tool_progress``)."""
+        return self._use_native_streaming or self._inline_tool_progress()
+
+    def _inline_tool_progress(self) -> bool:
+        """The adapter opted in to keeping tool-progress lines in the streamed message, in order with
+        the text (a card that IS the reply). Checked on the CLASS (MagicMock-safe)."""
+        return (self._use_draft_streaming and self._stream_is_message()
+                and getattr(type(self.adapter), "inline_tool_progress", False) is True)
 
     def on_tool_progress(self, line: str) -> None:
-        """Thread-safe: overlay a tool-progress line in the native bubble until the next delta."""
+        """Thread-safe: a tool-progress line for the stream (native overlay, or inline in a draft)."""
         if line:
             self._queue.put((_TOOL_PROGRESS, line))
 
@@ -287,11 +296,29 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         """Append to the live buffer and the split-stable stream ledger."""
         if not text:
             return
+        if self._inline_progress_last:  # text after a progress line starts a fresh paragraph
+            self._inline_progress_last = ""
+            text = "\n" + text.lstrip("\n")
         if self._tool_progress_lines:  # real text overwrites the overlay
             self._tool_progress_lines.clear()
             self._tool_progress_active = False
         self._accumulated += text
         self._stream_ledger += text
+
+    def _append_inline_progress(self, line: str) -> None:
+        """A progress line kept in the stream as a quote line of its own. A repeat of the line just shown
+        (the runner sends ``"<line> (×N)"``) rewrites that line in place instead of stacking another.
+        Progress is gateway chrome, not the model's answer, so it stays out of ``_stream_ledger``."""
+        body = f"> {line}"
+        last = self._inline_progress_last
+        if last and self._accumulated.endswith(last) and line.startswith(self._inline_progress_base):
+            self._accumulated = self._accumulated[: -len(last)] + f"\n{body}\n"
+        else:
+            self._inline_progress_base = line
+            if self._accumulated and not self._accumulated.endswith("\n"):
+                self._accumulated += "\n"
+            self._accumulated += f"\n{body}\n"
+        self._inline_progress_last = f"\n{body}\n"
 
     def _mark_skip_redundant_finalize(self) -> None:
         """Mark the turn final as delivered by a prior mid-stream edit.  Records what was
@@ -676,6 +703,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 if self._use_native_streaming:
                     self._tool_progress_lines.append(item[1])
                     self._tool_progress_active = True
+                elif self._inline_tool_progress():
+                    self._append_inline_progress(item[1])
             elif kind is _APPROVAL_BOUNDARY:
                 tick.approval_boundary = (item[1], item[2])
                 return tick

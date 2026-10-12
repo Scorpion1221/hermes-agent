@@ -1392,8 +1392,10 @@ class FeishuAdapter(FeishuMediaTypesMixin, BasePlatformAdapter):
             return sealed
         return await send_message(self, chat_id, content, reply_to=reply_to, metadata=md or None)
 
-    # CardKit streaming: one card per turn is the reply (upstream's stream-is-the-message draft contract).
+    # CardKit streaming: one card per turn is the reply (upstream's stream-is-the-message draft contract),
+    # with tool-progress lines kept in it, in order with the text.
     draft_stream_is_message = True
+    inline_tool_progress = True
 
     def supports_draft_streaming(self, chat_type: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
                                  chat_id: Optional[str] = None) -> bool:
