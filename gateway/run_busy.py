@@ -620,11 +620,7 @@ class GatewayBusySessionMixin:
             # A follow-up qualifies for steering when it is plain text, OR when every attachment is
             # STT-eligible voice media whose transcript was just folded into steer_text — otherwise a voice
             # note in steer mode silently degrades to queue mode (#58780).
-            _steer_media_urls = getattr(event, "media_urls", None) or []
-            _steer_all_voice = bool(_steer_media_urls) and (
-                len(self._pending_event_audio_paths(event)) == len(_steer_media_urls)
-            )
-            if steer_text and (plain_text or _steer_all_voice) and agent_live and hasattr(running_agent, "steer"):
+            if steer_text and (plain_text or self._event_is_voice_only(event)) and agent_live and hasattr(running_agent, "steer"):
                 steered = self._try_agent_verb(
                     running_agent, "steer", steer_text, session_key, event=event
                 )
@@ -862,8 +858,9 @@ class GatewayBusySessionMixin:
                 event.source.platform.value if event.source.platform else "unknown", session_key,
             )
             return True  # handled (silently dropped); do not fall through
-        # A steered or queued follow-up never reaches _hm_admit_event, so the budget is charged here.
-        if not self._admit_bot_message_for_source(event.source):
+        # A steered or queued follow-up never reaches _hm_admit_event, so the budget is charged here
+        # (once: a clarify release routes an already-admitted upload through this handler).
+        if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(event.source):
             return True
         event._bot_loop_admitted = True
 
@@ -883,11 +880,11 @@ class GatewayBusySessionMixin:
             self._queue_or_replace_pending_event(session_key, event)
             return True
         if (
-            event.message_type == MessageType.TEXT
+            self._hm_text_only(event)
             and self._effective_busy_text_mode(event.source) == "queue"
             and effective_mode != "steer"
         ):
-            return False
+            return False  # plain text: the base adapter's queue debounce owns it (a captioned upload does not)
 
         _busy_state = self._peek_session_state(session_key)
         running_agent = _busy_state.turn.agent if _busy_state else None
