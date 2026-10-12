@@ -44,6 +44,8 @@ TEXT_NO_PENDING = "no_pending"
 SKIP_WORD = "skip"
 SKIPPED = "\x00skipped"
 CANCELLED = "\x00cancelled"
+# How often a blocked wait re-checks the agent's interrupt signal.
+_WAIT_SLICE_SECONDS = 0.2
 
 
 def register(clarify_id: str, session_key: str, question: str, choices: Optional[list[str]],
@@ -59,9 +61,11 @@ def register(clarify_id: str, session_key: str, question: str, choices: Optional
 
 
 def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
-    """Block until the entry resolves or ``timeout`` (``<= 0`` = unlimited) elapses; None on
-    timeout/unknown id. Polls in 1s slices so the inactivity heartbeat keeps firing (a
+    """Block until the entry resolves, the waiting agent is interrupted, or ``timeout`` (``<= 0`` =
+    unlimited) elapses; None on timeout/interrupt/unknown id. Polls in short slices so an interrupt
+    (/stop, a new message) releases the wait promptly and the inactivity heartbeat keeps firing (a
     single long ``Event.wait`` would let the gateway watchdog kill a live prompt)."""
+    from tools.interrupt import is_interrupted
     with _lock:
         entry = _entries.get(clarify_id)
     if entry is None:
@@ -73,8 +77,12 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
     deadline = None if timeout is None or float(timeout) <= 0.0 else time.monotonic() + float(timeout)
     activity_state = {"last_touch": time.monotonic(), "start": time.monotonic()}
     while True:
-        remaining = 1.0 if deadline is None else deadline - time.monotonic()
-        if remaining <= 0 or entry.event.wait(timeout=min(1.0, remaining)):
+        # The signal is thread-scoped, so stopping one agent never releases another session's wait.
+        # An answer that already landed is still returned below.
+        if is_interrupted():
+            break
+        remaining = _WAIT_SLICE_SECONDS if deadline is None else deadline - time.monotonic()
+        if remaining <= 0 or entry.event.wait(timeout=min(_WAIT_SLICE_SECONDS, remaining)):
             break
         # Periodic activity touch so the gateway's inactivity timeout doesn't kill the agent during long
         # code execution (#10807).

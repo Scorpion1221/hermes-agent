@@ -112,6 +112,10 @@ def _clarify_send_then_wait(fut, *, clarify_id: str, session_key: str, clarify_m
         return late.undeliverable, False
     if response == clarify_mod.CANCELLED:
         return response, False
+    from tools.interrupt import is_interrupted
+    if response is None and is_interrupted():
+        # /stop or a new message released the wait: the user moved on, they did not go idle.
+        return clarify_mod.CANCELLED, False
     if response is None or response == "":
         return f"[user did not respond within {int(timeout / 60)}m]", False
     return response, True
