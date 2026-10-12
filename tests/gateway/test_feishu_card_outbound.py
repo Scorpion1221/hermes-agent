@@ -151,7 +151,7 @@ def test_editing_a_card_reply_patches_the_card():
 
 
 def test_editing_a_message_that_is_not_a_card_falls_back_to_put():
-    api = _MessageAPI({"patch": [_refused(230001, "message type is not interactive")]})
+    api = _MessageAPI({"patch": [_refused(230001, "Your request contains an invalid request parameter")]})
 
     result = asyncio.run(_adapter(api).edit_message("oc_chat", "om_text", "plain update"))
 
@@ -193,3 +193,42 @@ def test_a_streamed_preview_card_is_edited_in_place_through_to_its_final_text():
     assert final.success
     assert [name for name, _ in api.calls] == ["create", "patch", "patch"]
     assert _card_markdown(api.calls[-1][1].request_body.content) == "Full **answer:** 42"
+
+
+def test_a_rate_limited_card_edit_is_reported_as_such_and_not_retried_as_put():
+    api = _MessageAPI({"patch": [_refused(230020, "This operation triggers the frequency limit")]})
+
+    result = asyncio.run(_adapter(api).edit_message("oc_chat", "om_card", "update"))
+
+    assert not result.success and "230020" in (result.error or "")
+    assert [name for name, _ in api.calls] == ["patch"]
+
+
+def test_when_put_fails_too_the_patch_error_is_what_the_caller_sees():
+    api = _MessageAPI({
+        "patch": [_refused(230099, "Failed to create card content")],
+        "update": [_refused(230001, "invalid request parameter")],
+    })
+
+    result = asyncio.run(_adapter(api).edit_message("oc_chat", "om_card", "update"))
+
+    assert not result.success and "230099" in (result.error or "")
+
+
+def test_a_card_still_refused_for_a_mention_after_the_retry_goes_out_as_plain_text():
+    refused = _refused(100290, "invalid user resource")
+    api = _MessageAPI({"create": [refused, refused]})
+
+    result = asyncio.run(_adapter(api).send("oc_chat", '<at user_id="ou_0123456789abcdef">Alice</at> look'))
+
+    assert result.success
+    assert [msg_type for msg_type, _ in _sent(api)] == ["interactive", "interactive", "text"]
+    assert json.loads(_sent(api)[2][1]) == {"text": "@Alice look"}
+
+
+def test_an_unknown_render_mode_falls_back_to_cards():
+    api = _MessageAPI()
+
+    asyncio.run(_adapter(api, render_mode="cards").send("oc_chat", "hello"))
+
+    assert [msg_type for msg_type, _ in _sent(api)] == ["interactive"]

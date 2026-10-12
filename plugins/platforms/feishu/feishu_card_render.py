@@ -23,14 +23,10 @@ import re
 import unicodedata
 from collections.abc import Iterator
 
-_FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,}).*$")
+_FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(?:(?P<fence>`{3,})[^`]*|(?P<tilde>~{3,}).*)$")
 _ATX_HEADING_RE = re.compile(r"^(?P<indent>[ ]{0,3})(?P<marks>#{1,6})(?P<rest>(?:[ \t]+.*)?)$")
 _INLINE_CODE_RE = re.compile(r"(?<!\\)(?P<fence>`+)(?!`)[^\r\n]*?(?P=fence)(?!`)")
-_STRONG_BOUNDARY_RE = re.compile(
-    r"(?<![*\\])\*\*(?!\*)"
-    r"(?P<label>[^`\\*\r\n]*?)(?P<last>[^`\\*\s\r\n])\*\*"
-    r"(?=[^\W])"
-)
+_STRONG_DELIM_RE = re.compile(r"(?<![*\\])\*\*(?!\*)")
 _MENTION_TAG_RE = re.compile(
     r"<(?P<tag>at|person)\b(?P<attrs>[^>]*?)(?:/>|>(?P<inner>.*?)</(?P=tag)\s*>)", re.IGNORECASE | re.DOTALL,
 )
@@ -61,7 +57,7 @@ def _lines(content: str) -> Iterator[tuple[str, str, bool]]:
             continue
         opening = _FENCE_OPEN_RE.match(line)
         if opening:
-            fence = opening.group("fence")
+            fence = opening.group("fence") or opening.group("tilde")
         yield line, ending, bool(opening)
 
 
@@ -82,18 +78,27 @@ def _inside_url_token(line: str, position: int) -> bool:
 
 
 def _space_strong_boundaries(line: str) -> str:
-    """Separate a punctuation-ended ``**`` span from the word glued to it, outside code and URLs."""
+    """Separate a punctuation-ended ``**`` span from the word glued to it, outside code and URLs.
+
+    Delimiters pair left to right, as CommonMark reads them, so the closer of ``**A**：**B**`` is never
+    mistaken for an opener; only a closer whose span ends in punctuation and touches a word gets a space.
+    """
     if line.startswith(("    ", "\t")):  # indented code
         return line
     spans = _code_spans(line)
+    delims = [m.start() for m in _STRONG_DELIM_RE.finditer(line) if not _in_spans(spans, m.start())]
     pieces: list[str] = []
     cursor = 0
-    for match in _STRONG_BOUNDARY_RE.finditer(line):
-        if (not unicodedata.category(match.group("last")).startswith("P")
-                or _in_spans(spans, match.start()) or _inside_url_token(line, match.start())):
+    for opener, closer in zip(delims[0::2], delims[1::2]):
+        end = closer + 2
+        label = line[opener + 2:closer]
+        if (not label.strip() or label != label.strip() or end >= len(line)
+                or not unicodedata.category(label[-1]).startswith("P")
+                or not (line[end].isalnum() or line[end] == "_")
+                or _inside_url_token(line, opener)):
             continue
-        pieces += [line[cursor:match.end()], " "]
-        cursor = match.end()
+        pieces += [line[cursor:end], " "]
+        cursor = end
     return "".join(pieces) + line[cursor:] if pieces else line
 
 
@@ -120,31 +125,45 @@ def _mentions_as_text(line: str, *, only_invalid: bool) -> str:
     return _MENTION_TAG_RE.sub(_plain, line)
 
 
+def _prose_blocks(content: str) -> Iterator[tuple[str, bool]]:
+    """``(text, is_code)`` runs: consecutive prose lines joined, so a mention tag may span lines."""
+    run: list[str] = []
+    run_code = False
+    for line, ending, code in _lines(content):
+        if run and code != run_code:
+            yield "".join(run), run_code
+            run = []
+        run_code = code
+        run.append(line + ending)
+    if run:
+        yield "".join(run), run_code
+
+
 def has_card_mentions(content: str) -> bool:
-    return bool(content) and _MENTION_TAG_RE.search(content) is not None
+    """A mention tag outside fenced code, the same text ``strip_card_mentions`` rewrites."""
+    return any(not code and _MENTION_TAG_RE.search(text) for text, code in _prose_blocks(content or ""))
 
 
 def strip_card_mentions(content: str, *, only_invalid: bool = False) -> str:
     """``<at>`` / ``<person>`` mention tags outside fenced code as plain ``@name`` text.
 
     An inline code span is not spared: whether Feishu resolves a tag there is not known, and a refused
-    one rejects the whole card.
+    one rejects the whole card. A tag may span lines.
 
     ``only_invalid`` keeps a mention whose id looks real and rewrites only placeholders; without it every
     mention goes, which is the retry after Feishu refused one of them (100290).
     """
     return "".join(
-        line + ending if code else _mentions_as_text(line, only_invalid=only_invalid) + ending
-        for line, ending, code in _lines(content)
+        text if code else _mentions_as_text(text, only_invalid=only_invalid) for text, code in _prose_blocks(content)
     )
 
 
 def render_markdown_for_card(content: str) -> str:
     """Raw assistant Markdown as a card's ``markdown`` element shows it best (see the module docstring)."""
     rendered: list[str] = []
-    for line, ending, code in _lines(content):
+    for line, ending, code in _lines(strip_card_mentions(content, only_invalid=True)):
         if not code:
-            line = _space_strong_boundaries(_downshift_heading(_mentions_as_text(line, only_invalid=True)))
+            line = _space_strong_boundaries(_downshift_heading(line))
         rendered.append(line + ending)
     return "".join(rendered)
 

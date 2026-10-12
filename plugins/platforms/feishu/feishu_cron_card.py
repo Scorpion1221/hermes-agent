@@ -35,6 +35,10 @@ class CronDelivery:
     job_id: str
     body: str
 
+    def header_line(self) -> str:
+        """Who sent it, for the plain-text fallback that cannot carry the card header."""
+        return f"⏰ {self.name}" + (f" ({self.job_id})" if self.job_id else "")
+
 
 def parse_cron_delivery(text: str) -> Optional[CronDelivery]:
     match = _CRON_WRAPPER_RE.match(text or "")

@@ -14,6 +14,7 @@ import json
 import pytest
 
 from plugins.platforms.feishu.feishu_card_render import (
+    has_card_mentions,
     markdown_card,
     render_markdown_for_card,
     strip_card_mentions,
@@ -226,3 +227,36 @@ def test_markdown_card_keeps_non_ascii_text_unescaped():
     payload = markdown_card("# 标题\n**标签：**正文")
     assert "标题" in payload and "\\u" not in payload
     assert json.loads(payload)["body"]["elements"][0]["content"] == "### 标题\n**标签：** 正文"
+
+
+# --- review fixes: delimiter pairing, fence info strings, multi-line mentions ---
+
+
+@pytest.mark.parametrize("text", [
+    "**状态**：**已完成**",
+    "**苹果**、**香蕉**",
+    "| **状态**：**完成** |",
+    "**x**:**y**z",
+])
+def test_adjacent_strong_spans_keep_both_bold(text):
+    """A closing ``**`` is never reused as an opener, so the second span is left intact."""
+    assert render_markdown_for_card(text) == text
+
+
+def test_every_glued_label_on_a_line_gets_its_space():
+    assert render_markdown_for_card("**a:**b and **c:**d") == "**a:** b and **c:** d"
+
+
+def test_a_one_line_code_span_with_backticks_does_not_open_a_fence():
+    assert render_markdown_for_card("```js x``` then\n# H") == "```js x``` then\n### H"
+
+
+def test_a_mention_tag_spanning_lines_is_rewritten_and_detected_consistently():
+    text = '<at id="ou_abc12345678">\nAlice</at> hi'
+
+    assert has_card_mentions(text)
+    assert strip_card_mentions(text) == "@Alice hi"
+
+
+def test_a_mention_only_inside_a_fence_does_not_count_as_a_mention():
+    assert not has_card_mentions('```\n<at id="ou_?">x</at>\n```')

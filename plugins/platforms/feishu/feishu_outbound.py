@@ -54,9 +54,15 @@ CARD_INVALID_USER_RESOURCE = 100290  # a mention in the card names a user Feishu
 
 
 def _strip_markdown_to_plain_text(text: str) -> str:
-    """Plain-text fallback: shared strip_markdown plus Feishu extras (blockquote, ~~, <u>, hr, CRLF)."""
+    """Plain-text fallback: shared strip_markdown plus Feishu extras (blockquote, ~~, <u>, hr, CRLF).
+
+    Mention tags become ``@name``: a text message cannot carry them, and one Feishu refused is why the
+    text fallback runs at all.
+    """
     from gateway.platforms.helpers import strip_markdown
-    plain = text.replace("\r\n", "\n")
+
+    from .feishu_card_render import strip_card_mentions
+    plain = strip_card_mentions(text).replace("\r\n", "\n")
     plain = _MARKDOWN_LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2).strip()})", plain)
     plain = re.sub(r"^>\s?", "", plain, flags=re.MULTILINE)
     plain = re.sub(r"^\s*---+\s*$", "---", plain, flags=re.MULTILINE)
@@ -143,6 +149,18 @@ def _patch_request(message_id: str, content: str) -> Any:
     return facade._sdk_build(facade.PatchMessageRequest, message_id=message_id, request_body=body)
 
 
+# PATCH failures that say nothing about the message's type (Feishu has no "not a card" code): the rate
+# limit, a recalled or deleted message, the 14-day edit window. A PUT would fail the same way and hide why.
+_PATCH_FINAL_CODES = frozenset({230011, 230020, 230031, 230110})
+
+
+def _patch_may_be_wrong_type(code: Any) -> bool:
+    try:
+        return int(code) not in _PATCH_FINAL_CODES
+    except (TypeError, ValueError):
+        return True
+
+
 def _without_mentions(content: str) -> str:
     from .feishu_card_render import markdown_card, strip_card_mentions
     return markdown_card(strip_card_mentions(content))
@@ -173,29 +191,38 @@ async def send_message(adapter: Any, chat_id: str, content: str, *, reply_to: An
 
     try:
         if cron:
+            from .feishu_card_render import strip_card_mentions
             from .feishu_cron_card import cron_card
         for index, chunk in enumerate(chunks):
             msg_type, payload = outbound_payload(adapter, chunk, prefer_post=prefer_post)
             if cron:
-                payload = cron_card(cron, chunk, header=index == 0, footer=index == len(chunks) - 1)
+                edges = {"header": index == 0, "footer": index == len(chunks) - 1}
+                payload = cron_card(cron, chunk, **edges)
+                plain = f"{cron.header_line()}\n\n{chunk}" if index == 0 else chunk
+                without_mentions = cron_card(cron, strip_card_mentions(chunk), **edges)
+            else:
+                plain, without_mentions = chunk, None
             try:
                 response = await _send(msg_type, payload)
             except Exception as exc:
                 if not content_rejected(msg_type, str(exc)):
                     raise
                 logger.warning("[Feishu] Invalid %s payload rejected by API; falling back to plain text", msg_type)
-                response = await _send_plain(chunk)
+                response = await _send_plain(plain)
                 msg_type = "text"
             if not adapter._response_succeeded(response) and _mention_refused(
                 msg_type, getattr(response, "code", None), chunk,
             ):
                 logger.info("[Feishu] A mention in the card could not be resolved; sending mentions as text")
-                response = await _send(msg_type, _without_mentions(chunk))
-            if not adapter._response_succeeded(response) and content_rejected(
-                msg_type, str(getattr(response, "msg", "") or ""),
+                response = await _send(msg_type, without_mentions or _without_mentions(chunk))
+            if not adapter._response_succeeded(response) and (
+                content_rejected(msg_type, str(getattr(response, "msg", "") or ""))
+                or _mention_refused(msg_type, getattr(response, "code", None), chunk)
             ):
+                # A card refused for its content, or still refused for a mention once every mention is
+                # plain text: the plain-text message always goes through.
                 logger.warning("[Feishu] %s payload rejected by API response; falling back to plain text", msg_type)
-                response = await _send_plain(chunk)
+                response = await _send_plain(plain)
             last_response = response
 
         return adapter._finalize_send_result(last_response, "send failed")
@@ -208,8 +235,10 @@ async def edit_message(adapter: Any, message_id: str, content: str) -> SendResul
     """``FeishuAdapter.edit_message``: PATCH a card or PUT a text/post payload, falling back to plain text.
 
     The edit keeps the type the message was sent as: under ``render_mode: card`` every formatted message
-    went out as a card, so the edit PATCHes a card; if that PATCH is refused because the message is not
-    a card (a plain-text fallback, or one sent before the mode changed), the edit PUTs instead.
+    went out as a card, so the edit PATCHes a card. A refused PATCH may mean the message is text or post
+    (a plain-text fallback, or sent before the mode changed), so the edit tries PUT, except after a rate
+    limit, a recalled or deleted message or an expired edit window; when PUT fails too, the PATCH error is
+    returned, so the caller sees the real cause.
     """
     if not adapter._client:
         return SendResult(success=False, error="Not connected")
@@ -244,9 +273,11 @@ async def edit_message(adapter: Any, message_id: str, content: str) -> SendResul
             if not result.success and _mention_refused(msg_type, code, content):
                 logger.info("[Feishu] A mention in the card could not be resolved; editing with mentions as text")
                 result, code = await _patch(_without_mentions(content))
-            if not result.success:
-                logger.debug("[Feishu] Card PATCH refused for %s (%s); trying PUT update", message_id, result.error)
-                result = await _put_post_or_text()
+            if not result.success and _patch_may_be_wrong_type(code):
+                # The message may be text or post (a plain-text fallback, or sent before the mode changed).
+                logger.debug("[Feishu] Card PATCH refused for %s (%s); trying PUT", message_id, result.error)
+                put = await _put_post_or_text()
+                result = put if put.success else result
         else:
             result = await _put_post_or_text()
         if result.success:

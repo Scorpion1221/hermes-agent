@@ -127,3 +127,54 @@ def test_the_parser_reads_exactly_cron_s_wrapper():
     assert delivery is not None
     assert (delivery.name, delivery.job_id, delivery.body) == ("GitHub Releases 早检", "a25ca1ae14f5", "line 1\n\nline 2")
     assert parse_cron_delivery(_cron_text({**JOB, "name": "other"}, "x").replace("stop reminder other", "stop x")) is None
+
+
+def _refused(code: int, msg: str) -> SimpleNamespace:
+    return SimpleNamespace(success=lambda: False, code=code, msg=msg, data=None)
+
+
+class _ScriptedAPI(_MessageAPI):
+    def __init__(self, answers):
+        super().__init__()
+        self._answers = list(answers)
+
+    def create(self, request):
+        self.created.append(request)
+        return self._answers.pop(0) if self._answers else SimpleNamespace(
+            success=lambda: True, code=0, msg="ok", data=SimpleNamespace(message_id="om_cron"))
+
+
+def _scripted_adapter(answers) -> tuple[FeishuAdapter, _ScriptedAPI]:
+    adapter, _ = _adapter()
+    api = _ScriptedAPI(answers)
+    adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=api)))
+    return adapter, api
+
+
+def test_a_cron_card_resent_without_mentions_is_still_a_cron_card():
+    adapter, api = _scripted_adapter([_refused(100290, "invalid user resource")])
+    text = _cron_text(JOB, '<at user_id="ou_0123456789abcdef">Alice</at> please check')
+
+    asyncio.run(adapter.send("oc_home", text))
+
+    retry = json.loads(api.created[1].request_body.content)
+    assert retry["header"]["title"]["content"] == "⏰ GitHub Releases 早检"
+    assert retry["body"]["elements"][0]["content"] == "@Alice please check"
+
+
+def test_a_cron_card_that_falls_back_to_text_still_says_which_job_sent_it():
+    adapter, api = _scripted_adapter([_refused(230099, "Failed to create card content, invalid card schema")])
+
+    asyncio.run(adapter.send("oc_home", _cron_text(JOB, "All good.")))
+
+    assert api.created[1].request_body.msg_type == "text"
+    assert json.loads(api.created[1].request_body.content)["text"] == "⏰ GitHub Releases 早检 (a25ca1ae14f5)\n\nAll good."
+
+
+def test_an_unknown_render_mode_still_renders_cron_cards_like_the_default():
+    adapter, api = _adapter(render_mode="cards")
+
+    asyncio.run(adapter.send("oc_home", _cron_text(JOB, "All good.")))
+
+    (card,) = _cards(api)
+    assert card["header"]["title"]["content"] == "⏰ GitHub Releases 早检"

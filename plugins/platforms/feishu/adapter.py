@@ -344,6 +344,14 @@ def _coerce_int(value: Any, default: Optional[int] = None, min_value: int = 0) -
     return parsed if parsed >= min_value else default
 
 
+def _render_mode(value: Any) -> str:
+    mode = str(value or "card").strip().lower()
+    if mode in {"card", "post"}:
+        return mode
+    logger.warning("[Feishu] Unknown render_mode=%r, using 'card'. Valid: card, post.", value)
+    return "card"
+
+
 def _coerce_required_int(value: Any, default: int, min_value: int = 0) -> int:
     parsed = _coerce_int(value, default=default, min_value=min_value)
     return default if parsed is None else parsed
@@ -1132,7 +1140,7 @@ class FeishuAdapter(BasePlatformAdapter):
             group_rules=group_rules, allow_bots=allow_bots, allow_all_dm=allow_all_dm,
             require_mention=_to_boolean(extra.get("require_mention", _get_scoped_secret("FEISHU_REQUIRE_MENTION", "true"))),
             quote_chain_max_depth=_coerce_required_int(extra.get("quote_chain_max_depth"), default=20, min_value=0),
-            render_mode=str(extra.get("render_mode") or "card").strip().lower(),
+            render_mode=_render_mode(extra.get("render_mode")),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
