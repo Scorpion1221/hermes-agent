@@ -22,6 +22,7 @@ from agent.i18n import t
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
 from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.run_completion_owner import GatewayCompletionOwnerMixin
 from gateway.session import SessionEntry, SessionSource
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
 
@@ -122,12 +123,12 @@ def _raw_process_event_session_id(evt: dict) -> str:
     return str(evt.get("origin_session_id") or session_key or "").strip()
 
 
-class GatewayNotificationsMixin:
+class GatewayNotificationsMixin(GatewayCompletionOwnerMixin):
     """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner."""
 
     # Coalescing keys: process completions (short-window fan-in) and async delegations (+ parent session).
-    _COMPLETION_BATCH_KEY_FIELDS = ("session_key", "platform", "chat_type", "chat_id", "thread_id", "user_id")
-    _ASYNC_GROUP_KEY_FIELDS = ("session_key", "parent_session_id", "task_failure_notice", *_COMPLETION_BATCH_KEY_FIELDS[1:])
+    _COMPLETION_BATCH_KEY_FIELDS = ("session_key", "parent_session_id", "platform", "chat_type", "chat_id", "thread_id", "user_id")
+    _ASYNC_GROUP_KEY_FIELDS = ("session_key", "parent_session_id", "task_failure_notice", *_COMPLETION_BATCH_KEY_FIELDS[2:])
 
     @dataclasses.dataclass
     class _UpdatePaths:
@@ -207,55 +208,6 @@ class GatewayNotificationsMixin:
                     return
         await adapter.send(source.chat_id, content, metadata=metadata)
 
-    async def _resolve_compression_lineage_target(
-        self, session_db: Any, session_entry: SessionEntry, pinned_session_id: str,
-    ) -> Optional[str]:
-        """Return the live compression tip of ``pinned_session_id`` if the route owns that lineage, else None."""
-        try:
-            target_session_id = await session_db.get_compression_tip(pinned_session_id)
-        except Exception:
-            logger.debug("Async-delegation compression-tip lookup failed for %s", pinned_session_id, exc_info=True)
-            target_session_id = None
-        if not target_session_id or target_session_id == pinned_session_id:
-            logger.warning(
-                "Async-delegation completion pinned to compressed session %s "
-                "without a continuation; dropping injection.", pinned_session_id,
-            )
-            return None
-        try:
-            tip_row = await session_db.get_session(target_session_id)
-        except Exception:
-            tip_row = None
-        if tip_row is None or tip_row.get("ended_at"):
-            logger.warning(
-                "Async-delegation compression continuation %s is %s; dropping injection.",
-                target_session_id, "unknown" if tip_row is None else "ended",
-            )
-            return None
-        route_owns_lineage = session_entry.session_id in {pinned_session_id, target_session_id}
-        if not route_owns_lineage:
-            # Across several rotations, accept a stale route only when its own tip is the same live target.
-            try:
-                route_row = await session_db.get_session(session_entry.session_id)
-                route_tip = (
-                    await session_db.get_compression_tip(session_entry.session_id)
-                    if route_row is not None
-                    and route_row.get("ended_at")
-                    and route_row.get("end_reason") == "compression"
-                    else None
-                )
-            except Exception:
-                route_tip = None
-            route_owns_lineage = route_tip == target_session_id
-        if not route_owns_lineage:
-            logger.warning(
-                "Async-delegation completion for compression lineage %s -> %s "
-                "does not own current route %s; dropping injection.",
-                pinned_session_id, target_session_id, session_entry.session_id,
-            )
-            return None
-        return target_session_id
-
     async def _resolve_async_delegation_session(
         self, session_entry: SessionEntry, pinned_session_id: str,
     ) -> Optional[SessionEntry]:
@@ -274,11 +226,12 @@ class GatewayNotificationsMixin:
             )
             return None
         pinned_row = None
+        execution_session_id = pinned_session_id
         # Snapshot the run generation before the row lookup awaits: a /stop or /new landing while
         # the lookup is pending must not let this completion re-point the route afterwards.
         run_generation = self._current_session_run_generation(session_entry.session_key)
         try:
-            pinned_row = await session_db.get_session(pinned_session_id)
+            pinned_session_id, pinned_row = await self._get_completion_owner(pinned_session_id)
         except Exception:
             logger.debug("Async-delegation parent lookup failed for %s", pinned_session_id, exc_info=True)
         if pinned_row is None:
@@ -315,6 +268,13 @@ class GatewayNotificationsMixin:
                 return None
         if target_session_id == session_entry.session_id:
             return session_entry
+        if execution_session_id != pinned_session_id and not follows_compression:
+            logger.warning(
+                "Delegated completion owner %s does not own current route %s; "
+                "dropping injection instead of switching conversations.",
+                pinned_session_id, session_entry.session_id,
+            )
+            return None
         prior_session_id = session_entry.session_id
         if not self._is_session_run_current(session_entry.session_key, run_generation):
             logger.warning(
@@ -1413,7 +1373,7 @@ class GatewayNotificationsMixin:
         if session_db is None:
             return "retry"
         try:
-            parent = await session_db.get_session(parent_session_id)
+            parent_session_id, parent = await self._get_completion_owner(parent_session_id)
         except Exception:
             logger.debug("Async-completion pre-flight parent lookup failed for %s", parent_session_id, exc_info=True)
             return "retry"
