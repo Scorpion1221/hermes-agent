@@ -1627,17 +1627,7 @@ async def cache_media_bytes_async(
     )
 
 
-@dataclass
-class TextDebounceState:
-    event: MessageEvent
-    task: asyncio.Task | None
-    first_ts: float
-    last_ts: float
-
-    def cancel_timer(self, *, unless: asyncio.Task | None = None) -> None:
-        """Cancel the pending flush timer (if live and not ``unless``)."""
-        if self.task is not None and self.task is not unless and not self.task.done():
-            self.task.cancel()
+from gateway.platforms.base_text_debounce import TextDebounceState  # noqa: E402
 
 
 def _append_text(existing: Optional[str], new: Optional[str]) -> str:
@@ -3903,10 +3893,17 @@ class BasePlatformAdapter(ABC):
         state.cancel_timer(unless=asyncio.current_task())
         state.task = None
         pending = self._pending_messages.get(session_key)
-        if pending is not None and not self._can_merge_text_debounce_events(pending, state.event):
+        # Another sender's message holds the slot (shared group/topic session): the burst becomes its own
+        # turn in the runner's FIFO, or a third sender would find no place and be dropped.
+        enqueue = getattr(getattr(self, "gateway_runner", None), "_enqueue_fifo", None)
+        foreign = pending is not None and not self._can_merge_text_debounce_events(pending, state.event)
+        if foreign and not callable(enqueue):
             return False
         store.pop(session_key, None)
-        merge_pending_message_event(self._pending_messages, session_key, state.event, merge_text=True)
+        if foreign:
+            enqueue(session_key, state.event, self)
+        else:
+            merge_pending_message_event(self._pending_messages, session_key, state.event, merge_text=True)
         return True
 
     def _discard_text_debounce(self, session_key: str) -> None:

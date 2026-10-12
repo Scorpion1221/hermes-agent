@@ -246,3 +246,47 @@ async def test_control_and_clarify_messages_bypass_text_debounce():
     adapter._message_handler.assert_awaited_once_with(answer)
     assert session_key not in adapter._text_debounce
     assert session_key not in adapter._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_a_third_sender_during_a_busy_group_burst_is_never_dropped():
+    """Group chat, one shared session, agent busy: A's text sits in the pending slot, B's in the
+    debounce buffer; C's message must still reach a turn of its own (it used to be returned on the
+    floor because neither slot could take another sender)."""
+    adapter = _make_adapter()
+    adapter._busy_text_debounce_seconds = 5.0  # keep B buffered while C arrives
+    fifo: list[MessageEvent] = []
+
+    def _enqueue_fifo(session_key, event, owner):
+        assert owner is adapter
+        fifo.append(event)
+
+    adapter.gateway_runner = types.SimpleNamespace(_enqueue_fifo=_enqueue_fifo)
+    a = _make_event("from A", chat_id="oc_group", chat_type="group", user_id="ua")
+    session_key = build_session_key(a.source, group_sessions_per_user=False)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._pending_messages[session_key] = a
+    b = _make_event("from B", chat_id="oc_group", chat_type="group", user_id="ub")
+    c = _make_event("from C", chat_id="oc_group", chat_type="group", user_id="uc")
+
+    await adapter._queue_text_debounce(session_key, b)
+    await adapter._queue_text_debounce(session_key, c)
+
+    assert adapter._pending_messages[session_key].text == "from A"
+    assert [e.text for e in fifo] == ["from B"]  # B's burst became its own queued turn
+    assert adapter._text_debounce[session_key].event.text == "from C"  # C buffered, next in line
+
+
+@pytest.mark.asyncio
+async def test_without_a_runner_fifo_a_foreign_burst_still_waits_rather_than_merging():
+    adapter = _make_adapter()
+    adapter._busy_text_debounce_seconds = 5.0
+    a = _make_event("from A", chat_id="oc_group", chat_type="group", user_id="ua")
+    session_key = build_session_key(a.source, group_sessions_per_user=False)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._pending_messages[session_key] = a
+
+    await adapter._queue_text_debounce(session_key, _make_event("from B", chat_id="oc_group", chat_type="group", user_id="ub"))
+    flushed = await adapter._flush_text_debounce_now(session_key)
+
+    assert flushed is False and adapter._pending_messages[session_key].text == "from A"
