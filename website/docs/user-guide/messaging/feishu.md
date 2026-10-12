@@ -437,13 +437,20 @@ File upload routing is automatic based on extension:
 - `.pdf`, `.doc(x)`, `.xls(x)`, `.ppt(x)` → uploaded with their document type
 - Everything else → uploaded as a generic stream file
 
-## Markdown Rendering and Post Fallback
+## Markdown Rendering and Fallbacks
 
-When outbound text contains markdown formatting (headings, bold, lists, code blocks, links, etc.), the adapter automatically sends it as a Feishu **post** message with an embedded `md` tag rather than as plain text. This enables rich rendering in the Feishu client.
+Replies are sent as Feishu **Card JSON 2.0** cards with a single `markdown` element, so tables, headings, lists, code blocks and links render the same way in every reply. Edits update the card in place. Inside the card, headings render two levels smaller (a `#` heading shows as `###`), since a top-level heading is very large in a card, and a bold label glued to the next word (`**Status:**done`) gets the space Feishu needs to render it bold. Code is never changed.
 
-If the Feishu API rejects the post payload (e.g., due to unsupported markdown constructs), the adapter automatically falls back to sending as plain text with markdown stripped. This two-stage fallback ensures messages are always delivered.
+A mention whose user Feishu cannot resolve makes it reject the whole card, so a mention with a placeholder id is sent as plain `@name`, and if Feishu still refuses a mention the reply is resent once with every mention as plain text. If Feishu rejects the card itself, the reply is sent as plain text with the markdown stripped, so it is always delivered.
 
-Plain text messages (no markdown detected) are sent as the simple `text` message type.
+To send the classic way instead, a **post** message with an `md` element for markdown and plain `text` otherwise, set:
+
+```yaml
+platforms:
+  feishu:
+    extra:
+      render_mode: post   # default: card
+```
 
 ## Processing Status Reactions
 

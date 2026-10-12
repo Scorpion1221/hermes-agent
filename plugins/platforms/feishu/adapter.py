@@ -67,7 +67,7 @@ _LARK_SDK_IMPORTS = (
         "CreateMessageRequest", "CreateMessageRequestBody", "GetChatRequest", "GetMessageRequest",
         "DeleteMessageRequest", "GetMessageResourceRequest", "P2ImMessageMessageReadV1",
         "ReplyMessageRequest", "ReplyMessageRequestBody",
-        "UpdateMessageRequest", "UpdateMessageRequestBody",
+        "PatchMessageRequest", "PatchMessageRequestBody", "UpdateMessageRequest", "UpdateMessageRequestBody",
     )),
     ("lark_oapi.core", ("AccessTokenType", "HttpMethod")),
     ("lark_oapi.core.const", ("FEISHU_DOMAIN", "LARK_DOMAIN")),
@@ -291,6 +291,7 @@ class FeishuAdapterSettings:
     require_mention: bool = True
     allow_all_dm: bool = False  # resolved per-profile so multiplexed adapters honor their own .env
     quote_chain_max_depth: int = 20  # quoted messages walked toward the root; 0/1 = the direct quote only
+    render_mode: str = "card"  # "card": Card JSON 2.0 markdown; "post": post md / text (upstream)
 
 
 @dataclass
@@ -1131,6 +1132,7 @@ class FeishuAdapter(BasePlatformAdapter):
             group_rules=group_rules, allow_bots=allow_bots, allow_all_dm=allow_all_dm,
             require_mention=_to_boolean(extra.get("require_mention", _get_scoped_secret("FEISHU_REQUIRE_MENTION", "true"))),
             quote_chain_max_depth=_coerce_required_int(extra.get("quote_chain_max_depth"), default=20, min_value=0),
+            render_mode=str(extra.get("render_mode") or "card").strip().lower(),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1372,7 +1374,7 @@ class FeishuAdapter(BasePlatformAdapter):
         return await send_message(self, chat_id, content, reply_to=reply_to, metadata=metadata)
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
-        """Edit a previously sent Feishu text/post message."""
+        """Edit a previously sent Feishu message: PATCH a card, PUT text/post."""
         from .feishu_outbound import edit_message
         return await edit_message(self, message_id, content)
 

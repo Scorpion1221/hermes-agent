@@ -1,8 +1,14 @@
 """Feishu outbound text: the payload for each chunk of a reply, its fallbacks, and edits.
 
-A formatted reply is chunked at ``MAX_MESSAGE_LENGTH``; the markdown-vs-text decision is made once for the
-whole message (#26841) and each chunk goes out as a ``post`` with an ``md`` element, or as ``text``. A post
-Feishu rejects for its content is resent as plain text with the Markdown stripped. Edits PUT the same payload.
+A formatted reply is chunked at ``MAX_MESSAGE_LENGTH``. With ``render_mode: card`` (the default) every chunk
+goes out as an ``interactive`` Card JSON 2.0 card with one ``markdown`` element (``feishu_card_render``),
+which renders GFM tables, headings, lists and code the same way every time. ``render_mode: post`` keeps the
+post/text choice: the markdown-vs-text decision is made once for the whole message (#26841) and each chunk is
+a ``post`` with an ``md`` element, or ``text``.
+
+Fallbacks: a card Feishu refuses for a mention it cannot resolve (100290) is resent once with every mention
+as plain ``@name``; a card or post refused for its content is resent as plain text with the Markdown
+stripped. Edits PATCH a card (the PUT update API cannot edit ``interactive`` messages) and PUT text/post.
 """
 
 from __future__ import annotations
@@ -38,6 +44,12 @@ _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
 _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+# How Feishu words a card it refuses for its content (seen in production on the fork since April 2026).
+_CARD_CONTENT_INVALID_RE = re.compile(
+    r"(invalid.{0,40}(card|interactive|schema)|(card|interactive|schema).{0,40}invalid|card.{0,40}(format|content|schema))",
+    re.IGNORECASE,
+)
+CARD_INVALID_USER_RESOURCE = 100290  # a mention in the card names a user Feishu cannot resolve
 
 
 def _strip_markdown_to_plain_text(text: str) -> str:
@@ -105,8 +117,34 @@ def post_mode_payload(content: str, *, prefer_post: bool = False) -> tuple[str, 
 
 
 def content_rejected(msg_type: str, text: str) -> bool:
-    """Whether Feishu refused a post for its content, so the plain-text payload can go instead."""
-    return msg_type == "post" and bool(_POST_CONTENT_INVALID_RE.search(text))
+    """Whether Feishu refused a post or card for its content, so the plain-text payload can go instead."""
+    if msg_type == "post":
+        return bool(_POST_CONTENT_INVALID_RE.search(text))
+    return msg_type == "interactive" and bool(_CARD_CONTENT_INVALID_RE.search(text))
+
+
+def outbound_payload(adapter: Any, content: str, *, prefer_post: bool = False) -> tuple[str, str]:
+    """``(msg_type, payload)`` for one chunk under the adapter's ``render_mode``."""
+    if getattr(adapter, "_render_mode", "card") == "post":
+        return post_mode_payload(content, prefer_post=prefer_post)
+    from .feishu_card_render import markdown_card
+    return "interactive", markdown_card(content)
+
+
+def _mention_refused(msg_type: str, code: Any, content: str) -> bool:
+    from .feishu_card_render import has_card_mentions
+    return msg_type == "interactive" and str(code) == str(CARD_INVALID_USER_RESOURCE) and has_card_mentions(content)
+
+
+def _patch_request(message_id: str, content: str) -> Any:
+    from . import adapter as facade  # the lazily bound SDK names live on the facade
+    body = facade._sdk_build(facade.PatchMessageRequestBody, content=content)
+    return facade._sdk_build(facade.PatchMessageRequest, message_id=message_id, request_body=body)
+
+
+def _without_mentions(content: str) -> str:
+    from .feishu_card_render import markdown_card, strip_card_mentions
+    return markdown_card(strip_card_mentions(content))
 
 
 async def send_message(adapter: Any, chat_id: str, content: str, *, reply_to: Any, metadata: Any) -> SendResult:
@@ -132,18 +170,24 @@ async def send_message(adapter: Any, chat_id: str, content: str, *, reply_to: An
 
     try:
         for chunk in chunks:
-            msg_type, payload = post_mode_payload(chunk, prefer_post=prefer_post)
+            msg_type, payload = outbound_payload(adapter, chunk, prefer_post=prefer_post)
             try:
                 response = await _send(msg_type, payload)
             except Exception as exc:
                 if not content_rejected(msg_type, str(exc)):
                     raise
-                logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
+                logger.warning("[Feishu] Invalid %s payload rejected by API; falling back to plain text", msg_type)
                 response = await _send_plain(chunk)
+                msg_type = "text"
+            if not adapter._response_succeeded(response) and _mention_refused(
+                msg_type, getattr(response, "code", None), chunk,
+            ):
+                logger.info("[Feishu] A mention in the card could not be resolved; sending mentions as text")
+                response = await _send(msg_type, _without_mentions(chunk))
             if not adapter._response_succeeded(response) and content_rejected(
                 msg_type, str(getattr(response, "msg", "") or ""),
             ):
-                logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
+                logger.warning("[Feishu] %s payload rejected by API response; falling back to plain text", msg_type)
                 response = await _send_plain(chunk)
             last_response = response
 
@@ -154,7 +198,12 @@ async def send_message(adapter: Any, chat_id: str, content: str, *, reply_to: An
 
 
 async def edit_message(adapter: Any, message_id: str, content: str) -> SendResult:
-    """``FeishuAdapter.edit_message``: PUT the new text/post payload, falling back to plain text."""
+    """``FeishuAdapter.edit_message``: PATCH a card or PUT a text/post payload, falling back to plain text.
+
+    The edit keeps the type the message was sent as: under ``render_mode: card`` every formatted message
+    went out as a card, so the edit PATCHes a card; if that PATCH is refused because the message is not
+    a card (a plain-text fallback, or one sent before the mode changed), the edit PUTs instead.
+    """
     if not adapter._client:
         return SendResult(success=False, error="Not connected")
 
@@ -166,7 +215,12 @@ async def edit_message(adapter: Any, message_id: str, content: str) -> SendResul
         response = await adapter._run_blocking(adapter._client.im.v1.message.update, request)
         return adapter._finalize_send_result(response, "update failed")
 
-    try:
+    async def _patch(payload: str) -> tuple[SendResult, Any]:
+        request = _patch_request(message_id, payload)
+        response = await adapter._run_blocking(adapter._client.im.v1.message.patch, request)
+        return adapter._finalize_send_result(response, "patch failed"), getattr(response, "code", None)
+
+    async def _put_post_or_text() -> SendResult:
         msg_type, payload = post_mode_payload(content)
         result = await _update(msg_type, payload)
         if not result.success and content_rejected(msg_type, result.error or ""):
@@ -174,6 +228,20 @@ async def edit_message(adapter: Any, message_id: str, content: str) -> SendResul
             result = await _update(
                 "text", json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
             )
+        return result
+
+    try:
+        msg_type, payload = outbound_payload(adapter, content)
+        if msg_type == "interactive":
+            result, code = await _patch(payload)
+            if not result.success and _mention_refused(msg_type, code, content):
+                logger.info("[Feishu] A mention in the card could not be resolved; editing with mentions as text")
+                result, code = await _patch(_without_mentions(content))
+            if not result.success:
+                logger.debug("[Feishu] Card PATCH refused for %s (%s); trying PUT update", message_id, result.error)
+                result = await _put_post_or_text()
+        else:
+            result = await _put_post_or_text()
         if result.success:
             result.message_id = message_id
         return result

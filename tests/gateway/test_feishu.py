@@ -225,7 +225,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
-        adapter = FeishuAdapter(PlatformConfig())
+        adapter = FeishuAdapter(PlatformConfig(extra={"render_mode": "post"}))
         captured = {"calls": []}
 
         class _MessageAPI:
@@ -1312,7 +1312,7 @@ class TestAdapterBehavior(unittest.TestCase):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
-        adapter = FeishuAdapter(PlatformConfig())
+        adapter = FeishuAdapter(PlatformConfig(extra={"render_mode": "post"}))
         captured = []
 
         class _MessageAPI:
@@ -1363,7 +1363,7 @@ class TestAdapterBehavior(unittest.TestCase):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
-        adapter = FeishuAdapter(PlatformConfig())
+        adapter = FeishuAdapter(PlatformConfig(extra={"render_mode": "post"}))
         captured = {}
 
         class _MessageAPI:
