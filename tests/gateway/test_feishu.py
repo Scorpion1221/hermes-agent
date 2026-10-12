@@ -2492,4 +2492,4 @@ def test_processing_failure_skips_cross_mark_when_typing_removal_fails(fake_lark
     _run_processing(adapter, ProcessingOutcome.FAILURE)
     assert tracker.created == ["Typing"]
     assert tracker.deleted == ["r_typing"]
-    assert adapter._pending_processing_reactions["om_msg"] == "r_typing"
+    assert adapter._pending_processing_reactions["om_msg"] == ("Typing", "r_typing")

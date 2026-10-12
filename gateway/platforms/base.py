@@ -4120,6 +4120,7 @@ class BasePlatformAdapter(ABC):
                 except Exception as e:
                     logger.error("[%s] Clarify text-intercept dispatch failed: %s", self.name, e, exc_info=True)
                 return
+        await self._run_processing_hook("mark_event_queued", event)  # optional: a "waiting" badge
         if self._busy_session_handler is not None:
             try:
                 handled = await self._busy_session_handler(event, session_key)

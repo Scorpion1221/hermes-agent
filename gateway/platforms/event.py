@@ -101,6 +101,8 @@ class MessageEvent:
     # knows the message was meant for someone else); None means unknown and keeps the visible
     # fallback, like True.
     reply_expected: Optional[bool] = None
+    # Every inbound message id this event stands for after merges (see absorb_reply_expected).
+    absorbed_message_ids: list[str] = field(default_factory=list, repr=False, compare=False)
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
@@ -108,9 +110,13 @@ class MessageEvent:
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
 
     def absorb_reply_expected(self, other: MessageEvent) -> None:
-        """One turn now answers *other* too: an addressed message wins, then an unknown one."""
+        """One turn now answers *other* too: an addressed message wins, then an unknown one. The
+        message ids it stands for accumulate in ``absorbed_message_ids`` (oldest first), so a
+        platform that marks each inbound message (a status reaction) still reaches every one."""
         if self.reply_expected is not True and other.reply_expected is not False:
             self.reply_expected = other.reply_expected
+        ids = [*(self.absorbed_message_ids or [self.message_id]), *(other.absorbed_message_ids or [other.message_id])]
+        self.absorbed_message_ids = [i for n, i in enumerate(ids) if i and i not in ids[:n]]
 
     def _command_text(self) -> str:
         """Return the message text with leading Desktop attachment refs stripped.

@@ -167,12 +167,9 @@ _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withd
 # small footer emoji — a success badge on every message would add noise, so
 # we only mark start (Typing) and failure (CrossMark); the reply itself is
 # the success signal.
-_FEISHU_REACTION_IN_PROGRESS = "Typing"
-_FEISHU_REACTION_FAILURE = "CrossMark"
 # Bound on the (message_id → reaction_id) handle cache. Happy-path entries
 # drain on completion; the cap is a safeguard against unbounded growth from
 # delete-failures, not a capacity plan.
-_FEISHU_PROCESSING_REACTION_CACHE_SIZE = 1024
 _FEISHU_MESSAGE_TEXT_CACHE_SIZE = 512       # LRU cap for quoted-message (reply chain) lookups
 
 # QR onboarding constants
@@ -1068,7 +1065,7 @@ class FeishuAdapter(FeishuMediaTypesMixin, BasePlatformAdapter):
         self._update_prompt_state: dict[int, dict[str, str]] = {}
         self._update_prompt_counter = itertools.count(1)
         # Reaction deletion needs the opaque reaction_id from create, cached per message_id.
-        self._pending_processing_reactions: OrderedDict[str, str] = OrderedDict()
+        self._pending_processing_reactions: OrderedDict[str, tuple[str, str]] = OrderedDict()  # id -> (emoji, reaction)
         self._load_seen_message_ids()
 
     @staticmethod
@@ -2230,32 +2227,22 @@ class FeishuAdapter(FeishuMediaTypesMixin, BasePlatformAdapter):
         return data is not None
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        from .feishu_reaction import feishu_message_id
-        message_id = feishu_message_id(event.message_id)  # a reaction badges the message it reacted to
-        if not self._reactions_enabled() or not message_id or message_id in self._pending_processing_reactions:
-            return
-        reaction_id = await self._add_reaction(message_id, _FEISHU_REACTION_IN_PROGRESS)
-        if reaction_id:
-            cache = self._pending_processing_reactions
-            cache[message_id] = reaction_id
-            cache.move_to_end(message_id)
-            while len(cache) > _FEISHU_PROCESSING_REACTION_CACHE_SIZE:
-                cache.popitem(last=False)
+        from .feishu_badges import RUNNING, mark
+        await mark(self, event, RUNNING)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        from .feishu_reaction import feishu_message_id
-        message_id = feishu_message_id(event.message_id)
-        if not self._reactions_enabled() or not message_id:
-            return
-        start_reaction_id = self._pending_processing_reactions.get(message_id)
-        if start_reaction_id:
-            if not await self._remove_reaction(message_id, start_reaction_id):
-                # Don't stack a second badge on a Typing we couldn't remove (UI would read as both
-                # "working" and "done/failed"); keep the handle so LRU eventually evicts it.
-                return
-            self._pending_processing_reactions.pop(message_id, None)
-        if outcome is ProcessingOutcome.FAILURE:
-            await self._add_reaction(message_id, _FEISHU_REACTION_FAILURE)
+        from .feishu_badges import finish
+        await finish(self, event, failed=outcome is ProcessingOutcome.FAILURE)
+
+    async def mark_event_queued(self, event: MessageEvent) -> None:
+        """A busy session accepted ``event`` for a later turn: badge its messages "one second"."""
+        from .feishu_badges import QUEUED, mark
+        await mark(self, event, QUEUED, only_unbadged=True)
+
+    async def mark_event_dropped(self, event: MessageEvent) -> None:
+        """``event`` will never be answered (/stop, /new): clear its badges."""
+        from .feishu_badges import mark
+        await mark(self, event, None)
 
     # --- Webhook server and security ---
     def _record_webhook_anomaly(self, remote_ip: str, status: str) -> None:
@@ -2382,6 +2369,8 @@ class FeishuAdapter(FeishuMediaTypesMixin, BasePlatformAdapter):
         if event.text:
             existing.text = self._merge_caption(existing.text, event.text)
         existing.timestamp = event.timestamp
+        from .feishu_badges import record_merged  # every message of the batch keeps its own badge
+        record_merged(existing, event)
         if event.message_id:
             existing.message_id = event.message_id
             existing.source.message_id = event.message_id
@@ -2644,6 +2633,8 @@ class FeishuAdapter(FeishuMediaTypesMixin, BasePlatformAdapter):
         merge_media(existing, event)
         existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
         existing.timestamp = event.timestamp
+        from .feishu_badges import record_merged  # every message of the batch keeps its own badge
+        record_merged(existing, event)
         if event.message_id:
             existing.message_id = event.message_id
             existing.source.message_id = event.message_id

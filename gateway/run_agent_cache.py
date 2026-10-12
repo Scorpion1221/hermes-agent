@@ -577,13 +577,17 @@ class GatewayAgentCacheMixin:
             # (_resolve_async_delegation_session fails closed), not here.
             parked = adapter.get_pending_message(session_key)
             wake = parked if getattr(parked, "internal", False) else None
+            overflow = self._overflow_queue(session_key) or []
             if wake is None:
-                overflow = self._overflow_queue(session_key) or []
                 wake = next((e for e in overflow if getattr(e, "internal", False)), None)
                 if wake is not None:
                     overflow.remove(wake)
             if wake is not None:
                 adapter._pending_messages[session_key] = wake
+            # Messages that will never be answered lose any "waiting" marker the adapter showed.
+            for dropped in [parked, *overflow]:
+                if dropped is not None and dropped is not wake and not getattr(dropped, "internal", False):
+                    await adapter._run_processing_hook("mark_event_dropped", dropped)
         if state is not None:
             state.persistent.pending_command_text = None
         if release_running_state:
