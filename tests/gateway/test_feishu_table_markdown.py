@@ -6,30 +6,19 @@ markdown pipe table to ``msg_type=text``, so Feishu clients rendered the raw
 pipe-and-dash source instead of a table.  Empirically current Feishu clients
 render ``post``+``md`` tables natively, so the downgrade branch must be removed.
 
-These tests guard the fix.  They invoke the real adapter via the project's
-plugin-loader helper so that no ``sys.path`` / ``sys.modules`` games are
-needed.
+These tests guard the fix by building the payload a chunk is sent with.
 """
 
 from __future__ import annotations
 
 import json
 
-from tests.gateway._plugin_adapter_loader import load_plugin_adapter
-
-_adapter = load_plugin_adapter("feishu")
+from plugins.platforms.feishu.feishu_outbound import post_mode_payload
 
 
 def _call_build_outbound_payload(content: str) -> tuple[str, str]:
-    """Invoke ``_build_outbound_payload`` on a bare adapter instance.
-
-    ``_build_outbound_payload`` is a method that only uses module-level
-    helpers (``_MARKDOWN_TABLE_RE``, ``_MARKDOWN_HINT_RE``,
-    ``_build_markdown_post_payload``) and never touches ``self.*``, so a bare
-    object is sufficient.
-    """
-    inst = object.__new__(_adapter.FeishuAdapter)
-    return inst._build_outbound_payload(content)
+    """The ``(msg_type, payload)`` a chunk of ``content`` is sent with in post mode."""
+    return post_mode_payload(content)
 
 
 def _md_texts_from_post_payload(payload_str: str) -> list[str]:

@@ -104,29 +104,7 @@ from gateway.platforms._shared import (
 logger = logging.getLogger(__name__)
 
 # --- Regex patterns ---
-_MARKDOWN_HINT_RE = re.compile(
-    # Pipe table: any header line + separator line both starting with '|'.
-    r"(^\|.*\|\s*\n\|[-:|\s]+\|)"
-    # Headings, lists, code, bold/italic/strike/underline, links, blockquotes.
-    r"|(^#{1,6}\s)"
-    r"|(^\s*[-*]\s)"
-    r"|(^\s*\d+\.\s)"
-    r"|(^\s*---+\s*$)"
-    r"|(```)"
-    r"|(`[^`\n]+`)"
-    r"|(\*\*[^*\n].+?\*\*)"
-    r"|(~~[^~\n].+?~~)"
-    r"|(<u>.+?</u>)"
-    r"|(\*[^*\n]+\*)"
-    r"|(\[[^\]]+\]\([^)]+\))"
-    r"|(^>\s)",
-    re.MULTILINE,
-)
-_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
-_MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
-_MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
-_POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
 # --- Media type sets and upload constants ---
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 _AUDIO_EXTENSIONS = {".ogg", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".opus", ".webm"}
@@ -350,22 +328,10 @@ def _sender_identity(sender: Any) -> frozenset:
     return frozenset(v for v in (getattr(sid, k, None) for k in ("open_id", "user_id", "union_id")) if v)
 
 
-# --- Markdown rendering helpers ---
+# --- Value coercion helpers ---
 
 def _to_boolean(value: Any) -> bool:
     return value is True or value == 1 or value == "true"
-
-
-def _strip_markdown_to_plain_text(text: str) -> str:
-    """Plain-text fallback: shared strip_markdown plus Feishu extras (blockquote, ~~, <u>, hr, CRLF)."""
-    from gateway.platforms.helpers import strip_markdown
-    plain = text.replace("\r\n", "\n")
-    plain = _MARKDOWN_LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2).strip()})", plain)
-    plain = re.sub(r"^>\s?", "", plain, flags=re.MULTILINE)
-    plain = re.sub(r"^\s*---+\s*$", "---", plain, flags=re.MULTILINE)
-    plain = re.sub(r"~~([^~\n]+)~~", r"\1", plain)
-    plain = re.sub(r"<u>([\s\S]*?)</u>", r"\1", plain)
-    return strip_markdown(plain)
 
 
 def _coerce_int(value: Any, default: Optional[int] = None, min_value: int = 0) -> Optional[int]:
@@ -380,49 +346,6 @@ def _coerce_int(value: Any, default: Optional[int] = None, min_value: int = 0) -
 def _coerce_required_int(value: Any, default: int, min_value: int = 0) -> int:
     parsed = _coerce_int(value, default=default, min_value=min_value)
     return default if parsed is None else parsed
-
-
-# --- Post payload builders and parsers ---
-
-def _build_markdown_post_payload(content: str) -> str:
-    rows = _build_markdown_post_rows(content)
-    return json.dumps({"zh_cn": {"content": rows}}, ensure_ascii=False)
-
-
-def _build_markdown_post_rows(content: str) -> list[list[dict[str, str]]]:
-    """Build Feishu post rows, giving each fenced code block its own row.
-
-    Feishu's `md` renderer can swallow trailing content when a fence sits inside one
-    large element; splitting at real fence lines keeps surrounding prose visible.
-    """
-    if not content:
-        return [[{"tag": "md", "text": ""}]]
-    if "```" not in content:
-        return [[{"tag": "md", "text": content}]]
-
-    rows: list[list[dict[str, str]]] = []
-    current: list[str] = []
-    in_code_block = False
-
-    def _flush_current() -> None:
-        nonlocal current
-        segment = "\n".join(current)
-        if segment.strip():
-            rows.append([{"tag": "md", "text": segment}])
-        current = []
-
-    for raw_line in content.splitlines():
-        fence_re = _MARKDOWN_FENCE_CLOSE_RE if in_code_block else _MARKDOWN_FENCE_OPEN_RE
-        is_fence = bool(fence_re.match(raw_line.strip()))
-        if is_fence and not in_code_block:  # opening fence: prose before it becomes its own row
-            _flush_current()
-        current.append(raw_line)
-        if is_fence:
-            in_code_block = not in_code_block
-            if not in_code_block:  # closing fence: the code block becomes its own row
-                _flush_current()
-    _flush_current()
-    return rows or [[{"tag": "md", "text": content}]]
 
 
 # --- Message normalization ---
@@ -1445,81 +1368,13 @@ class FeishuAdapter(BasePlatformAdapter):
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
         """Send a Feishu message."""
-        if not self._client:
-            return SendResult(success=False, error="Not connected")
-
-        formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-        # Decide markdown-vs-text once for the whole message: a chunk of a long
-        # markdown reply may be plain prose that fails the per-chunk regex and would
-        # otherwise render as literal ``**bold`` / fences while other chunks render.
-        # Lock the markdown decision at the whole-message level so every chunk consistently uses ``post``.
-        # See #26841.
-        prefer_post = bool(_MARKDOWN_HINT_RE.search(formatted))
-        last_response = None
-
-        async def _send_plain(chunk: str) -> Any:
-            return await self._feishu_send_with_retry(
-                chat_id=chat_id,
-                msg_type="text",
-                payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
-                reply_to=reply_to,
-                metadata=metadata,
-            )
-
-        try:
-            for chunk in chunks:
-                msg_type, payload = self._build_outbound_payload(chunk, prefer_post=prefer_post)
-                try:
-                    response = await self._feishu_send_with_retry(
-                        chat_id=chat_id, msg_type=msg_type, payload=payload, reply_to=reply_to, metadata=metadata,
-                    )
-                except Exception as exc:
-                    if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
-                        raise
-                    logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
-                    response = await _send_plain(chunk)
-                if (
-                    msg_type == "post"
-                    and not self._response_succeeded(response)
-                    and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
-                ):
-                    logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
-                    response = await _send_plain(chunk)
-                last_response = response
-
-            return self._finalize_send_result(last_response, "send failed")
-        except Exception as exc:
-            logger.error("[Feishu] Send error: %s", exc, exc_info=True)
-            return SendResult(success=False, error=str(exc))
+        from .feishu_outbound import send_message
+        return await send_message(self, chat_id, content, reply_to=reply_to, metadata=metadata)
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
         """Edit a previously sent Feishu text/post message."""
-        if not self._client:
-            return SendResult(success=False, error="Not connected")
-
-        content = self.format_message(content)
-
-        async def _update(msg_type: str, payload: str) -> SendResult:
-            body = self._build_update_message_body(msg_type=msg_type, content=payload)
-            request = self._build_update_message_request(message_id=message_id, request_body=body)
-            response = await self._run_blocking(self._client.im.v1.message.update, request)
-            return self._finalize_send_result(response, "update failed")
-
-        try:
-            msg_type, payload = self._build_outbound_payload(content)
-            result = await _update(msg_type, payload)
-            if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
-                logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
-                result = await _update(
-                    "text", json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
-                )
-            if result.success:
-                result.message_id = message_id
-            return result
-        except Exception as exc:
-            logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
-            return SendResult(success=False, error=str(exc))
+        from .feishu_outbound import edit_message
+        return await edit_message(self, message_id, content)
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete a bot-posted message (used by stream-consumer preview cleanup)."""
@@ -3340,19 +3195,6 @@ class FeishuAdapter(BasePlatformAdapter):
         return lock
 
     # --- Outbound payload construction and send pipeline ---
-    def _build_outbound_payload(self, content: str, *, prefer_post: bool = False) -> tuple[str, str]:
-        # Feishu clients render markdown tables inside ``post`` ``md`` elements natively, so tables
-        # take the common markdown path (no text downgrade). ``prefer_post`` lets ``send`` keep every
-        # chunk of a split markdown reply as ``post`` even when a chunk alone looks like prose.
-        # The previous table-downgrade branch forced any table-containing message to ``text``, which left
-        # Feishu readers seeing the raw pipe-and-dash source instead of a rendered table. ``prefer_post``
-        # lets ``send`` treat the chunk as part of a larger markdown document: when a long markdown reply is
-        # split at MAX_MESSAGE_LENGTH, the per-chunk regex would otherwise mis-classify a plain-prose chunk
-        # as ``text``. See #26841.
-        if prefer_post or _MARKDOWN_HINT_RE.search(content):
-            return "post", _build_markdown_post_payload(content)
-        return "text", json.dumps({"text": content}, ensure_ascii=False)
-
     @staticmethod
     def _get_audio_duration_ms(file_path: str) -> int:
         """OGG/Opus duration in ms (pure Python): last granule position / 48000 Hz; 0 on non-OGG or error."""
@@ -3648,6 +3490,7 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _feishu_send_with_retry(
         self, *, chat_id: str, msg_type: str, payload: str, reply_to: Optional[str], metadata: Optional[dict[str, Any]],
     ) -> Any:
+        from .feishu_outbound import content_rejected  # a rejected payload is not retried: send() falls back
         last_error: Optional[Exception] = None
         active_reply_to = reply_to
 
@@ -3680,7 +3523,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 return response
             except Exception as exc:
                 last_error = exc
-                if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(exc)):
+                if content_rejected(msg_type, str(exc)):
                     raise
                 if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
                     raise
@@ -3774,6 +3617,7 @@ class FeishuAdapter(BasePlatformAdapter):
         return _sdk_build(CreateFileRequest, request_body=request_body)
 
     def _build_media_post_payload(self, *, caption: str, media_tag: dict[str, str]) -> str:
+        from .feishu_outbound import _build_markdown_post_payload
         payload = json.loads(_build_markdown_post_payload(caption))
         content = payload.setdefault("zh_cn", {}).setdefault("content", [])
         content.append([media_tag])
