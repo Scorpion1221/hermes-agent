@@ -454,6 +454,21 @@ platforms:
       render_mode: post   # default: card
 ```
 
+### Streaming replies (CardKit)
+
+With `streaming.enabled: true`, a reply streams into one Feishu CardKit card: the text appears as it is written, with a loading icon under it, and when the reply is complete the same card is sealed with the final text — the card is the reply, no second message is sent. `/stop` or `/new` seals the card with what it already shows. Feishu closes a card's streaming window after about ten minutes and a card holds about 30,000 characters, so a long-running or very long reply continues in a fresh card below one that ends with "Continued below ↓".
+
+Streaming uses cards only with `render_mode: card` (the default). To stream with edit-based previews instead:
+
+```yaml
+platforms:
+  feishu:
+    extra:
+      streaming_transport: edit   # default: cardkit
+```
+
+The app needs the CardKit permission (`cardkit:card:write`); without it replies fall back to edit-based previews.
+
 ## Processing Status Reactions
 
 While the agent is working, the bot shows a `Typing` reaction on your message. It's cleared when the reply arrives, or replaced with `CrossMark` if processing failed.

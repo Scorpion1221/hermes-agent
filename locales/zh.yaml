@@ -1383,6 +1383,8 @@ platform:
       notified_at: "通知时间：{time}"
       job_id: "任务 ID：{job_id}"
       manage_hint: "需要调整或暂停？回复并说明任务名称即可。"
+    stream:
+      continued: "继续 ↓"
   google_chat:
     clarify:
       other_button: "其他 / 输入答案"

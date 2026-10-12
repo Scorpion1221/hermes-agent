@@ -1383,6 +1383,8 @@ platform:
       notified_at: "وقت الإشعار: {time}"
       job_id: "معرّف المهمة: {job_id}"
       manage_hint: "لتعديلها أو إيقافها مؤقتًا، رد باسم المهمة."
+    stream:
+      continued: "يتبع أدناه ↓"
   google_chat:
     clarify:
       other_button: "غير ذلك / اكتب إجابة"

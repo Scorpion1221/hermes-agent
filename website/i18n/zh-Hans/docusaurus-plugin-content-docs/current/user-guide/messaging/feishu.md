@@ -380,6 +380,21 @@ platforms:
       render_mode: post   # 默认：card
 ```
 
+### 流式回复（CardKit）
+
+开启 `streaming.enabled: true` 后，回复会流式写入一张飞书 CardKit 卡片：文字边写边出现，下方有加载图标；回复完成时，同一张卡片会用最终文本封卡——这张卡片就是回复，不会再发第二条消息。`/stop` 或 `/new` 会用卡片当前已显示的内容封卡。飞书大约十分钟后会关闭卡片的流式窗口，一张卡片约能容纳 30,000 个字符，所以耗时很长或特别长的回复会在下方新卡片里接着写，上一张卡片末尾显示「继续 ↓」。
+
+只有 `render_mode: card`（默认）时才会用卡片流式。如果想改用编辑消息的方式预览：
+
+```yaml
+platforms:
+  feishu:
+    extra:
+      streaming_transport: edit   # 默认：cardkit
+```
+
+应用需要 CardKit 权限（`cardkit:card:write`）；没有该权限时，回复会退回编辑消息的预览方式。
+
 ## 处理状态表情回应
 
 Agent 工作期间，机器人会在你的消息上显示 `Typing` 表情回应。回复到达后清除，处理失败则替换为 `CrossMark`。

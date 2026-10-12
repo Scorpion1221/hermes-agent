@@ -1609,6 +1609,8 @@ platform:
       notified_at: "Notifié : {time}"
       job_id: "ID de la tâche : {job_id}"
       manage_hint: "Pour la modifier ou la suspendre, répondez avec le nom de la tâche."
+    stream:
+      continued: "Suite ci-dessous ↓"
   google_chat:
     clarify:
       other_button: "Autre / saisir une réponse"

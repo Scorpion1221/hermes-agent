@@ -1383,6 +1383,8 @@ platform:
       notified_at: "Kennisgewing: {time}"
       job_id: "Taak-ID: {job_id}"
       manage_hint: "Om dit te verander of te onderbreek, antwoord met die taaknaam."
+    stream:
+      continued: "Gaan hieronder voort ↓"
   google_chat:
     clarify:
       other_button: "Ander / tik antwoord"

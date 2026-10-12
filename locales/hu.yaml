@@ -1400,6 +1400,8 @@ platform:
       notified_at: "Értesítés: {time}"
       job_id: "Feladatazonosító: {job_id}"
       manage_hint: "Módosításhoz vagy szüneteltetéshez válaszolj a feladat nevével."
+    stream:
+      continued: "Folytatás lent ↓"
   google_chat:
     clarify:
       other_button: "Egyéb / írd be a választ"

@@ -1383,6 +1383,8 @@ platform:
       notified_at: "Сповіщення: {time}"
       job_id: "ID задачі: {job_id}"
       manage_hint: "Щоб змінити чи призупинити, відповідайте з назвою задачі."
+    stream:
+      continued: "Продовження нижче ↓"
   google_chat:
     clarify:
       other_button: "Інше / ввести відповідь"

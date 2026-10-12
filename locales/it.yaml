@@ -1383,6 +1383,8 @@ platform:
       notified_at: "Notificato: {time}"
       job_id: "ID attività: {job_id}"
       manage_hint: "Per modificarla o metterla in pausa, rispondi con il nome dell'attività."
+    stream:
+      continued: "Continua sotto ↓"
   google_chat:
     clarify:
       other_button: "Altro / digita la risposta"

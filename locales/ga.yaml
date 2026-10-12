@@ -1383,6 +1383,8 @@ platform:
       notified_at: "Fógartha: {time}"
       job_id: "Aitheantas an tasc: {job_id}"
       manage_hint: "Chun é a athrú nó a chur ar sos, freagair le hainm an tasc."
+    stream:
+      continued: "Ar lean thíos ↓"
   google_chat:
     clarify:
       other_button: "Eile / clóscríobh freagra"

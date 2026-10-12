@@ -290,6 +290,7 @@ class FeishuAdapterSettings:
     allow_all_dm: bool = False  # resolved per-profile so multiplexed adapters honor their own .env
     quote_chain_max_depth: int = 20  # quoted messages walked toward the root; 0/1 = the direct quote only
     render_mode: str = "card"  # "card": Card JSON 2.0 markdown; "post": post md / text (upstream)
+    streaming_transport: str = "cardkit"  # "cardkit": stream into one CardKit card; "edit": edit-based previews
 
 
 @dataclass
@@ -1142,6 +1143,7 @@ class FeishuAdapter(FeishuMediaTypesMixin, BasePlatformAdapter):
             require_mention=_to_boolean(extra.get("require_mention", _get_scoped_secret("FEISHU_REQUIRE_MENTION", "true"))),
             quote_chain_max_depth=_coerce_required_int(extra.get("quote_chain_max_depth"), default=20, min_value=0),
             render_mode=_render_mode(extra.get("render_mode")),
+            streaming_transport=str(_extra_or_env("streaming_transport", "FEISHU_STREAMING_TRANSPORT", "cardkit")).strip().lower(),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1378,9 +1380,36 @@ class FeishuAdapter(FeishuMediaTypesMixin, BasePlatformAdapter):
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a Feishu message."""
+        """Send a Feishu message; a turn's final seals its open CardKit card instead (``feishu_stream``)."""
         from .feishu_outbound import send_message
-        return await send_message(self, chat_id, content, reply_to=reply_to, metadata=metadata)
+        from .feishu_stream import seal_with_final
+        md = dict(metadata or {})
+        turn = {**md, "reply_to_message_id": md.get("reply_to_message_id") or reply_to}
+        if not md.pop("_interim_send", False) and (sealed := await seal_with_final(self, chat_id, content, turn)):
+            return sealed
+        return await send_message(self, chat_id, content, reply_to=reply_to, metadata=md or None)
+
+    # CardKit streaming: one card per turn is the reply (upstream's stream-is-the-message draft contract).
+    draft_stream_is_message = True
+
+    def supports_draft_streaming(self, chat_type: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
+                                 chat_id: Optional[str] = None) -> bool:
+        return self._streaming_transport == "cardkit" and self._render_mode == "card"
+
+    def streaming_overflow_limit(self) -> Optional[int]:
+        # Cards roll over on their own (feishu_stream); a consumer-side split would send its head chunks
+        # through send(), which seals the turn's card early.
+        return 10**9 if self.supports_draft_streaming() else None
+
+    async def send_draft(self, chat_id: str, draft_id: int, content: str,
+                         metadata: Optional[dict[str, Any]] = None) -> SendResult:
+        from .feishu_stream import send_draft
+        return await send_draft(self, chat_id, draft_id, content, metadata)
+
+    async def abandon_open_draft(self, chat_id: str, content: str,
+                                 metadata: Optional[dict[str, Any]] = None) -> SendResult:
+        from .feishu_stream import abandon
+        return await abandon(self, chat_id, content, metadata)
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
         """Edit a previously sent Feishu message: PATCH a card, PUT text/post."""

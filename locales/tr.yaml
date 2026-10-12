@@ -1383,6 +1383,8 @@ platform:
       notified_at: "Bildirim: {time}"
       job_id: "Görev kimliği: {job_id}"
       manage_hint: "Değiştirmek veya duraklatmak için görev adıyla yanıtlayın."
+    stream:
+      continued: "Aşağıda devam ediyor ↓"
   google_chat:
     clarify:
       other_button: "Diğer / yanıt yazın"

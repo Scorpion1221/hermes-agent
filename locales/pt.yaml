@@ -1383,6 +1383,8 @@ platform:
       notified_at: "Notificado: {time}"
       job_id: "ID da tarefa: {job_id}"
       manage_hint: "Para alterá-la ou pausá-la, responda com o nome da tarefa."
+    stream:
+      continued: "Continua abaixo ↓"
   google_chat:
     clarify:
       other_button: "Outra / digitar resposta"

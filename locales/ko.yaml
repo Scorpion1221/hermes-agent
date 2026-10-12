@@ -1383,6 +1383,8 @@ platform:
       notified_at: "알림 시간: {time}"
       job_id: "작업 ID: {job_id}"
       manage_hint: "변경하거나 일시 중지하려면 작업 이름과 함께 답장하세요."
+    stream:
+      continued: "아래에 계속 ↓"
   google_chat:
     clarify:
       other_button: "기타 / 직접 입력"
