@@ -295,3 +295,90 @@ async def test_an_anchorless_turn_is_sealed_by_its_own_final():
     (body,) = fake.final_bodies()
     assert _final_text(body) == "no anchor here"
     assert fake.names().count("card.create") == 1 and consumer.final_response_sent
+
+
+@pytest.mark.asyncio
+async def test_the_sealed_card_keeps_the_preamble_streamed_before_a_tool_call():
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    consumer = _consumer(adapter)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("First I will check the logs.")
+    await asyncio.sleep(0.05)
+    consumer.on_segment_break()
+    await asyncio.sleep(0.05)
+    consumer.on_delta("Found it: the cache was stale.")
+    await asyncio.sleep(0.05)
+    final = "Found it: the cache was stale.\n\n⚠️ verifier footer"
+    consumer.finish(final)
+    await task
+
+    (body,) = fake.final_bodies()
+    assert _final_text(body) == "First I will check the logs.\n\nFound it: the cache was stale.\n\n⚠️ verifier footer"
+    assert consumer.delivered_final_matches(final) is True
+
+
+@pytest.mark.parametrize("shown, final, sealed", [
+    ("", "answer", "answer"),
+    ("answer", "answer", "answer"),
+    ("answer so", "answer so far", "answer so far"),
+    ("Pre.Seg two", "Seg two, done", "Pre.\n\nSeg two, done"),
+    ("Pre.\n\nSeg two", "Unrelated final", "Pre.\n\nSeg two\n\nUnrelated final"),
+    ("All shown here.", "", "All shown here."),
+])
+def test_the_final_completes_the_card_without_erasing_or_repeating(shown, final, sealed):
+    assert feishu_stream.merge_final(shown, final) == sealed
+
+
+@pytest.mark.asyncio
+async def test_an_approval_prompt_splits_the_card_and_later_text_streams_below_it():
+    from gateway.platforms.base import ExecApprovalPrompt
+
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    md = {"reply_to_message_id": "om_user_1"}
+    await adapter.send_draft("oc_chat", 21, "I need to run a command.", metadata=md)
+
+    await adapter._send_exec_approval_prompt(ExecApprovalPrompt(
+        chat_id="oc_chat", session_key="s", text="rm -rf build", actions=[("OK", "once", "primary")],
+        command="rm -rf build", description="dangerous", smart_denied=False))
+    await adapter.send_draft("oc_chat", 21, "I need to run a command. It ran; build cleaned.", metadata=md)
+    await adapter.send("oc_chat", "I need to run a command. It ran; build cleaned.", reply_to="om_user_1")
+
+    above, below = fake.final_bodies()
+    assert _final_text(above) == "I need to run a command." and len(above["body"]["elements"]) == 1
+    assert _final_text(below) == "It ran; build cleaned."
+    order = [name for name in fake.names() if name in {"card.update", "message.create", "message.reply"}]
+    assert order.index("card.update") < [i for i, n in enumerate(order) if n in {"message.create", "message.reply"}][1]
+
+
+@pytest.mark.asyncio
+async def test_a_clarify_question_splits_the_card_and_never_seals_the_reply():
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    md = {"reply_to_message_id": "om_user_1"}
+    await adapter.send_draft("oc_chat", 22, "Which file did you mean?", metadata=md)
+
+    await adapter.send_clarify("oc_chat", "Which file?", None, "clar_1", "s", metadata=md)
+
+    (sealed,) = fake.final_bodies()
+    assert _final_text(sealed) == "Which file did you mean?"
+    assert adapter._card_streams.open, "the turn's stream stays open for the answer after the question"
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_card_is_sealed_before_its_streaming_window_closes():
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    md = {"reply_to_message_id": "om_user_1"}
+    await adapter.send_draft("oc_chat", 23, "running a long tool…", metadata=md)
+    stream = adapter._card_streams.open["oc_chat:turn:om_user_1"]
+
+    await feishu_stream.seal_quiet_cards(adapter)
+    assert not fake.final_bodies(), "a young card is left alone"
+    stream.card.created_at -= feishu_stream.MAX_CARD_AGE_SECONDS + 1
+    await feishu_stream.seal_quiet_cards(adapter)
+
+    (body,) = fake.final_bodies()
+    assert body["config"]["streaming_mode"] is False and len(body["body"]["elements"]) == 2
+    assert stream.card is None and stream.sealed_prefix == "running a long tool…"

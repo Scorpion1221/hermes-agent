@@ -1259,6 +1259,8 @@ class FeishuAdapter(FeishuMediaTypesMixin, BasePlatformAdapter):
                 # The WS thread can die without any external signal; keep a watcher alive.
                 self._ws_supervisor = asyncio.ensure_future(self._supervise_websocket_thread())
             self._mark_connected()
+            from .feishu_stream import watch_quiet_cards
+            self._card_watch = asyncio.ensure_future(watch_quiet_cards(self))
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
             # Plugin-registered native handlers (lark_oapi client).
             self._wire_plugin_handlers(self._client)
@@ -1273,9 +1275,10 @@ class FeishuAdapter(FeishuMediaTypesMixin, BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Feishu/Lark."""
         self._running = False
-        if self._ws_supervisor is not None:
-            self._ws_supervisor.cancel()
-            self._ws_supervisor = None
+        for task in (self._ws_supervisor, getattr(self, "_card_watch", None)):
+            if task is not None:
+                task.cancel()
+        self._ws_supervisor = self._card_watch = None
         await self._cancel_pending_tasks(self._pending_text_batch_tasks)
         await self._cancel_pending_tasks(self._pending_media_batch_tasks)
         self._reset_batch_buffers()
@@ -1411,6 +1414,13 @@ class FeishuAdapter(FeishuMediaTypesMixin, BasePlatformAdapter):
         from .feishu_stream import abandon
         return await abandon(self, chat_id, content, metadata)
 
+    async def send_clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
+                           session_key: str, metadata: Optional[dict[str, Any]] = None) -> SendResult:
+        from .feishu_stream import seal_for_prompt
+        await seal_for_prompt(self, chat_id)  # the streamed text stays above the question
+        md = {**(metadata or {}), "_interim_send": True}  # the question never seals the turn's reply
+        return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata=md)
+
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
         """Edit a previously sent Feishu message: PATCH a card, PUT text/post."""
         from .feishu_outbound import edit_message
@@ -1463,6 +1473,8 @@ class FeishuAdapter(FeishuMediaTypesMixin, BasePlatformAdapter):
         route to ``resolve_gateway_approval()`` and unblock the waiting agent thread."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
+        from .feishu_stream import seal_for_prompt
+        await seal_for_prompt(self, prompt.chat_id)  # the streamed text stays above the prompt
         try:
             approval_id = next(self._approval_counter)
             actions = [

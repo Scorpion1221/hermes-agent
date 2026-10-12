@@ -74,6 +74,30 @@ def stream_key(chat_id: str, metadata: Optional[dict[str, Any]]) -> str:
     return f"{chat_id}:{md.get('thread_id') or ''}"
 
 
+def merge_final(shown: str, final: str) -> str:
+    """The text a sealed card shows: what the turn already streamed, completed by the final.
+
+    The consumer's final is the turn's last assistant message, not the whole stream: a preamble streamed
+    before a tool call ("Let me check the logs.") is not in it, and segments are joined with no separator.
+    Replacing the card with the final would erase that preamble, so the final replaces only the tail of the
+    card it restates (the longest suffix of ``shown`` the final starts with), and the rest of the card
+    stays; a final the card does not show at all is appended."""
+    shown, final = shown.rstrip(), final.strip()
+    if not shown or not final:
+        return shown or final
+    if final in shown:
+        return shown
+    if final.startswith(shown):
+        return final
+    # The longest tail of the card that the final restates (the last segment, possibly extended).
+    for start in range(len(shown)):
+        tail = shown[start:].lstrip()
+        if len(tail) >= 2 and final.startswith(tail):
+            head = shown[:start].rstrip()
+            return f"{head}\n\n{final}" if head else final
+    return f"{shown}\n\n{final}"
+
+
 def _remainder(full: str, prefix: str) -> str:
     """``full`` minus the head already shown by sealed cards. A card starts at the seam, so whitespace
     there is dropped (a card would not show it anyway); a ``full`` that does not extend the head is kept
@@ -184,12 +208,14 @@ async def _open_card(adapter: Any, stream: TurnStream, text: str) -> Optional[Li
     return card
 
 
-async def _roll_over(adapter: Any, stream: TurnStream) -> bool:
+async def _roll_over(adapter: Any, stream: TurnStream, *, footer: Optional[str] = None) -> bool:
     """Seal the live card with what it shows and a "continued" footer; the next frame opens a new card."""
     card = stream.card
     if card is None:
         return True
-    if not await _seal(adapter, card, card.shown, footer=_continued_footer()):
+    if stream.card is not card:
+        return True  # another task rolled it over while this one waited for the lock
+    if not await _seal(adapter, card, card.shown, footer=_continued_footer() if footer is None else footer):
         return False
     stream.sealed_prefix += card.shown
     stream.card = None
@@ -260,13 +286,17 @@ async def seal_with_final(adapter: Any, chat_id: str, content: str,
     stream = streams.open.pop(key)
     streams.tombstone(key, stream.draft_id)
     card = stream.card
-    if card is not None and len(_remainder(content, stream.sealed_prefix)) > MAX_CARD_CHARS:
+    shown = card.shown if card else ""
+    # The live card's final text: the reply minus what sealed cards show, completing what this card shows
+    # (a final that only restates the turn's last segment must not erase an earlier one).
+    part = merge_final(shown, _remainder(content, stream.sealed_prefix))
+    if card is not None and len(part) > MAX_CARD_CHARS:
         # The final outgrew the live card: keep what it shows, continue the rest in a fresh card.
         async with card.lock:
             if not await _roll_over(adapter, stream):
                 return None
         card = None
-    part = _remainder(content, stream.sealed_prefix)
+        part = _remainder(part, shown)
     if card is None:
         if not part.strip():
             return SendResult(success=True, message_id=stream.first_message_id)
@@ -295,3 +325,43 @@ async def abandon(adapter: Any, chat_id: str, content: str, metadata: Optional[d
         shown = card.shown or _remainder(content, stream.sealed_prefix)
         ok = await _seal(adapter, card, shown)
     return SendResult(success=ok, message_id=card.message_id, error=None if ok else "CardKit abandon seal failed")
+
+
+async def seal_for_prompt(adapter: Any, chat_id: str) -> None:
+    """Before an approval / clarify card: seal every card streaming in ``chat_id`` with what it shows.
+
+    A prompt blocks its turn's agent, so whatever streams in the chat now belongs above the prompt; the
+    turn keeps its stream, and the next frame after the answer opens a fresh card below the prompt (else
+    post-answer text would keep growing the card above it). A prompt carries no turn id in a plain chat,
+    so the chat is the unit.
+    """
+    streams = _registry(adapter)
+    for stream in [s for s in streams.open.values() if s.chat_id == chat_id and s.card is not None]:
+        async with stream.card.lock:
+            await _roll_over(adapter, stream, footer="")
+
+
+async def seal_quiet_cards(adapter: Any) -> None:
+    """Seal a card about to outlive Feishu's streaming window while no frame arrives (a long tool call):
+    a frame-driven rollover only happens on the next frame, and an expired card keeps its loading icon."""
+    streams = _registry(adapter)
+    for stream in [s for s in streams.open.values() if s.card is not None]:
+        card = stream.card
+        if time.monotonic() - card.created_at >= MAX_CARD_AGE_SECONDS and not card.lock.locked():
+            async with card.lock:
+                await _roll_over(adapter, stream)
+
+
+QUIET_CHECK_SECONDS = 30.0
+
+
+async def watch_quiet_cards(adapter: Any) -> None:
+    """Background check (the adapter's connection lifetime) for cards outliving their streaming window."""
+    while True:
+        await asyncio.sleep(QUIET_CHECK_SECONDS)
+        try:
+            await seal_quiet_cards(adapter)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("[Feishu] Quiet-card check failed", exc_info=True)
