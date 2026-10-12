@@ -630,6 +630,10 @@ class GatewayBusySessionMixin:
                 )
             if steered:
                 self._fold_into_running_turn(running_agent, session_key, event)
+                # The running turn now answers it: its "waiting" marker becomes "working".
+                from gateway.run_turn_followup_ack import _run_followup_processing_hook
+                await _run_followup_processing_hook(
+                    self._delivery_adapter_for(event.source), event, "on_processing_start")
             else:
                 effective_mode = "queue"
         elif (

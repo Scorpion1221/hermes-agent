@@ -128,3 +128,28 @@ async def test_a_typed_yes_is_refused_when_its_sender_may_not_approve(monkeypatc
     approve.assert_not_called()
     sent = adapter._send_with_retry.await_args.kwargs["content"]
     assert "only admins" in sent
+
+
+@pytest.mark.asyncio
+async def test_a_steered_follow_up_is_marked_as_part_of_the_running_turn():
+    from plugins.platforms.feishu.adapter import FeishuAdapter
+    from gateway.config import PlatformConfig
+
+    runner = _runner("steer")
+    adapter = FeishuAdapter(PlatformConfig())
+    marked: list[tuple[str, str]] = []
+
+    async def _add(message_id, emoji):
+        marked.append((message_id, emoji))
+        return f"r_{emoji}"
+
+    adapter._add_reaction = _add
+    event = _event("also check the logs", "ou_alice", "om_a2")
+    session_key = build_session_key(event.source, group_sessions_per_user=False)
+    runner.adapters[Platform.FEISHU] = adapter
+    runner._delivery_adapter_for = lambda source: adapter
+    _running(runner, session_key, owner="ou_alice")
+
+    await runner._handle_active_session_busy_message(event, session_key)
+
+    assert ("om_a2", "Typing") in marked
