@@ -106,6 +106,7 @@ logger = logging.getLogger(__name__)
 # --- Regex patterns ---
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 # --- Media type sets and upload constants ---
+from .feishu_message_time import message_sent_at  # noqa: E402
 from .feishu_media_types import _AUDIO_EXTENSIONS, _IMAGE_EXTENSIONS, _VIDEO_EXTENSIONS  # noqa: E402
 _DOCUMENT_MIME_TO_EXT = {mime: ext for ext, mime in SUPPORTED_DOCUMENT_TYPES.items()}
 _FEISHU_IMAGE_UPLOAD_TYPE = "message"
@@ -2311,7 +2312,7 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
             media_text_inlined=media_text_inlined + [False] * len(quote.media_urls),
             reply_to_message_id=reply_to_message_id, reply_to_text=quote.text, reply_to_is_own_message=quote.is_own,
             channel_prompt=self._resolve_channel_prompt(chat_id, thread_id or None),
-            timestamp=datetime.now(),
+            timestamp=message_sent_at(message),
         )
         await self._dispatch_inbound_event(normalized)
 
