@@ -153,3 +153,42 @@ async def test_a_steered_follow_up_is_marked_as_part_of_the_running_turn():
     await runner._handle_active_session_busy_message(event, session_key)
 
     assert ("om_a2", "Typing") in marked
+
+
+@pytest.mark.asyncio
+async def test_a_steered_follow_up_gets_no_unpaired_start_on_other_adapters():
+    """Discord/Signal/Slack mark a message in on_processing_start and clear it on completion, keyed on
+    that one message. A steered message never gets its own completion, so it must not get a start."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import BasePlatformAdapter, SendResult
+
+    started: list[str] = []
+
+    class _ReactingAdapter(BasePlatformAdapter):
+        async def connect(self, **kwargs):
+            return True
+
+        async def disconnect(self):
+            pass
+
+        async def send(self, *args, **kwargs):
+            return SendResult(success=True)
+
+        async def get_chat_info(self, chat_id):
+            return {}
+
+        async def on_processing_start(self, event):
+            started.append(event.message_id)
+
+    runner = _runner("steer")
+    adapter = _ReactingAdapter(PlatformConfig(), Platform.FEISHU)
+    event = _event("also check the logs", "ou_alice", "om_a2")
+    session_key = build_session_key(event.source, group_sessions_per_user=False)
+    runner.adapters[Platform.FEISHU] = adapter
+    runner._delivery_adapter_for = lambda source: adapter
+    agent = _running(runner, session_key, owner="ou_alice")
+
+    await runner._handle_active_session_busy_message(event, session_key)
+
+    agent.steer.assert_called_once()
+    assert started == []

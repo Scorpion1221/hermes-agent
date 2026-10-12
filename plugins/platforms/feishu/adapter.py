@@ -1001,10 +1001,11 @@ def _sdk_build(request_cls: Any, **fields: Any) -> Any:
     return builder.build()
 
 
+from .feishu_badges import FeishuBadgesMixin  # noqa: E402
 from .feishu_media_types import FeishuMediaTypesMixin  # noqa: E402
 
 
-class FeishuAdapter(FeishuMediaTypesMixin, BasePlatformAdapter):
+class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapter):
     """Feishu/Lark bot adapter."""
     # Answers /p/<profile>/... on the default listener for a served secondary (shared_ingress).
     serves_profile_prefix: bool = True
@@ -2226,24 +2227,6 @@ class FeishuAdapter(FeishuMediaTypesMixin, BasePlatformAdapter):
 
         data = await self._reaction_call("Remove", message_id, reaction_id, _build, self._client.im.v1.message_reaction.delete)
         return data is not None
-
-    async def on_processing_start(self, event: MessageEvent) -> None:
-        from .feishu_badges import RUNNING, mark
-        await mark(self, event, RUNNING)
-
-    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        from .feishu_badges import finish
-        await finish(self, event, failed=outcome is ProcessingOutcome.FAILURE)
-
-    async def mark_event_queued(self, event: MessageEvent) -> None:
-        """A busy session accepted ``event`` for a later turn: badge its messages "one second"."""
-        from .feishu_badges import QUEUED, mark
-        await mark(self, event, QUEUED, only_unbadged=True)
-
-    async def mark_event_dropped(self, event: MessageEvent) -> None:
-        """``event`` will never be answered (/stop, /new): clear its badges."""
-        from .feishu_badges import mark
-        await mark(self, event, None)
 
     # --- Webhook server and security ---
     def _record_webhook_anomaly(self, remote_ip: str, status: str) -> None:

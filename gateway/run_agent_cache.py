@@ -521,6 +521,19 @@ class GatewayAgentCacheMixin:
             ).start()
         return _generation_at_interrupt
 
+    @staticmethod
+    async def _run_adapter_hook(adapter: Any, hook_name: str, event: Any) -> None:
+        """Fire an optional adapter lifecycle hook for a human ``event``. Class lookup: a MagicMock
+        adapter must not fabricate an un-awaitable hook runner."""
+        run_hook = getattr(type(adapter), "_run_processing_hook", None)
+        if callable(run_hook) and event is not None and not getattr(event, "internal", False):
+            await run_hook(adapter, hook_name, event)
+
+    async def _mark_events_dropped(self, adapter: Any, events) -> None:
+        """Tell the adapter these human follow-ups will never be answered (clears a "waiting" marker)."""
+        for event in list(events):
+            await self._run_adapter_hook(adapter, "mark_event_dropped", event)
+
     async def _interrupt_and_clear_session(
         self, session_key: str, source: SessionSource, *, interrupt_reason: str,
         invalidation_reason: str, release_running_state: bool = True,
@@ -577,17 +590,16 @@ class GatewayAgentCacheMixin:
             # (_resolve_async_delegation_session fails closed), not here.
             parked = adapter.get_pending_message(session_key)
             wake = parked if getattr(parked, "internal", False) else None
-            overflow = self._overflow_queue(session_key) or []
             if wake is None:
+                overflow = self._overflow_queue(session_key) or []
                 wake = next((e for e in overflow if getattr(e, "internal", False)), None)
                 if wake is not None:
                     overflow.remove(wake)
             if wake is not None:
                 adapter._pending_messages[session_key] = wake
-            # Messages that will never be answered lose any "waiting" marker the adapter showed.
-            for dropped in [parked, *overflow]:
-                if dropped is not None and dropped is not wake and not getattr(dropped, "internal", False):
-                    await adapter._run_processing_hook("mark_event_dropped", dropped)
+            # The discarded follow-up will never be answered: drop any "waiting" marker it shows.
+            if parked is not wake:
+                await self._mark_events_dropped(adapter, [parked])
         if state is not None:
             state.persistent.pending_command_text = None
         if release_running_state:

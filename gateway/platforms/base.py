@@ -1627,7 +1627,7 @@ async def cache_media_bytes_async(
     )
 
 
-from gateway.platforms.base_text_debounce import TextDebounceState  # noqa: E402
+from gateway.platforms.base_text_debounce import TextDebounceMixin, TextDebounceState  # noqa: E402
 
 
 def _append_text(existing: Optional[str], new: Optional[str]) -> str:
@@ -1904,7 +1904,7 @@ def _lazy_attr(obj: Any, name: str, factory: Callable[[], Any]) -> Any:
 _strip_media_directives = _strip_media_tag_directives
 
 
-class BasePlatformAdapter(ABC):
+class BasePlatformAdapter(TextDebounceMixin, ABC):
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
 
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
@@ -3798,120 +3798,6 @@ class BasePlatformAdapter(ABC):
             return existing_text
         return f"{existing_text}\n\n{new_text}".strip()
 
-    def _text_debounce_store(self) -> dict[str, TextDebounceState]:
-        return _lazy_attr(self, "_text_debounce", dict)
-
-    def _is_queue_text_debounce_candidate(self, event: MessageEvent) -> bool:
-        """Return True for normal text eligible for queue-mode debounce."""
-        result = (
-            getattr(self, "_busy_text_mode", "interrupt") == "queue"
-            and event.message_type == MessageType.TEXT and not getattr(event, "internal", False)
-            and not event.is_command() and bool((event.text or "").strip()))
-        if result:
-            logger.debug("[%s] Queue-text debounce candidate accepted: session=%s text_len=%d",
-                         self.name, getattr(event, "session_key", "?"), len(event.text or ""))
-        return result
-
-    def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
-        """Return True when two text debounce events came from the same sender."""
-
-        def _identity(candidate: MessageEvent) -> tuple[str, ...] | None:
-            source = getattr(candidate, "source", None)
-            if source is None:
-                return None
-            platform = _platform_name(getattr(source, "platform", None))
-            sender = getattr(source, "user_id_alt", None) or getattr(source, "user_id", None)
-            if sender:
-                return (platform, str(sender))
-            if getattr(source, "chat_type", None) in {"dm", "private"} and getattr(source, "chat_id", None):
-                return (platform, "dm", str(source.chat_id))
-            return None
-        existing_sender = _identity(existing)
-        return existing_sender is not None and existing_sender == _identity(event)
-
-    def _text_debounce_delay(self, session_key: str) -> float:
-        """Return bounded busy-text debounce delay for ``session_key``."""
-        state = self._text_debounce_store().get(session_key)
-        if state is None:
-            return 0.0
-        deadline = min(state.last_ts + self._busy_text_debounce_seconds,
-                       state.first_ts + self._busy_text_hard_cap_seconds)
-        return max(0.0, deadline - time.monotonic())
-
-    async def _queue_text_debounce(self, session_key: str, event: MessageEvent) -> None:
-        """Buffer normal queue-mode busy text and schedule a bounded flush."""
-        store = self._text_debounce_store()
-        state = store.get(session_key)
-        if state is not None and not self._can_merge_text_debounce_events(state.event, event):
-            # Preserve sender attribution: flush the buffer as the next turn, new sender starts
-            # fresh.
-            await self._flush_text_debounce_now(session_key)
-            state = store.get(session_key)
-            if state is not None and not self._can_merge_text_debounce_events(state.event, event):
-                existing_pending = self._pending_messages.get(session_key)
-                if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
-                    merge_pending_message_event(self._pending_messages, session_key, event, merge_text=True)
-                return
-        now = time.monotonic()
-        if state is None:
-            state = TextDebounceState(event=event, task=None, first_ts=now, last_ts=now)
-            store[session_key] = state
-        else:
-            if event.text:
-                state.event.text = _append_text(state.event.text, event.text)
-            state.event.absorb_reply_expected(event)
-            latest_message_id = getattr(event, "message_id", None)
-            latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
-            if latest_message_id is not None:
-                state.event.message_id = str(latest_message_id)
-            if latest_anchor is not None and hasattr(state.event, "reply_to_message_id"):
-                state.event.reply_to_message_id = str(latest_anchor)
-            state.last_ts = now
-        state.cancel_timer()
-        delay = self._text_debounce_delay(session_key)
-        state.task = asyncio.create_task(self._flush_text_debounce(session_key, delay))
-
-    async def _flush_text_debounce(self, session_key: str, delay: float) -> None:
-        """Timer task that flushes the debounced text buffer."""
-        try:
-            await asyncio.sleep(delay)
-            await self._flush_text_debounce_now(session_key)
-        except asyncio.CancelledError:
-            return
-        finally:
-            current = asyncio.current_task()
-            state = self._text_debounce_store().get(session_key)
-            if state is not None and state.task is current:
-                state.task = None
-
-    async def _flush_text_debounce_now(self, session_key: str) -> bool:
-        """Force-flush one debounced busy-text burst into the pending slot."""
-        store = self._text_debounce_store()
-        state = store.get(session_key)
-        if state is None:
-            return False
-        state.cancel_timer(unless=asyncio.current_task())
-        state.task = None
-        pending = self._pending_messages.get(session_key)
-        # Another sender's message holds the slot (shared group/topic session): the burst becomes its own
-        # turn in the runner's FIFO, or a third sender would find no place and be dropped.
-        enqueue = getattr(getattr(self, "gateway_runner", None), "_enqueue_fifo", None)
-        foreign = pending is not None and not self._can_merge_text_debounce_events(pending, state.event)
-        if foreign and not callable(enqueue):
-            return False
-        store.pop(session_key, None)
-        if foreign:
-            enqueue(session_key, state.event, self)
-        else:
-            merge_pending_message_event(self._pending_messages, session_key, state.event, merge_text=True)
-        return True
-
-    def _discard_text_debounce(self, session_key: str) -> None:
-        """Cancel and drop pending text debounce state for control commands."""
-        state = self._text_debounce_store().pop(session_key, None)
-        if state is not None:
-            state.cancel_timer()
-
     # ── Session task + guard ownership helpers: paired with the _session_tasks owner map so
     # reconciliation is deterministic across completion, /stop /new /reset, and stale-lock heal.
 
@@ -3994,8 +3880,9 @@ class BasePlatformAdapter(ABC):
                 logger.debug("[%s] Session cancellation raised while unwinding %s", self.name,
                              session_key, exc_info=True)
         if discard_pending:
-            self._pending_messages.pop(session_key, None)
-            self._discard_text_debounce(session_key)
+            for dropped in (self._pending_messages.pop(session_key, None), self._discard_text_debounce(session_key)):
+                if dropped is not None and not dropped.internal:
+                    await self._run_processing_hook("mark_event_dropped", dropped)
         if release_guard:
             self._release_session_guard(session_key)
 
@@ -4074,6 +3961,18 @@ class BasePlatformAdapter(ABC):
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
         event._gateway_accepted = self._start_session_processing(event, session_key)
 
+    async def _route_to_pending_clarify(self, event: MessageEvent, session_key: str) -> bool:
+        """Hand ``event`` to the runner's clarify intercept when a clarify is waiting; True if handed."""
+        from tools import clarify_gateway as _clarify_mod
+        if _clarify_mod.get_pending_for_session(session_key, include_choice_prompts=True) is None:
+            return False
+        logger.debug("[%s] Routing message to clarify text-intercept for %s", self.name, session_key)
+        try:
+            await self._dispatch_inline_reply(event)
+        except Exception as e:
+            logger.error("[%s] Clarify text-intercept dispatch failed: %s", self.name, e, exc_info=True)
+        return True
+
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass
         commands / clarify replies dispatch inline, everything else is queued."""
@@ -4091,7 +3990,9 @@ class BasePlatformAdapter(ABC):
             try:
                 # /stop, /new, /reset: cancel + response + drain; other bypasses don't cancel.
                 if cmd and is_interrupt_then_dispatch(cmd):
-                    self._discard_text_debounce(session_key)
+                    dropped = self._discard_text_debounce(session_key)
+                    if dropped is not None:
+                        await self._run_processing_hook("mark_event_dropped", dropped)
                     await self._dispatch_active_session_command(event, session_key, cmd)
                 else:
                     logger.debug("[%s] Command '/%s' bypassing active-session guard for %s",
@@ -4106,21 +4007,8 @@ class BasePlatformAdapter(ABC):
         # discarded.  Same shape as the /approve deadlock fix (PR #4926): agent thread
         # blocked on Event.wait, message must reach the resolver before being a new turn.
         # See #4926.
-        if not cmd and event.allow_gateway_control:
-            try:
-                from tools import clarify_gateway as _clarify_mod
-                _has_text_clarify = _clarify_mod.get_pending_for_session(
-                    session_key, include_choice_prompts=True) is not None
-            except Exception:
-                _has_text_clarify = False
-            if _has_text_clarify:
-                logger.debug("[%s] Routing message to clarify text-intercept for %s", self.name, session_key)
-                try:
-                    await self._dispatch_inline_reply(event)
-                except Exception as e:
-                    logger.error("[%s] Clarify text-intercept dispatch failed: %s", self.name, e, exc_info=True)
-                return
-        await self._run_processing_hook("mark_event_queued", event)  # optional: a "waiting" badge
+        if not cmd and event.allow_gateway_control and await self._route_to_pending_clarify(event, session_key):
+            return
         if self._busy_session_handler is not None:
             try:
                 handled = await self._busy_session_handler(event, session_key)
@@ -4172,8 +4060,7 @@ class BasePlatformAdapter(ABC):
             logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
             merge_pending_message_event(self._pending_messages, session_key, event)
             event._gateway_accepted = True
-            return
-        if self._is_queue_text_debounce_candidate(event):
+        elif self._is_queue_text_debounce_candidate(event):
             logger.debug("[%s] New text message while session %s is active — "
                          "debouncing follow-up (busy_text_mode=queue, window=%.2fs)", self.name,
                          session_key, self._busy_text_debounce_seconds)
@@ -4184,6 +4071,8 @@ class BasePlatformAdapter(ABC):
             merge_pending_message_event(self._pending_messages, session_key, event,
                                         merge_text=event.message_type == MessageType.TEXT)
             event._gateway_accepted = True
+        if not event.internal:
+            await self._run_processing_hook("mark_event_queued", event)  # optional: a "waiting" badge
 
     def _get_human_delay(self) -> float:
         """Random human-like pacing delay (s) from this adapter's ``human_delay`` config range

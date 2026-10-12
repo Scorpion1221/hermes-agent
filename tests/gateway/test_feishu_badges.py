@@ -104,27 +104,102 @@ def test_every_message_merged_into_one_turn_carries_the_badge():
     assert all(badges.of(m) == [] for m in ("om_a", "om_b", "om_c"))
 
 
-@pytest.mark.asyncio
-async def test_a_busy_message_through_the_real_base_path_gets_one_second():
-    adapter, badges = _adapter()
-    adapter._busy_text_mode = "interrupt"
+def _busy(adapter, outcome):
+    """A busy session handler that settles each follow-up the way the runner would."""
+    async def _handler(event, session_key):
+        if outcome == "queue":
+            adapter._pending_messages[session_key] = event
+            event._gateway_accepted = True
+            await adapter._run_processing_hook("mark_event_queued", event)
+        elif outcome == "steer":
+            await adapter._run_processing_hook("mark_event_running", event)
+        return True  # handled: queued, steered, or dropped (unauthorized, approval answer, cap)
+    return _handler
+
+
+async def _arrive_busy(adapter, follow, outcome, *, text_mode="interrupt"):
+    adapter._busy_text_mode = text_mode
     adapter._message_handler = lambda event: asyncio.sleep(0)
-    queued: list[MessageEvent] = []
-
-    async def _busy(event, session_key):
-        queued.append(event)
-        event._gateway_accepted = True
-        return True
-
-    adapter._busy_session_handler = _busy
-    follow = _event("follow up", "om_2")
+    adapter._busy_session_handler = _busy(adapter, outcome) if outcome else None
     session_key = build_session_key(follow.source)
     adapter._active_sessions[session_key] = asyncio.Event()
-
     await adapter.handle_message(follow)
+    return session_key
 
-    assert queued == [follow]
+
+@pytest.mark.asyncio
+async def test_a_follow_up_queued_behind_a_busy_turn_waits_with_one_second():
+    adapter, badges = _adapter()
+    await _arrive_busy(adapter, _event("follow up", "om_2"), "queue")
     assert badges.of("om_2") == ["OneSecond"]
+
+
+@pytest.mark.asyncio
+async def test_a_follow_up_the_busy_session_did_not_queue_shows_no_waiting_badge():
+    """An approval answer, an unauthorized sender, the bot-loop guard, a full queue: handled without a
+    later turn, so nothing ever clears a "waiting" badge — none may be shown."""
+    adapter, badges = _adapter()
+    await _arrive_busy(adapter, _event("yes", "om_2"), "drop")
+    assert badges.of("om_2") == []
+
+
+@pytest.mark.asyncio
+async def test_a_steered_follow_up_shows_typing_and_ends_with_the_turn():
+    adapter, badges = _adapter()
+    turn = _event("first", "om_1")
+    follow = _event("also this", "om_2")
+    await adapter.on_processing_start(turn)
+    await _arrive_busy(adapter, follow, "steer")
+    turn.absorb_reply_expected(follow)  # the runner folds a steered message into the running turn
+    assert badges.of("om_2") == ["Typing"]
+
+    await adapter.on_processing_complete(turn, ProcessingOutcome.SUCCESS)
+    assert badges.of("om_1") == [] and badges.of("om_2") == []
+
+
+@pytest.mark.asyncio
+async def test_without_a_busy_handler_the_base_queue_badges_what_it_stored():
+    adapter, badges = _adapter()
+    session_key = await _arrive_busy(adapter, _event("follow up", "om_2"), None)
+    assert adapter._pending_messages[session_key].message_id == "om_2"
+    assert badges.of("om_2") == ["OneSecond"]
+
+
+@pytest.mark.asyncio
+async def test_stop_clears_the_waiting_badge_of_a_burst_still_in_the_text_debounce():
+    adapter, badges = _adapter()
+    adapter._busy_text_debounce_seconds = 5.0  # keep the burst buffered
+    follow = _event("still typing", "om_2")
+    session_key = await _arrive_busy(adapter, follow, None, text_mode="queue")
+    assert badges.of("om_2") == ["OneSecond"]
+
+    async def _dispatch(event, key, cmd):
+        return None
+
+    adapter._dispatch_active_session_command = _dispatch
+    await adapter.handle_message(_event("/stop", "om_3"))
+
+    assert session_key not in adapter._text_debounce
+    assert badges.of("om_2") == []
+
+
+def test_a_batched_event_merged_into_a_turn_badges_every_message_of_the_batch():
+    """A text batch (om_a1 + om_a2) folded into a running turn: the turn's end clears both."""
+    from plugins.platforms.feishu.feishu_badges import record_merged
+
+    adapter, badges = _adapter()
+    turn, batch = _event("turn", "om_t"), _event("a1", "om_a1")
+    record_merged(batch, _event("a2", "om_a2"))
+    batch.message_id = "om_a2"  # a batch advances to its newest message
+    turn.absorb_reply_expected(batch)
+
+    async def _run():
+        await adapter.on_processing_start(turn)
+        assert all(badges.of(m) == ["Typing"] for m in ("om_t", "om_a1", "om_a2"))
+        await adapter.on_processing_complete(turn, ProcessingOutcome.SUCCESS)
+
+    asyncio.run(_run())
+    assert all(badges.of(m) == [] for m in ("om_t", "om_a1", "om_a2"))
 
 
 @pytest.mark.asyncio

@@ -626,10 +626,6 @@ class GatewayBusySessionMixin:
                 )
             if steered:
                 self._fold_into_running_turn(running_agent, session_key, event)
-                # The running turn now answers it: its "waiting" marker becomes "working".
-                from gateway.run_turn_followup_ack import _run_followup_processing_hook
-                await _run_followup_processing_hook(
-                    self._delivery_adapter_for(event.source), event, "on_processing_start")
             else:
                 effective_mode = "queue"
         elif (
@@ -894,6 +890,12 @@ class GatewayBusySessionMixin:
         # the run and must NOT replay). FIFO gives each text its own turn (raw merge would join them).
         if not _steer.steered and not redirected:
             self._queue_or_replace_pending_event(session_key, event)
+            if event._gateway_accepted:
+                await self._run_adapter_hook(adapter, "mark_event_queued", event)  # optional: a "waiting" badge
+        else:
+            # The running turn answers it now. Optional: only an adapter that marks every message a
+            # turn absorbed (and so clears them when it ends) shows this one as running.
+            await self._run_adapter_hook(adapter, "mark_event_running", event)
         # Store the message so it's processed as the next turn after the current run finishes (or is
         # interrupted). Skip this for a successful steer — the text already landed inside the run and must
         # NOT also be replayed as a next-turn user message. Route through _queue_or_replace_pending_event
@@ -1066,6 +1068,8 @@ class GatewayBusySessionMixin:
         await self._interrupt_and_clear_session(
             quick_key, source, interrupt_reason=_INTERRUPT_REASON_RESET, invalidation_reason="new_command",
         )
+        # The reset clears the overflow FIFO too: those messages will never be answered.
+        await self._mark_events_dropped(self._delivery_adapter_for(source), self._overflow_queue(quick_key) or [])
         return await self._handle_reset_command(event)
 
     async def _busy_queue_command(self, event: MessageEvent, quick_key: str, source):

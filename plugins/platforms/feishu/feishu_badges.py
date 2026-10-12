@@ -17,17 +17,15 @@ from typing import Any, Optional
 QUEUED = "OneSecond"
 RUNNING = "Typing"
 FAILED = "CrossMark"
-_MERGED_IDS_KEY = "feishu_message_ids"
 _CACHE_SIZE = 1024
 
 
 def message_ids(event: Any) -> list[str]:
-    """Every Feishu message id ``event`` stands for, oldest first: the adapter's own text/media batches,
-    then the gateway's busy-slot merges (``absorbed_message_ids``), then its current id."""
+    """Every Feishu message id ``event`` stands for, oldest first: ``absorbed_message_ids`` (the
+    adapter's text/media batches and the gateway's merges), then its current id."""
     from .feishu_reaction import feishu_message_id
 
-    raw = [*((getattr(event, "metadata", None) or {}).get(_MERGED_IDS_KEY) or ()),
-           *(getattr(event, "absorbed_message_ids", None) or ()), getattr(event, "message_id", None)]
+    raw = [*(getattr(event, "absorbed_message_ids", None) or ()), getattr(event, "message_id", None)]
     ids: list[str] = []
     for value in raw:
         message_id = feishu_message_id(value) if value else None
@@ -37,12 +35,10 @@ def message_ids(event: Any) -> list[str]:
 
 
 def record_merged(existing: Any, incoming: Any) -> None:
-    """Fold ``incoming``'s ids into a batched ``existing`` before it advances to the newest message."""
+    """Fold ``incoming``'s ids into a batched ``existing`` before it advances to the newest message.
+    They live in the generic ``absorbed_message_ids``, so a later gateway merge carries them along."""
     ids = message_ids(existing)
-    ids += [i for i in message_ids(incoming) if i not in ids]
-    if existing.metadata is None:
-        existing.metadata = {}
-    existing.metadata[_MERGED_IDS_KEY] = ids
+    existing.absorbed_message_ids = ids + [i for i in message_ids(incoming) if i not in ids]
 
 
 async def _set(adapter: Any, message_id: str, emoji: Optional[str]) -> bool:
@@ -84,3 +80,27 @@ async def finish(adapter: Any, event: Any, failed: bool) -> None:
     for message_id in await mark(adapter, event, None):
         if failed:
             await adapter._add_reaction(message_id, FAILED)
+
+
+class FeishuBadgesMixin:
+    """The gateway's processing hooks, as Feishu badges on the adapter."""
+
+    async def on_processing_start(self, event: Any) -> None:
+        await mark(self, event, RUNNING)
+
+    async def on_processing_complete(self, event: Any, outcome: Any) -> None:
+        from gateway.platforms.event import ProcessingOutcome
+        await finish(self, event, failed=outcome is ProcessingOutcome.FAILURE)
+
+    async def mark_event_queued(self, event: Any) -> None:
+        """A busy session stored ``event`` for a later turn: badge its messages "one second"."""
+        await mark(self, event, QUEUED, only_unbadged=True)
+
+    async def mark_event_running(self, event: Any) -> None:
+        """``event`` was folded into the running turn (steer): badge it "working"; the turn's
+        completion clears it with the rest of the turn's messages."""
+        await mark(self, event, RUNNING)
+
+    async def mark_event_dropped(self, event: Any) -> None:
+        """``event`` will never be answered (/stop, /new): clear its badges."""
+        await mark(self, event, None)
