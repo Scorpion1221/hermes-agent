@@ -555,6 +555,12 @@ class GatewayBusySessionMixin:
                 _match = self._plaintext_approval_words().get(_raw_text)
                 if _match is not None:
                     _verb, _normalized_args = _match
+                    _denied = self._check_slash_access(event.source, _verb)
+                    _adapter = self._delivery_adapter_for(event.source)
+                    if _denied is not None:  # a typed "yes" must not do what "/approve" may not
+                        if _adapter:
+                            await self._send_busy_reply(event, _adapter, _denied, plain_anchor=True)
+                        return True
                     _approval_handler = (
                         self._handle_approve_command if _verb == "approve" else self._handle_deny_command
                     )
@@ -567,7 +573,6 @@ class GatewayBusySessionMixin:
                         "Approval response via plain text: session=%s verb=%s args=%r",
                         session_key, _verb, _normalized_args,
                     )
-                    _adapter = self._delivery_adapter_for(event.source)
                     if _adapter and _reply:
                         _text, _eph_ttl = _adapter._unwrap_ephemeral(_reply)
                         if _text:
@@ -598,6 +603,12 @@ class GatewayBusySessionMixin:
         )
         if demoted_for_compression:
             effective_mode = self._demote_interrupt(session_key, "context compression is in flight (#56391)")
+        if effective_mode in {"interrupt", "steer"} and self._busy_followup_is_cross_sender(event, running_agent):
+            # Steer, redirect and interrupt are the turn owner's corrections. In a shared group/topic
+            # session another participant's message is not: it gets its own turn instead of being
+            # spliced into (or cutting short) someone else's.
+            logger.info("Queueing another participant's busy follow-up for shared session %s", session_key)
+            effective_mode = "queue"
         steered = redirected = False
         agent_live = running_agent is not None and running_agent is not _AGENT_PENDING_SENTINEL
         plain_text = (
@@ -633,6 +644,27 @@ class GatewayBusySessionMixin:
             effective_mode=effective_mode, demoted_for_subagents=demoted_for_subagents,
             demoted_for_compression=demoted_for_compression, steered=steered, redirected=redirected,
         )
+
+    def _busy_followup_is_cross_sender(self, event: MessageEvent, running_agent: Any) -> bool:
+        """A busy follow-up in a SHARED session from someone other than the running turn's sender
+        (identities compared across user_id / user_id_alt). Unknown identities keep the old behaviour."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        from gateway.session import is_shared_multi_user_session
+        if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
+            return False
+        config = getattr(self, "config", None)
+        if not is_shared_multi_user_session(
+            event.source, group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
+            thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+        ):
+            return False
+
+        def _ids(*values: Any) -> set[str]:
+            return {v for v in values if isinstance(v, str) and v}
+
+        owner = _ids(getattr(running_agent, "_user_id", None), getattr(running_agent, "_user_id_alt", None))
+        sender = _ids(event.source.user_id, getattr(event.source, "user_id_alt", None))
+        return bool(owner) and bool(sender) and not owner & sender
 
     @staticmethod
     def _demote_interrupt(session_key: str, why: str) -> str:
