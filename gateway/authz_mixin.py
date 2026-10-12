@@ -657,7 +657,9 @@ class GatewayAuthorizationMixin:
         # Pairing store: a first-class grant created only by an operator approving a code. Honored as
         # a UNION with the allowlist (approval also mirrors into it).
         pairing_store = self._pairing_store_for(source)
-        if pairing_store is not None and pairing_store.is_approved(source.platform.value if source.platform else "", user_id):
+        sender_ids = [user_id, *(a for a in getattr(source, "auth_aliases", ()) or () if a and a != user_id)]
+        platform_name = source.platform.value if source.platform else ""
+        if pairing_store is not None and any(pairing_store.is_approved(platform_name, i) for i in sender_ids):
             return True
 
         platform_allowlist = _auth_env(platform_allow_env)
@@ -693,7 +695,7 @@ class GatewayAuthorizationMixin:
         )
         if platform_allowlist:
             allowed_ids |= self._adapter_resolved_allowlist_ids(source)
-        return "*" in allowed_ids or _principal_matches_allowlist(source, user_id, allowed_ids)
+        return "*" in allowed_ids or any(_principal_matches_allowlist(source, i, allowed_ids) for i in sender_ids)
 
     def _get_unauthorized_dm_behavior(self, platform: Optional[Platform], *, profile: Optional[str] = None) -> str:
         """How unauthorized DMs are handled ("pair" / "ignore" / "decline") for a platform.

@@ -75,6 +75,9 @@ class SessionSource:
     thread_id: Optional[str] = None  # forum topics, Discord threads, etc.
     chat_topic: Optional[str] = None  # channel topic/description (Discord, Slack)
     user_id_alt: Optional[str] = None  # platform-specific stable alt ID (Signal UUID, Feishu union_id)
+    # Every other id the same sender is known by on this platform, for authorization only (an allowlist
+    # or pairing written with one id still matches after the adapter switches which one is primary).
+    auth_aliases: tuple[str, ...] = ()
     chat_id_alt: Optional[str] = None  # Signal group internal ID
     is_bot: bool = False  # message author is a bot/webhook (Discord)
     # Platform-neutral SCOPE discriminator (Discord guild / Slack workspace / Matrix server) driving

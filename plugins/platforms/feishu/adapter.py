@@ -2156,6 +2156,7 @@ class FeishuAdapter(FeishuMediaTypesMixin, BasePlatformAdapter):
             thread_id=thread_id,
             user_id_alt=sender_profile["user_id_alt"],
         )
+        source.auth_aliases = tuple(sender_profile.get("auth_aliases") or ())  # an allowlist under another id still matches
         synthetic_event = MessageEvent(
             text=text, message_type=message_type, source=source, raw_message=raw_message,
             message_id=message_id, channel_prompt=self._resolve_channel_prompt(chat_id, thread_id),
@@ -2320,6 +2321,7 @@ class FeishuAdapter(FeishuMediaTypesMixin, BasePlatformAdapter):
             is_bot=is_bot,
             message_id=message_id,
         )
+        source.auth_aliases = tuple(sender_profile.get("auth_aliases") or ())  # an allowlist under another id still matches
         normalized = MessageEvent(
             text=text, message_type=inbound_type, source=source, raw_message=data,
             message_id=message_id, media_urls=media_urls + quote.media_urls, media_types=media_types + quote.media_types,
@@ -2854,7 +2856,8 @@ class FeishuAdapter(FeishuMediaTypesMixin, BasePlatformAdapter):
         primary_id = user_id or open_id
         name_lookup_id = open_id if is_bot else (primary_id or union_id)  # bots/basic_batch only takes open_id
         display_name = await self._resolve_sender_name_from_api(name_lookup_id, is_bot=is_bot)
-        return {"user_id": primary_id, "user_name": display_name, "user_id_alt": union_id}
+        aliases = tuple(i for i in (open_id, user_id, union_id) if i and i != primary_id)
+        return {"user_id": primary_id, "user_name": display_name, "user_id_alt": union_id, "auth_aliases": aliases}
 
     def _get_cached_sender_name(self, sender_id: Optional[str]) -> Optional[str]:
         """Return a cached sender name only while its TTL is still valid."""
