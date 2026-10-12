@@ -106,9 +106,7 @@ logger = logging.getLogger(__name__)
 # --- Regex patterns ---
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 # --- Media type sets and upload constants ---
-_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
-_AUDIO_EXTENSIONS = {".ogg", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".opus", ".webm"}
-_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".3gp"}
+from .feishu_media_types import _AUDIO_EXTENSIONS, _IMAGE_EXTENSIONS, _VIDEO_EXTENSIONS  # noqa: E402
 _DOCUMENT_MIME_TO_EXT = {mime: ext for ext, mime in SUPPORTED_DOCUMENT_TYPES.items()}
 _FEISHU_IMAGE_UPLOAD_TYPE = "message"
 _FEISHU_FILE_UPLOAD_TYPE = "stream"
@@ -1005,7 +1003,10 @@ def _sdk_build(request_cls: Any, **fields: Any) -> Any:
     return builder.build()
 
 
-class FeishuAdapter(BasePlatformAdapter):
+from .feishu_media_types import FeishuMediaTypesMixin  # noqa: E402
+
+
+class FeishuAdapter(FeishuMediaTypesMixin, BasePlatformAdapter):
     """Feishu/Lark bot adapter."""
     # Answers /p/<profile>/... on the default listener for a served secondary (shared_ingress).
     serves_profile_prefix: bool = True
@@ -2810,77 +2811,6 @@ class FeishuAdapter(BasePlatformAdapter):
                 logger.warning("[Feishu] Failed to cache message resource %s/%s", message_id, file_key, exc_info=True)
         return "", ""
 
-    # --- Static helpers — extension / media-type guessing ---
-    @staticmethod
-    def _read_binary_response(response: Any) -> bytes:
-        file_obj = getattr(response, "file", None)
-        if file_obj is None:
-            return b""
-        if hasattr(file_obj, "getvalue"):
-            return bytes(file_obj.getvalue())
-        return bytes(file_obj.read())
-
-    @staticmethod
-    def _get_response_header(response: Any, name: str) -> str:
-        raw = getattr(response, "raw", None)
-        headers = getattr(raw, "headers", {}) or {}
-        return str(headers.get(name, headers.get(name.lower(), "")) or "").split(";", 1)[0].strip().lower()
-
-    @staticmethod
-    def _guess_extension(filename: str, content_type: str, default: str, *, allowed: set[str]) -> str:
-        ext = Path(filename or "").suffix.lower()
-        if ext in allowed:
-            return ext
-        guessed = mimetypes.guess_extension((content_type or "").split(";", 1)[0].strip().lower() or "")
-        return guessed if guessed in allowed else default
-
-    @staticmethod
-    def _normalize_media_type(content_type: str, *, default: str) -> str:
-        normalized = (content_type or "").split(";", 1)[0].strip().lower()
-        return normalized or default
-
-    @staticmethod
-    def _guess_document_media_type(filename: str) -> str:
-        ext = Path(filename or "").suffix.lower()
-        return SUPPORTED_DOCUMENT_TYPES.get(ext, mimetypes.guess_type(filename or "")[0] or "application/octet-stream")
-
-    @staticmethod
-    def _display_name_from_cached_path(path: str) -> str:
-        basename = os.path.basename(path)
-        parts = basename.split("_", 2)
-        display_name = parts[2] if len(parts) >= 3 else basename
-        return re.sub(r"[^\w.\- ]", "_", display_name)
-
-    @staticmethod
-    def _guess_media_type_from_filename(filename: str) -> str:
-        guessed = (mimetypes.guess_type(filename or "")[0] or "").lower()
-        if guessed:
-            return guessed
-        ext = Path(filename or "").suffix.lower()
-        if ext in _VIDEO_EXTENSIONS:
-            return f"video/{ext.lstrip('.')}"
-        if ext in _AUDIO_EXTENSIONS:
-            return f"audio/{ext.lstrip('.')}"
-        if ext in _IMAGE_EXTENSIONS:
-            return FeishuAdapter._default_image_media_type(ext)
-        return ""
-
-    @staticmethod
-    def _map_chat_type(raw_chat_type: str) -> str:
-        normalized = (raw_chat_type or "").strip().lower()
-        if normalized == "p2p":
-            return "dm"
-        if any(marker in normalized for marker in ("topic", "thread", "forum")):
-            return "forum"
-        return "group" if normalized == "group" else "dm"
-
-    @staticmethod
-    def _resolve_source_chat_type(*, chat_info: dict[str, Any], event_chat_type: str) -> str:
-        resolved = str(chat_info.get("type") or "").strip().lower()
-        if resolved in {"group", "forum"}:
-            return resolved
-        return "dm" if event_chat_type == "p2p" else "group"
-
     async def _resolve_sender_profile(self, sender_id: Any, *, is_bot: bool = False) -> dict[str, Optional[str]]:
         """Map Feishu's ID tiers onto SessionSource: user_id (tenant) > open_id (app) as primary,
         union_id (developer-scoped, cross-app stable) as user_id_alt — session keys prefer the alt."""
@@ -2951,13 +2881,6 @@ class FeishuAdapter(BasePlatformAdapter):
         """The quoted message's chain text, own-message flag and (unless ``media=False``) media; see ``feishu_quote``."""
         from .feishu_quote import fetch_quoted_reply
         return await fetch_quoted_reply(self, message_id, inbound=inbound, media=media)
-
-    @staticmethod
-    def _default_image_media_type(ext: str) -> str:
-        normalized_ext = (ext or "").lower()
-        if normalized_ext in {".jpg", ".jpeg"}:
-            return "image/jpeg"
-        return f"image/{normalized_ext.lstrip('.') or 'jpeg'}"
 
     @staticmethod
     def _log_background_failure(future: Any) -> None:
