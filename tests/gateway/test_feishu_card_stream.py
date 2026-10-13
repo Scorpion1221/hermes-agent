@@ -610,3 +610,54 @@ async def test_a_terminal_command_in_the_card_is_a_one_line_quote_not_a_fence():
     assert "```" not in text
     progress = [ln for ln in text.splitlines() if ln.startswith("> ")]
     assert len(progress) == 1 and "echo same" in progress[0]
+
+
+def _done_marked(adapter: FeishuAdapter) -> list[str]:
+    marked: list[str] = []
+
+    async def _add(message_id, emoji):
+        marked.append((message_id, emoji))
+        return "r1"
+
+    adapter._add_reaction = _add
+    return marked
+
+
+@pytest.mark.asyncio
+async def test_the_final_reply_card_gets_a_done_reaction_and_rolled_cards_do_not(monkeypatch):
+    monkeypatch.setattr(feishu_stream, "MAX_CARD_CHARS", 40)
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    marked = _done_marked(adapter)
+    paragraphs = [f"paragraph {i} " + "x" * 10 + "\n\n" for i in range(6)]
+
+    await _stream(adapter, paragraphs, "".join(paragraphs).rstrip())
+
+    replies = [r.request_body.content for name, r in fake.calls if name in {"message.reply", "message.create"}]
+    assert len(replies) >= 2  # rolled over at least once
+    assert [emoji for _, emoji in marked] == ["DONE"]
+    assert marked[0][0] == f"om_reply_{len(replies)}"  # the last card, not an earlier one
+
+
+@pytest.mark.asyncio
+async def test_a_card_sealed_for_a_prompt_is_not_marked_done():
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    marked = _done_marked(adapter)
+    await adapter.send_draft("oc_chat", 61, "before the prompt", metadata={"reply_to_message_id": "om_user_1"})
+
+    await feishu_stream.seal_for_prompt(adapter, "oc_chat")
+
+    assert fake.final_bodies() and marked == []
+
+
+@pytest.mark.asyncio
+async def test_with_reactions_off_the_final_card_is_not_marked(monkeypatch):
+    monkeypatch.setenv("FEISHU_REACTIONS", "false")
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    marked = _done_marked(adapter)
+
+    await _stream(adapter, ["hello"], "hello")
+
+    assert fake.final_bodies() and marked == []

@@ -32,6 +32,8 @@ from gateway.platforms.base import SendResult
 logger = logging.getLogger(__name__)
 
 # Cards older than this roll over before Feishu's ~600 s streaming window closes under them.
+# Reaction on the turn's final reply card.
+COMPLETE = "DONE"
 MAX_CARD_AGE_SECONDS = 540.0
 # Roll over well before a markdown element's ~30k-character limit (headroom for the render pass).
 MAX_CARD_CHARS = 24_000
@@ -346,9 +348,21 @@ async def _seal_turn(adapter: Any, stream: TurnStream, content: str) -> Optional
                 return await _plain_tail(adapter, stream, part)
             return None
     if await _seal(adapter, card, part):
+        await _mark_complete(adapter, card.message_id)
         return SendResult(success=True, message_id=card.message_id)
     logger.warning("[Feishu] Sealing the reply card failed; delivering the final as a plain message")
     return None
+
+
+async def _mark_complete(adapter: Any, message_id: str) -> None:
+    """The reply card is final: a DONE reaction says so, since a long stream gives no other signal it
+    ended. Only the turn's last card gets it, never a card sealed for a prompt or a rollover."""
+    if not adapter._reactions_enabled():
+        return
+    try:
+        await adapter._add_reaction(message_id, COMPLETE)
+    except Exception:  # the card is already sealed: a missing reaction must never undo that
+        logger.debug("[Feishu] DONE reaction on %s failed", message_id, exc_info=True)
 
 
 async def _plain_tail(adapter: Any, stream: TurnStream, part: str) -> SendResult:
