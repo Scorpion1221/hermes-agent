@@ -1354,8 +1354,8 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
         from .feishu_outbound import send_message
         from .feishu_stream import seal_with_final
         md = dict(metadata or {})
-        turn = {**md, "reply_to_message_id": md.get("reply_to_message_id") or reply_to}
-        if not md.pop("_interim_send", False) and (sealed := await seal_with_final(self, chat_id, content, turn)):
+        turn, final = {**md, "reply_to_message_id": md.get("reply_to_message_id") or reply_to}, bool(md.get("reply_to_message_id"))
+        if not md.pop("_interim_send", False) and (sealed := await seal_with_final(self, chat_id, content, turn, stream_final=final)):
             return sealed
         return await send_message(self, chat_id, content, reply_to=reply_to, metadata=md or None)
 

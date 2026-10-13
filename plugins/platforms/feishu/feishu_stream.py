@@ -331,13 +331,22 @@ async def _frame(adapter: Any, streams: CardStreams, stream: TurnStream, content
     return SendResult(success=False, error=f"CardKit stream failed: [{result.code}] {result.msg}")
 
 
-async def seal_with_final(adapter: Any, chat_id: str, content: str,
-                          metadata: Optional[dict[str, Any]]) -> Optional[SendResult]:
-    """Seal the turn's open card with the final text; None when no card is open (a plain send follows)."""
+async def seal_with_final(adapter: Any, chat_id: str, content: str, metadata: Optional[dict[str, Any]],
+                          *, stream_final: bool = False) -> Optional[SendResult]:
+    """Seal the turn's open card with the final text; None when no card is open (a plain send follows).
+    ``stream_final``: the stream consumer's own final (its metadata names the user's message)."""
     streams = _registry(adapter)
     key = streams.match(chat_id, metadata)
     if key is None:
-        return None
+        md = dict(metadata or {})
+        if not stream_final or md.get("notify") is not True or not adapter.supports_draft_streaming():
+            return None
+        # The turn's reply arrived in one piece and never opened a card: give it the card a streamed reply
+        # ends as (footer, DONE). Command replies and notices are not the consumer's final: plain cards.
+        stream = TurnStream(key="", draft_id=-1, chat_id=chat_id, reply_to=md.get("reply_to_message_id"),
+                            metadata=md, started_at=_now())
+        async with stream.lock:
+            return await _seal_turn(adapter, stream, content)
     stream = streams.open.pop(key)
     streams.tombstone(key, stream.draft_id)
     async with stream.lock:

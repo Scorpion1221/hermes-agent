@@ -737,3 +737,34 @@ def test_the_footer_is_localized():
     from agent.i18n import t
 
     assert t("platform.feishu.stream.done", lang="zh", elapsed="1.0s") == "已完成 · 耗时 1.0s"
+
+
+@pytest.mark.asyncio
+async def test_a_reply_that_arrives_in_one_piece_still_ends_as_a_done_card():
+    """A short reply ("OK") reaches the final before any frame opened a card: it gets the same sealed
+    card, elapsed footer and DONE reaction a streamed reply ends with."""
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    marked = _done_marked(adapter)
+    consumer = _consumer(adapter)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("OK")
+    consumer.finish("OK")
+    await task
+
+    (body,) = fake.final_bodies()
+    assert _final_text(body) == "OK" and _footer(body).startswith("Done · ")
+    assert [emoji for _, emoji in marked] == ["DONE"]
+    assert fake.names().count("message.reply") + fake.names().count("message.create") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_command_reply_with_no_turn_stays_a_plain_card():
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    marked = _done_marked(adapter)
+
+    await adapter.send("oc_chat", "Busy input mode set to `queue`.", reply_to="om_user_9", metadata={"notify": True})
+
+    assert fake.final_bodies() == [] and "card.create" not in fake.names()
+    assert marked == []
