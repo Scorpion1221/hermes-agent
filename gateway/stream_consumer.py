@@ -246,6 +246,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         stream-is-the-message draft whose adapter keeps progress inline (``inline_tool_progress``)."""
         return self._use_native_streaming or self._inline_tool_progress()
 
+    @property
+    def keeps_progress_inline(self) -> bool:
+        """Tool progress becomes quote lines inside the streamed reply (see ``_inline_tool_progress``)."""
+        return self._inline_tool_progress()
+
     def _inline_tool_progress(self) -> bool:
         """The adapter opted in to keeping tool-progress lines in the streamed message, in order with
         the text (a card that IS the reply). Checked on the CLASS (MagicMock-safe)."""

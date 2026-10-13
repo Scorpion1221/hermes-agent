@@ -100,8 +100,7 @@ class TurnRunner:
             return False
 
     def _stream_consumer(self):
-        holder = self._ctx.stream_consumer_holder
-        return holder[0] if holder else None
+        return (getattr(self._ctx, "stream_consumer_holder", None) or [None])[0]
 
     def _drain_progress_queue(self) -> None:
         q = self._ctx.progress_queue
@@ -244,11 +243,12 @@ class TurnRunner:
         No language tag: Slack mrkdwn renders it as a literal first code line. Verbose shows the FULL
         command; "all"/"new" truncate to one line capped at ``tool_preview_length``. Consecutive
         terminal calls drop the repeated header so back-to-back commands render as adjacent blocks.
+        Progress inside the streamed reply is a quote line a fence would cross: one-line preview there.
         """
         if not (
             getattr(adapter, "supports_code_blocks", False) and tool_name == "terminal" and isinstance(args, dict)
             and isinstance(args.get("command"), str) and args["command"].strip()
-        ):
+        ) or getattr(self._stream_consumer(), "keeps_progress_inline", False) is True:
             return None, None
         cmd_full = args["command"].rstrip()
         header = "" if self._ctx.last_was_terminal_block[0] else t("gateway.progress.tool_head", emoji=emoji, tool=tool_name) + "\n"

@@ -582,3 +582,31 @@ async def test_after_a_rollover_a_failed_card_create_never_resends_what_sealed_c
               and "schema" in json.loads(r.request_body.content)]
     (plain_tail,) = posted
     assert plain_tail["body"]["elements"][0]["content"] == "and tail"
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_command_in_the_card_is_a_one_line_quote_not_a_fence():
+    """The runner's progress line for a terminal call, kept inside the card: a fenced block would cross
+    the quote line and render its backticks literally, so it is the compact preview instead."""
+    from gateway.run_turn_runner import TurnRunner
+
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    consumer = _consumer(adapter)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("Let me check.")
+    await asyncio.sleep(0.05)
+    ctx = SimpleNamespace(source=None, progress_mode="all", last_was_terminal_block=[False],
+                          stream_consumer_holder=[consumer])
+    runner = TurnRunner(SimpleNamespace(_delivery_adapter_for=lambda source: adapter), ctx)
+    line = runner._progress_build_message("terminal", "echo same; pwd", {"command": "echo same; pwd"})
+    consumer.on_tool_progress(line)
+    await asyncio.sleep(0.05)
+    consumer.finish("Let me check.")
+    await task
+
+    (body,) = fake.final_bodies()
+    text = _final_text(body)
+    assert "```" not in text
+    progress = [ln for ln in text.splitlines() if ln.startswith("> ")]
+    assert len(progress) == 1 and "echo same" in progress[0]
