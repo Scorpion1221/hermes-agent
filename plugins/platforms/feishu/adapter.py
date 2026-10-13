@@ -107,6 +107,7 @@ logger = logging.getLogger(__name__)
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 # --- Media type sets and upload constants ---
 from .feishu_message_time import message_sent_at  # noqa: E402
+from .feishu_card_scan import _find_first_text, _find_header_title, _walk_nodes  # noqa: E402
 from .feishu_media_types import _AUDIO_EXTENSIONS, _IMAGE_EXTENSIONS, _VIDEO_EXTENSIONS  # noqa: E402
 _DOCUMENT_MIME_TO_EXT = {mime: ext for ext, mime in SUPPORTED_DOCUMENT_TYPES.items()}
 _FEISHU_IMAGE_UPLOAD_TYPE = "message"
@@ -285,6 +286,7 @@ class FeishuAdapterSettings:
     group_rules: dict[str, FeishuGroupRule] = field(default_factory=dict)
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
+    respond_to_at_all: bool = True  # an @all in a group counts as mentioning the bot
     allow_all_dm: bool = False  # resolved per-profile so multiplexed adapters honor their own .env
     quote_chain_max_depth: int = 20  # quoted messages walked toward the root; 0/1 = the direct quote only
     render_mode: str = "card"  # "card": Card JSON 2.0 markdown; "post": post md / text (upstream)
@@ -553,41 +555,6 @@ def _build_media_ref_from_payload(payload: dict[str, Any], *, resource_type: str
 def _attachment_placeholder(file_name: str) -> str:
     normalized_name = _normalize_feishu_text(file_name)
     return f"[Attachment: {normalized_name}]" if normalized_name else FALLBACK_ATTACHMENT_TEXT
-
-
-def _find_header_title(payload: Any) -> str:
-    if not isinstance(payload, dict):
-        return ""
-    header = payload.get("header")
-    if not isinstance(header, dict):
-        return ""
-    title = header.get("title")
-    if isinstance(title, dict):
-        return _first_non_empty_text(title.get("content"), title.get("text"), title.get("name"))
-    return _normalize_feishu_text(str(title or ""))
-
-
-def _find_first_text(payload: Any, *, keys: tuple[str, ...]) -> str:
-    for node in _walk_nodes(payload):
-        if not isinstance(node, dict):
-            continue
-        for key in keys:
-            value = node.get(key)
-            if isinstance(value, str):
-                normalized = _normalize_feishu_text(value)
-                if normalized:
-                    return normalized
-    return ""
-
-
-def _walk_nodes(value: Any):
-    if isinstance(value, dict):
-        yield value
-        for item in value.values():
-            yield from _walk_nodes(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _walk_nodes(item)
 
 
 def _first_non_empty_text(*values: Any) -> str:
@@ -1139,6 +1106,7 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
             admins=frozenset(_id_set(extra.get("admins", []))),
             default_group_policy=str(extra.get("default_group_policy", "")).strip().lower(),
             group_rules=group_rules, allow_bots=allow_bots, allow_all_dm=allow_all_dm,
+            respond_to_at_all=_to_boolean(extra.get("respond_to_at_all", True)),
             require_mention=_to_boolean(extra.get("require_mention", _get_scoped_secret("FEISHU_REQUIRE_MENTION", "true"))),
             quote_chain_max_depth=_coerce_required_int(extra.get("quote_chain_max_depth"), default=20, min_value=0),
             render_mode=_render_mode(extra.get("render_mode")),
@@ -2995,9 +2963,9 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
         return bool(sender_ids and (sender_ids & self._allowed_group_users))
 
     def _mentions_self(self, message: Any) -> bool:
-        # @_all is Feishu's @everyone placeholder.
+        # @_all is Feishu's @everyone placeholder (platforms.feishu.extra.respond_to_at_all: false ignores it).
         raw_content = getattr(message, "content", "") or ""
-        if "@_all" in raw_content:
+        if "@_all" in raw_content and self._respond_to_at_all:
             return True
         mentions = getattr(message, "mentions", None) or []
         if mentions and self._message_mentions_bot(mentions):
