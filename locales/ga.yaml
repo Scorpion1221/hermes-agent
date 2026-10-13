@@ -1385,6 +1385,8 @@ platform:
       manage_hint: "Chun é a athrú nó a chur ar sos, freagair le hainm an tasc."
     stream:
       continued: "Ar lean thíos ↓"
+      done: "Críochnaithe · {elapsed}"
+      stopped: "Stoptha · {elapsed}"
   google_chat:
     clarify:
       other_button: "Eile / clóscríobh freagra"

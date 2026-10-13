@@ -1385,6 +1385,8 @@ platform:
       manage_hint: "Para alterá-la ou pausá-la, responda com o nome da tarefa."
     stream:
       continued: "Continua abaixo ↓"
+      done: "Concluído · {elapsed}"
+      stopped: "Interrompido · {elapsed}"
   google_chat:
     clarify:
       other_button: "Outra / digitar resposta"

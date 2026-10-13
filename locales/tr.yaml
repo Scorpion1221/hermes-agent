@@ -1385,6 +1385,8 @@ platform:
       manage_hint: "Değiştirmek veya duraklatmak için görev adıyla yanıtlayın."
     stream:
       continued: "Aşağıda devam ediyor ↓"
+      done: "Tamamlandı · {elapsed}"
+      stopped: "Durduruldu · {elapsed}"
   google_chat:
     clarify:
       other_button: "Diğer / yanıt yazın"

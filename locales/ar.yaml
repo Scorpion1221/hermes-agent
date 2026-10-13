@@ -1385,6 +1385,8 @@ platform:
       manage_hint: "لتعديلها أو إيقافها مؤقتًا، رد باسم المهمة."
     stream:
       continued: "يتبع أدناه ↓"
+      done: "تم · {elapsed}"
+      stopped: "توقف · {elapsed}"
   google_chat:
     clarify:
       other_button: "غير ذلك / اكتب إجابة"

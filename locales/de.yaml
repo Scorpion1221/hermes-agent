@@ -1385,6 +1385,8 @@ platform:
       manage_hint: "Zum Ändern oder Pausieren mit dem Jobnamen antworten."
     stream:
       continued: "Weiter unten ↓"
+      done: "Fertig · {elapsed}"
+      stopped: "Gestoppt · {elapsed}"
   google_chat:
     clarify:
       other_button: "Sonstiges / Antwort eingeben"

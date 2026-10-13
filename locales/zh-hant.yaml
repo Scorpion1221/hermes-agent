@@ -1385,6 +1385,8 @@ platform:
       manage_hint: "需要調整或暫停？回覆並說明任務名稱即可。"
     stream:
       continued: "繼續 ↓"
+      done: "已完成 · 耗時 {elapsed}"
+      stopped: "已停止 · 耗時 {elapsed}"
   google_chat:
     clarify:
       other_button: "其他／輸入答案"

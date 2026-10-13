@@ -1385,6 +1385,8 @@ platform:
       manage_hint: "Per modificarla o metterla in pausa, rispondi con il nome dell'attività."
     stream:
       continued: "Continua sotto ↓"
+      done: "Fatto · {elapsed}"
+      stopped: "Interrotto · {elapsed}"
   google_chat:
     clarify:
       other_button: "Altro / digita la risposta"

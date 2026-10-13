@@ -1611,6 +1611,8 @@ platform:
       manage_hint: "Pour la modifier ou la suspendre, répondez avec le nom de la tâche."
     stream:
       continued: "Suite ci-dessous ↓"
+      done: "Terminé · {elapsed}"
+      stopped: "Arrêté · {elapsed}"
   google_chat:
     clarify:
       other_button: "Autre / saisir une réponse"

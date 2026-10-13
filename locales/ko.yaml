@@ -1385,6 +1385,8 @@ platform:
       manage_hint: "변경하거나 일시 중지하려면 작업 이름과 함께 답장하세요."
     stream:
       continued: "아래에 계속 ↓"
+      done: "완료 · {elapsed}"
+      stopped: "중지됨 · {elapsed}"
   google_chat:
     clarify:
       other_button: "기타 / 직접 입력"

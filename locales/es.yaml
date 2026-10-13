@@ -1385,6 +1385,8 @@ platform:
       manage_hint: "Para cambiarla o pausarla, responde con el nombre del trabajo."
     stream:
       continued: "Continúa abajo ↓"
+      done: "Listo · {elapsed}"
+      stopped: "Detenido · {elapsed}"
   google_chat:
     clarify:
       other_button: "Otro / escribir respuesta"

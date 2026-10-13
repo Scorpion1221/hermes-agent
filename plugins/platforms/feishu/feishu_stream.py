@@ -40,6 +40,11 @@ MAX_CARD_CHARS = 24_000
 _STATE_CAP = 512
 
 
+def _now() -> float:
+    """Card ages and the elapsed footer (a seam tests drive without slowing asyncio's own clock)."""
+    return time.monotonic()
+
+
 @dataclass
 class LiveCard:
     card_id: str
@@ -66,6 +71,7 @@ class TurnStream:
     card: Optional[LiveCard] = None
     sealed_prefix: str = ""  # reply text shown by earlier cards of this turn
     first_message_id: Optional[str] = None
+    started_at: Optional[float] = None  # monotonic time the turn's first card opened (the elapsed footer)
     # Serializes every card operation of the turn (frames, seal, rollover, prompt and quiet seals), so no
     # operation ever sees a card another one swapped out mid-await.
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -171,6 +177,18 @@ def _continued_footer() -> str:
     return t("platform.feishu.stream.continued")
 
 
+def _elapsed_footer(stream: TurnStream, *, stopped: bool = False) -> str:
+    """"Done · 12.3s" / "Stopped · 1m 5s", timed from the turn's first card (a continuation card
+    reports the whole reply)."""
+    from agent.i18n import t
+
+    if stream.started_at is None:
+        return ""
+    seconds = max(0.0, _now() - stream.started_at)
+    elapsed = f"{int(seconds // 60)}m {int(seconds % 60)}s" if seconds >= 60 else f"{seconds:.1f}s"
+    return t("platform.feishu.stream.stopped" if stopped else "platform.feishu.stream.done", elapsed=elapsed)
+
+
 async def _write(adapter: Any, card: LiveCard, text: str) -> Any:
     """Stream ``text`` into ``card``; a refused mention switches the card to plain-text mentions once."""
     from . import feishu_cardkit as ck
@@ -210,7 +228,7 @@ async def _open_card(adapter: Any, stream: TurnStream, text: str) -> Optional[Li
     card_id = await ck.create_card(adapter)
     if not card_id:
         return None
-    card = LiveCard(card_id=card_id, message_id="", created_at=time.monotonic())
+    card = LiveCard(card_id=card_id, message_id="", created_at=_now())
     try:
         response = await adapter._feishu_send_with_retry(
             chat_id=stream.chat_id, msg_type="interactive", payload=ck.card_message_content(card_id),
@@ -226,6 +244,8 @@ async def _open_card(adapter: Any, stream: TurnStream, text: str) -> Optional[Li
         return None
     card.message_id = result.message_id
     stream.first_message_id = stream.first_message_id or card.message_id
+    if stream.started_at is None:
+        stream.started_at = card.created_at
     if text:
         await _write(adapter, card, text)
         card.shown = text
@@ -246,7 +266,7 @@ async def _roll_over(adapter: Any, stream: TurnStream, *, footer: Optional[str] 
 
 
 def _needs_rollover(card: LiveCard, part: str) -> bool:
-    return time.monotonic() - card.created_at >= MAX_CARD_AGE_SECONDS or len(part) > MAX_CARD_CHARS
+    return _now() - card.created_at >= MAX_CARD_AGE_SECONDS or len(part) > MAX_CARD_CHARS
 
 
 # Failures a later frame (or the seal, which carries the whole text) repairs: not a reason to give up
@@ -347,7 +367,7 @@ async def _seal_turn(adapter: Any, stream: TurnStream, content: str) -> Optional
                 # Earlier cards show the head: post only what they do not, never the whole reply again.
                 return await _plain_tail(adapter, stream, part)
             return None
-    if await _seal(adapter, card, part):
+    if await _seal(adapter, card, part, footer=_elapsed_footer(stream)):
         await _mark_complete(adapter, card.message_id)
         return SendResult(success=True, message_id=card.message_id)
     logger.warning("[Feishu] Sealing the reply card failed; delivering the final as a plain message")
@@ -384,7 +404,7 @@ async def abandon(adapter: Any, chat_id: str, content: str, metadata: Optional[d
         if card is None:
             return SendResult(success=True)
         shown = card.shown or _remainder(content, stream.sealed_prefix)
-        ok = await _seal(adapter, card, shown)
+        ok = await _seal(adapter, card, shown, footer=_elapsed_footer(stream, stopped=True))
     return SendResult(success=ok, message_id=card.message_id, error=None if ok else "CardKit abandon seal failed")
 
 
@@ -410,7 +430,7 @@ async def seal_quiet_cards(adapter: Any) -> None:
         if stream.lock.locked():
             continue  # a frame or seal is working on it; that path rolls an old card over itself
         async with stream.lock:
-            if stream.card is not None and time.monotonic() - stream.card.created_at >= MAX_CARD_AGE_SECONDS:
+            if stream.card is not None and _now() - stream.card.created_at >= MAX_CARD_AGE_SECONDS:
                 await _roll_over(adapter, stream)
 
 

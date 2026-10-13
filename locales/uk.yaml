@@ -1385,6 +1385,8 @@ platform:
       manage_hint: "Щоб змінити чи призупинити, відповідайте з назвою задачі."
     stream:
       continued: "Продовження нижче ↓"
+      done: "Готово · {elapsed}"
+      stopped: "Зупинено · {elapsed}"
   google_chat:
     clarify:
       other_button: "Інше / ввести відповідь"

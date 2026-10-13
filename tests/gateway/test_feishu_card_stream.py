@@ -661,3 +661,79 @@ async def test_with_reactions_off_the_final_card_is_not_marked(monkeypatch):
     await _stream(adapter, ["hello"], "hello")
 
     assert fake.final_bodies() and marked == []
+
+
+def _footer(body: dict):
+    elements = body["body"]["elements"]
+    return elements[1]["content"] if len(elements) > 1 else None
+
+
+@pytest.mark.asyncio
+async def test_the_final_card_says_done_with_the_time_since_the_reply_began(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(feishu_stream, "_now", lambda: now[0])
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    md = {"reply_to_message_id": "om_user_1"}
+    await adapter.send_draft("oc_chat", 70, "hello", metadata=md)
+    now[0] += 12.3
+
+    await adapter.send("oc_chat", "hello", metadata={**md, **FINAL})
+
+    (body,) = fake.final_bodies()
+    assert _final_text(body) == "hello"
+    assert _footer(body) == "Done · 12.3s"
+
+
+@pytest.mark.asyncio
+async def test_a_continuation_card_times_the_whole_reply_and_only_the_last_card_says_done(monkeypatch):
+    monkeypatch.setattr(feishu_stream, "MAX_CARD_CHARS", 40)
+    now = [1000.0]
+    monkeypatch.setattr(feishu_stream, "_now", lambda: now[0])
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    md = {"reply_to_message_id": "om_user_1"}
+    await adapter.send_draft("oc_chat", 71, "first part " + "x" * 20, metadata=md)
+    now[0] += 30
+    await adapter.send_draft("oc_chat", 71, "first part " + "x" * 20 + " second part " + "y" * 20, metadata=md)
+    now[0] += 45
+
+    await adapter.send("oc_chat", "first part " + "x" * 20 + " second part " + "y" * 20, metadata={**md, **FINAL})
+
+    first, last = fake.final_bodies()
+    assert _footer(first) == "Continued below ↓"
+    assert _footer(last) == "Done · 1m 15s"
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_card_says_stopped_with_its_elapsed_time(monkeypatch):
+    now = [500.0]
+    monkeypatch.setattr(feishu_stream, "_now", lambda: now[0])
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    md = {"reply_to_message_id": "om_user_1"}
+    await adapter.send_draft("oc_chat", 72, "partial answer", metadata=md)
+    now[0] += 4.25
+
+    await adapter.abandon_open_draft("oc_chat", "partial answer", metadata=md)
+
+    (body,) = fake.final_bodies()
+    assert _footer(body) == "Stopped · 4.2s"
+
+
+@pytest.mark.asyncio
+async def test_a_card_sealed_for_a_prompt_carries_no_footer():
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    await adapter.send_draft("oc_chat", 73, "before the prompt", metadata={"reply_to_message_id": "om_user_1"})
+
+    await feishu_stream.seal_for_prompt(adapter, "oc_chat")
+
+    (body,) = fake.final_bodies()
+    assert _footer(body) is None
+
+
+def test_the_footer_is_localized():
+    from agent.i18n import t
+
+    assert t("platform.feishu.stream.done", lang="zh", elapsed="1.0s") == "已完成 · 耗时 1.0s"

@@ -1385,6 +1385,8 @@ platform:
       manage_hint: "変更や一時停止は、ジョブ名を添えて返信してください。"
     stream:
       continued: "続きは下へ ↓"
+      done: "完了 · {elapsed}"
+      stopped: "停止 · {elapsed}"
   google_chat:
     clarify:
       other_button: "その他 / 回答を入力"

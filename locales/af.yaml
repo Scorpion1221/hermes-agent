@@ -1385,6 +1385,8 @@ platform:
       manage_hint: "Om dit te verander of te onderbreek, antwoord met die taaknaam."
     stream:
       continued: "Gaan hieronder voort ↓"
+      done: "Klaar · {elapsed}"
+      stopped: "Gestop · {elapsed}"
   google_chat:
     clarify:
       other_button: "Ander / tik antwoord"
