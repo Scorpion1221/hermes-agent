@@ -109,7 +109,7 @@ class MessageEvent:
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
 
-    def absorb_reply_expected(self, other: MessageEvent) -> None:
+    def absorb_reply_expected(self, other: "MessageEvent") -> None:
         """One turn now answers *other* too: an addressed message wins, then an unknown one. The
         message ids it stands for accumulate in ``absorbed_message_ids`` (oldest first), so a
         platform that marks each inbound message (a status reaction) still reaches every one."""
