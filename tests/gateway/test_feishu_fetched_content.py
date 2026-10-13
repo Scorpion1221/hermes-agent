@@ -23,6 +23,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from tests.waiting import wait_until
+
 ROOT = "om_fwd_root"
 NESTED = "om_fwd_nested"
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
@@ -89,7 +91,7 @@ class FakeFeishu:
 
     def _get_message(self, request):
         self.message_gets.append(request)
-        time.sleep(self.get_delay)
+        time.sleep(self.get_delay)  # health: allow HX013 -- a slow forward GET is the scenario: the note behind it must arrive while it is in flight
         if not self.get_ok:
             return SimpleNamespace(success=lambda: False, code=230002, msg="no permission")
         return SimpleNamespace(success=lambda: True, data=SimpleNamespace(items=self.messages[request.message_id]))
@@ -437,13 +439,17 @@ def test_a_sender_no_lookup_can_name_is_not_looked_up_again_on_the_next_forward(
 
 class FlakyContact(FakeFeishu):
     """Feishu under load: each batch answer comes from ``batch_answers`` in turn (then rate-limited), and
-    each sender's first single lookup fails transiently (99991400) before it succeeds."""
+    each sender's first single lookup fails transiently (99991400) before it succeeds.
 
-    def __init__(self, messages, users, batch_answers):
+    With ``overlap``, a single lookup holds its slot until that many are in flight together (or all
+    ``lookups`` expected have started), so lookups overlap however the runner schedules them."""
+
+    def __init__(self, messages, users, batch_answers, *, overlap=1, lookups=0):
         super().__init__(messages, users)
         self.batch_answers = list(batch_answers)
         self.failed_once: set[str] = set()
-        self.in_flight = self.peak_in_flight = 0
+        self.in_flight = self.peak_in_flight = self.started = 0
+        self.overlap, self.lookups = overlap, lookups
         self.lock = threading.Lock()
 
     def request(self, request):
@@ -453,10 +459,12 @@ class FlakyContact(FakeFeishu):
 
     def _get_user(self, request):
         with self.lock:
+            self.started += 1
             self.in_flight += 1
             self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
         try:
-            time.sleep(0.02)
+            wait_until(lambda: self.in_flight >= self.overlap or self.started >= self.lookups,
+                       what=f"{self.overlap} lookups in flight together")
             if request.user_id not in self.failed_once:
                 self.failed_once.add(request.user_id)
                 self.user_gets.append(request.user_id)
@@ -493,10 +501,12 @@ def test_a_transient_lookup_failure_never_hides_a_colleagues_name_from_their_own
 
 
 def test_per_sender_fallback_lookups_run_a_few_at_a_time():
-    from plugins.platforms.feishu.feishu_names import prefetch_user_names
+    from plugins.platforms.feishu.feishu_names import _SINGLE_LOOKUP_CONCURRENCY, prefetch_user_names
 
     ids = [f"ou_user{i:02d}" for i in range(12)]
-    client = FlakyContact({}, {oid: oid for oid in ids}, [RATE_LIMITED])
+    # Each lookup waits for a full set of peers: without the cap, more than that pile in behind them.
+    client = FlakyContact({}, {oid: oid for oid in ids}, [RATE_LIMITED],
+                          overlap=_SINGLE_LOOKUP_CONCURRENCY, lookups=len(ids))
 
     asyncio.run(prefetch_user_names(make_adapter(client), ids))
 

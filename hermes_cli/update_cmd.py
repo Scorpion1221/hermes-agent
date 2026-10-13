@@ -1874,7 +1874,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     completion_request = _source_completion_request(
         opts, _pre_update_plan, pre_update_snapshot_id, _windows_gateway_resume,
         had_desktop_app_before_update, gateway_mode)
-    selected_channel = _source_update_channel(args)
+    selected_channel = _update_run_channel(args)
     fork = None
     if not use_zip_update and _follows_default_channel(
             selected_channel, bool(getattr(args, "branch", None)), getattr(args, "channel", None)):

@@ -22,6 +22,7 @@ from gateway.stream_consumer import (
     GatewayStreamConsumer,
     StreamConsumerConfig,
 )
+from tests.waiting import async_wait_until
 
 
 def _make_draft_capable_adapter(
@@ -521,6 +522,14 @@ class TestInlineToolProgress:
         type(adapter).inline_tool_progress = inline
         return adapter
 
+    @staticmethod
+    async def _framed(adapter, *steps):
+        """Feed the consumer ``steps``; return once its run loop has streamed them as a new draft frame."""
+        before = len(adapter.draft_calls)
+        for step in steps:
+            step()
+        await async_wait_until(lambda: len(adapter.draft_calls) > before, what="the next draft frame")
+
     @pytest.mark.asyncio
     async def test_progress_lines_join_the_stream_and_a_repeat_rewrites_its_line(self):
         adapter = self._adapter(True)
@@ -528,14 +537,11 @@ class TestInlineToolProgress:
                                    buffer_threshold=1, cursor="")
         consumer = GatewayStreamConsumer(adapter, "C1", cfg)
         task = asyncio.create_task(consumer.run())
-        consumer.on_delta("Checking.")
-        await asyncio.sleep(0.05)
+        await self._framed(adapter, lambda: consumer.on_delta("Checking."))
         assert consumer.accepts_tool_progress is True
-        consumer.on_tool_progress("🔍 search")
-        consumer.on_tool_progress("🔍 search (×2)")
-        await asyncio.sleep(0.05)
-        consumer.on_delta("Found it.")
-        await asyncio.sleep(0.05)
+        await self._framed(adapter, lambda: consumer.on_tool_progress("🔍 search"),
+                           lambda: consumer.on_tool_progress("🔍 search (×2)"))
+        await self._framed(adapter, lambda: consumer.on_delta("Found it."))
         consumer.finish("Checking.Found it.")
         await task
 
@@ -552,8 +558,7 @@ class TestInlineToolProgress:
                                    buffer_threshold=1, cursor="")
         consumer = GatewayStreamConsumer(adapter, "C1", cfg)
         task = asyncio.create_task(consumer.run())
-        consumer.on_delta("text")
-        await asyncio.sleep(0.05)
+        await self._framed(adapter, lambda: consumer.on_delta("text"))  # the draft transport is up
         assert consumer.accepts_tool_progress is False
         consumer.finish()
         await task
@@ -565,12 +570,9 @@ class TestInlineToolProgress:
                                    buffer_threshold=1, cursor="")
         consumer = GatewayStreamConsumer(adapter, "C1", cfg)
         task = asyncio.create_task(consumer.run())
-        consumer.on_delta("Answer part one. ")
-        await asyncio.sleep(0.05)
-        consumer.on_tool_progress("🔍 search")
-        await asyncio.sleep(0.05)
-        consumer.on_delta("Part two.")
-        await asyncio.sleep(0.05)
+        await self._framed(adapter, lambda: consumer.on_delta("Answer part one. "))
+        await self._framed(adapter, lambda: consumer.on_tool_progress("🔍 search"))
+        await self._framed(adapter, lambda: consumer.on_delta("Part two."))
         consumer._turn_split_delivery = True  # as after an overflow split: the ledger is what is recorded
         consumer.finish()
         await task

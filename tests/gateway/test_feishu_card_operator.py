@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 import time
 from types import SimpleNamespace
@@ -37,6 +38,13 @@ def card_types(monkeypatch):
     monkeypatch.setattr(feishu_module, "CallBackCard", _Card)
 
 
+async def _settle():
+    """Return once every other task on this loop is done (including any those tasks start)."""
+    me = asyncio.current_task()
+    while others := asyncio.all_tasks() - {me}:
+        await asyncio.wait(others)
+
+
 class _LoopThread:
     """A real adapter loop on its own thread; the test thread plays the SDK callback thread."""
 
@@ -47,8 +55,8 @@ class _LoopThread:
         return self.loop
 
     def __exit__(self, *_exc):
-        # Let work the callback scheduled (approval resolution) run before the loop stops.
-        asyncio.run_coroutine_threadsafe(asyncio.sleep(0.05), self.loop).result(timeout=5)
+        # Let work the callback scheduled (approval resolution) finish before the loop stops.
+        asyncio.run_coroutine_threadsafe(_settle(), self.loop).result(timeout=5)
         self.loop.call_soon_threadsafe(self.loop.stop)
         self.thread.join(timeout=5)
         self.loop.close()
@@ -113,20 +121,26 @@ def test_slow_name_lookup_falls_back_within_the_card_deadline(card_types, monkey
     monkeypatch.setattr(operator_module, "_LOOKUP_BUDGET_SECONDS", 0.2)
     adapter = _adapter()
     _resolve_without_running(adapter)
-    finished = threading.Event()
+    release, finished = asyncio.Event(), threading.Event()
 
     async def _hanging_lookup(sender_id, *, is_bot=False):
-        await asyncio.sleep(1.0)
-        finished.set()
+        # Overruns the budget: answers once the first card is back (or after 5 s, so a callback that
+        # ignored its budget fails the elapsed check instead of hanging the test).
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(release.wait(), timeout=5)
         adapter._sender_name_cache[sender_id] = ("Erin", time.time() + 600)
+        finished.set()
         return "Erin"
 
     adapter._resolve_sender_name_from_api = _hanging_lookup
     with _LoopThread() as loop:
         adapter._loop = loop
         started = time.monotonic()
-        first = adapter._on_card_action_trigger(_approval_click(adapter))
-        elapsed = time.monotonic() - started
+        try:
+            first = adapter._on_card_action_trigger(_approval_click(adapter))
+            elapsed = time.monotonic() - started
+        finally:
+            loop.call_soon_threadsafe(release.set)
         assert finished.wait(timeout=5)  # the overrunning lookup still completes and warms the cache
         second = adapter._on_card_action_trigger(_approval_click(adapter))
 

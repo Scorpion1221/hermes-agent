@@ -567,7 +567,7 @@ class SlowFolderFeishu(FolderFeishu):
         self.delay = delay
 
     def _get_resource(self, request):
-        time.sleep(self.delay)
+        time.sleep(self.delay)  # health: allow HX013 -- slow downloads are the scenario: the note behind the folder must arrive mid-download
         return super()._get_resource(request)
 
 

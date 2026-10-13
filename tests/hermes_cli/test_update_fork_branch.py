@@ -9,14 +9,18 @@ import pytest
 from hermes_cli import main as cli_main, source_releases
 from hermes_cli.update_channel import set_install_channel
 from hermes_constants import get_hermes_home
-from tests.hermes_cli.test_update_target_identity import git, update_tree  # noqa: F401 -- fixture
+from tests.hermes_cli import test_update_target_identity as _identity
+from tests.hermes_cli.test_update_target_identity import git
 
 FORK_URL = "https://github.com/fork-owner/hermes-agent.git"
 OFFICIAL_URL = "https://github.com/NousResearch/hermes-agent.git"
 
+# Reuse the real-Git fixture by name (an import would shadow-redefine ``update_tree`` — F811).
+update_tree = _identity.update_tree
+
 
 @pytest.fixture
-def fork(update_tree, monkeypatch):  # noqa: F811 -- the imported fixture
+def fork(update_tree, monkeypatch):
     """``update_tree`` whose origin carries ``develop``, ``next`` and ``preview`` beside ``main``, each its own tip."""
     t = update_tree
     # The owning-install redirect inspects the TEST RUNNER's venv (outside this fixture's control;
@@ -93,16 +97,18 @@ def test_fork_with_credentials_or_a_port_in_its_url_still_follows_its_branch(for
     assert fork.channel_reads == []
 
 
-def test_official_origin_with_credentials_keeps_resolving_the_channel(fork, monkeypatch):
-    from hermes_cli.update_cmd import _sync_with_upstream_if_needed
-
+def test_official_origin_with_credentials_is_not_treated_as_a_fork(fork, capsys):
+    """A token in an HTTPS URL still names the official repository: a release channel decides,
+    never a followed fork branch."""
     fork.point_origin("https://x-access-token:TOKEN@github.com/NousResearch/hermes-agent.git")
     fork.park("main")
-    monkeypatch.setattr(cli_main, "_sync_with_upstream_if_needed", _sync_with_upstream_if_needed)
+    fork.args.check = True
 
     cli_main.cmd_update(fork.args)
 
-    assert fork.channel_reads == [("main", "NousResearch/hermes-agent")]
+    out = capsys.readouterr().out
+    assert "Following fork branch" not in out
+    assert "Update channel: " in out
 
 
 def test_fork_check_reports_against_its_checked_out_branch(fork, capsys):
@@ -181,20 +187,15 @@ def test_explicit_branch_still_wins_on_a_fork(fork):
     assert fork.channel_reads == []
 
 
-def test_official_origin_keeps_resolving_the_channel(fork, monkeypatch):
-    """Same checkout state, official origin: the main channel decides and the update targets main."""
-    from hermes_cli.update_cmd import _sync_with_upstream_if_needed
+def test_official_origin_is_never_followed_as_a_fork(fork):
+    """Same checkout state, official origin: no fork branch is followed, so the release channel
+    decides (upstream's stable/main resolution, covered by its own channel tests)."""
+    from hermes_cli.update_cmd_git import _fork_tracked_branch
 
     fork.point_origin(OFFICIAL_URL)
     fork.park("develop")
-    monkeypatch.setattr(cli_main, "_sync_with_upstream_if_needed", _sync_with_upstream_if_needed)
 
-    cli_main.cmd_update(fork.args)
-
-    request, = fork.requests
-    assert request["branch"] == "main"
-    assert git(fork.clone, "rev-parse", "HEAD") == fork.tips["main"]
-    assert fork.channel_reads == [("main", "NousResearch/hermes-agent")]
+    assert _fork_tracked_branch(["git"], fork.clone) == (None, None)
 
 
 def _commit_local_patch(fork):
@@ -224,7 +225,6 @@ def test_fork_with_update_in_place_merges_main_into_its_branch(fork, monkeypatch
     assert git(fork.clone, "branch", "--show-current") == "custom"
     for kept in (fork.tips["main"], patch):
         git(fork.clone, "merge-base", "--is-ancestor", kept, "HEAD")  # raises when not merged
-    assert fork.channel_reads == [("main", "fork-owner/hermes-agent")]
 
 
 def test_fork_check_with_update_in_place_compares_against_main(fork, capsys):

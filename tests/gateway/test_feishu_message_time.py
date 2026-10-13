@@ -18,7 +18,7 @@ from gateway.config import PlatformConfig
 from plugins.platforms.feishu.feishu_quote import QuotedReply
 
 
-def _adapter(download_seconds: float = 0.0):
+def _adapter():
     from plugins.platforms.feishu.adapter import FeishuAdapter
 
     adapter = FeishuAdapter.__new__(FeishuAdapter)
@@ -26,7 +26,7 @@ def _adapter(download_seconds: float = 0.0):
     adapter._bot_open_id, adapter._bot_user_id, adapter._bot_name = "ou_bot", "", "Hermes"
 
     async def _download(*args, **kwargs):
-        await asyncio.sleep(download_seconds)
+        await asyncio.sleep(0)  # a real suspension, as a download is
         return [], []
 
     adapter._download_feishu_message_resources = _download
@@ -49,8 +49,10 @@ def _receive(adapter, **message_fields):
 
 
 def test_a_slow_attachment_keeps_the_time_its_message_was_sent():
-    sent_ms = int(time.time() * 1000) - 90_000  # sent a minute and a half before Hermes finished reading it
-    event = _receive(_adapter(download_seconds=0.05), create_time=str(sent_ms))
+    # Sent a minute and a half before Hermes finished reading it (the attachment download): a stamp taken
+    # when reading finished would be 90 s late.
+    sent_ms = int(time.time() * 1000) - 90_000
+    event = _receive(_adapter(), create_time=str(sent_ms))
 
     assert event.timestamp.tzinfo is not None
     assert int(event.timestamp.timestamp() * 1000) == sent_ms

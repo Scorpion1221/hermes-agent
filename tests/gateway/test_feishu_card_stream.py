@@ -17,6 +17,7 @@ from gateway.config import PlatformConfig
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 from plugins.platforms.feishu import feishu_stream
 from plugins.platforms.feishu.adapter import FeishuAdapter
+from tests.waiting import async_wait_until
 
 
 def _ok(**data):
@@ -58,6 +59,7 @@ class FakeFeishu:
         self.client = SimpleNamespace(
             im=SimpleNamespace(v1=SimpleNamespace(message=_API("message"))),
             cardkit=SimpleNamespace(v1=SimpleNamespace(card=_API("card"), card_element=_API("element"))),
+            fake=self,
         )
 
     def names(self) -> list[str]:
@@ -102,12 +104,20 @@ def _consumer(adapter: FeishuAdapter, reply_to: str = "om_user_1") -> GatewayStr
     return GatewayStreamConsumer(adapter, "oc_chat", cfg, initial_reply_to_id=reply_to)
 
 
+async def _sent(fake: FakeFeishu, *steps) -> None:
+    """Feed the consumer ``steps``; return once its run loop has put them on the wire (the fake answers at
+    once, so the tick that takes a step sends its frame before the loop sleeps), one frame per call."""
+    before = len(fake.calls)
+    for step in steps:
+        step()
+    await async_wait_until(lambda: len(fake.calls) > before, what="the consumer to send the frame")
+
+
 async def _stream(adapter: FeishuAdapter, deltas: list[str], final: str, reply_to: str = "om_user_1"):
     consumer = _consumer(adapter, reply_to)
     task = asyncio.create_task(consumer.run())
     for delta in deltas:
-        consumer.on_delta(delta)
-        await asyncio.sleep(0.05)
+        await _sent(adapter._client.fake, lambda delta=delta: consumer.on_delta(delta))
     consumer.finish(final)
     await task
     return consumer
@@ -149,8 +159,7 @@ async def test_an_interim_send_does_not_seal_the_live_card():
     adapter = _adapter(fake)
     consumer = _consumer(adapter)
     task = asyncio.create_task(consumer.run())
-    consumer.on_delta("working on it")
-    await asyncio.sleep(0.05)
+    await _sent(fake, lambda: consumer.on_delta("working on it"))
 
     result = await adapter.send("oc_chat", "⏳ still running", metadata={"_interim_send": True,
                                                                        "reply_to_message_id": "om_user_1"})
@@ -311,12 +320,9 @@ async def test_the_sealed_card_keeps_the_preamble_streamed_before_a_tool_call():
     adapter = _adapter(fake)
     consumer = _consumer(adapter)
     task = asyncio.create_task(consumer.run())
-    consumer.on_delta("First I will check the logs.")
-    await asyncio.sleep(0.05)
-    consumer.on_segment_break()
-    await asyncio.sleep(0.05)
-    consumer.on_delta("Found it: the cache was stale.")
-    await asyncio.sleep(0.05)
+    await _sent(fake, lambda: consumer.on_delta("First I will check the logs."))
+    # The break sends nothing (the card is the whole turn) and ends its tick: the text after it is the next frame.
+    await _sent(fake, consumer.on_segment_break, lambda: consumer.on_delta("Found it: the cache was stale."))
     final = "Found it: the cache was stale.\n\n⚠️ verifier footer"
     consumer.finish(final)
     await task
@@ -399,16 +405,12 @@ async def test_tool_progress_lines_stay_in_the_card_between_the_text_and_repeats
     consumer = _consumer(adapter)
     assert consumer.accepts_tool_progress is False  # not before the draft transport is up
     task = asyncio.create_task(consumer.run())
-    consumer.on_delta("Let me check.")
-    await asyncio.sleep(0.05)
+    await _sent(fake, lambda: consumer.on_delta("Let me check."))
     assert consumer.accepts_tool_progress is True
-    consumer.on_tool_progress("💻 terminal: ls")
-    consumer.on_tool_progress("💻 terminal: ls (×2)")
-    consumer.on_tool_progress("📄 read_file: a.py")
-    await asyncio.sleep(0.05)
-    consumer.on_segment_break()
-    consumer.on_delta("Done: a.py is fine.")
-    await asyncio.sleep(0.05)
+    await _sent(fake, lambda: consumer.on_tool_progress("💻 terminal: ls"),
+                lambda: consumer.on_tool_progress("💻 terminal: ls (×2)"),
+                lambda: consumer.on_tool_progress("📄 read_file: a.py"))
+    await _sent(fake, consumer.on_segment_break, lambda: consumer.on_delta("Done: a.py is fine."))
     consumer.finish("Done: a.py is fine.")
     await task
 
@@ -426,8 +428,7 @@ async def test_without_the_opt_in_a_draft_stream_does_not_take_tool_progress():
     adapter.__class__ = adapter_cls
     consumer = _consumer(adapter)
     task = asyncio.create_task(consumer.run())
-    consumer.on_delta("text")
-    await asyncio.sleep(0.05)
+    await _sent(fake, lambda: consumer.on_delta("text"))  # the draft transport is up
 
     assert consumer.accepts_tool_progress is False
     consumer.finish("text")
@@ -466,6 +467,16 @@ async def test_two_turns_in_one_topic_each_keep_their_own_card():
     assert sorted(_final_text(b) for b in fake.final_bodies()) == ["turn A grows", "turn B"]
 
 
+class _CountingLock(asyncio.Lock):
+    """The turn's lock, counting acquire attempts: a caller counted but not holding it is waiting."""
+
+    acquires = 0
+
+    async def acquire(self):
+        self.acquires += 1
+        return await super().acquire()
+
+
 @pytest.mark.asyncio
 async def test_a_frame_waiting_while_the_card_rolls_over_streams_into_the_new_card():
     fake = FakeFeishu()
@@ -473,19 +484,21 @@ async def test_a_frame_waiting_while_the_card_rolls_over_streams_into_the_new_ca
     md = {"reply_to_message_id": "om_user_1"}
     await adapter.send_draft("oc_chat", 51, "before the prompt", metadata=md)
     stream = _only_stream(adapter)
-    release = asyncio.Event()
+    stream.lock = lock = _CountingLock()
+    sealing, release = asyncio.Event(), asyncio.Event()
     original = feishu_stream._seal
 
     async def _slow_seal(*args, **kwargs):
+        sealing.set()
         await release.wait()
         return await original(*args, **kwargs)
 
     feishu_stream._seal = _slow_seal
     try:
         prompt = asyncio.create_task(feishu_stream.seal_for_prompt(adapter, "oc_chat"))
-        await asyncio.sleep(0.01)
+        await async_wait_until(sealing.is_set, what="the prompt seal to hold the card")
         frame = asyncio.create_task(adapter.send_draft("oc_chat", 51, "before the prompt after it", metadata=md))
-        await asyncio.sleep(0.01)
+        await async_wait_until(lambda: lock.acquires == 2, what="the frame to wait on the rolling card")
         release.set()
         await prompt
         result = await frame
@@ -535,10 +548,8 @@ async def test_a_turn_that_ends_in_a_silence_marker_does_not_leave_the_card_spin
     adapter = _adapter(fake)
     consumer = _consumer(adapter)
     task = asyncio.create_task(consumer.run())
-    consumer.on_delta("Checking the queue.")
-    await asyncio.sleep(0.05)
-    consumer.on_tool_progress("💻 terminal: ls")
-    await asyncio.sleep(0.05)
+    await _sent(fake, lambda: consumer.on_delta("Checking the queue."))
+    await _sent(fake, lambda: consumer.on_tool_progress("💻 terminal: ls"))
     consumer.finish("[SILENT]")
     await task
 
@@ -594,14 +605,12 @@ async def test_a_terminal_command_in_the_card_is_a_one_line_quote_not_a_fence():
     adapter = _adapter(fake)
     consumer = _consumer(adapter)
     task = asyncio.create_task(consumer.run())
-    consumer.on_delta("Let me check.")
-    await asyncio.sleep(0.05)
+    await _sent(fake, lambda: consumer.on_delta("Let me check."))
     ctx = SimpleNamespace(source=None, progress_mode="all", last_was_terminal_block=[False],
                           stream_consumer_holder=[consumer])
     runner = TurnRunner(SimpleNamespace(_delivery_adapter_for=lambda source: adapter), ctx)
     line = runner._progress_build_message("terminal", "echo same; pwd", {"command": "echo same; pwd"})
-    consumer.on_tool_progress(line)
-    await asyncio.sleep(0.05)
+    await _sent(fake, lambda: consumer.on_tool_progress(line))
     consumer.finish("Let me check.")
     await task
 
