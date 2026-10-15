@@ -12,7 +12,6 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.base import _reply_anchor_for_event
-from gateway.platforms.event import MessageEvent, MessageType
 from tests.gateway.test_feishu_fetched_content import json_card, markdown, text
 
 _SELF_APP = "cli_self_app"
@@ -318,19 +317,5 @@ def test_ordinary_message_ids_pass_through_unchanged():
 
     assert feishu_message_id("om_plain") == "om_plain"
     assert feishu_message_id(None) is None
-
-
-def test_synthetic_card_command_events_keep_their_shape():
-    """Non-approval card clicks still route as top-level synthetic commands."""
-    adapter = _adapter()
-    routed = _wire_routing(adapter, _bot_message())
-    data = SimpleNamespace(event=SimpleNamespace(
-        token="tok_cmd", context=SimpleNamespace(open_chat_id="oc_chat"),
-        operator=SimpleNamespace(open_id="ou_clicker"), action=SimpleNamespace(tag="button", value={"x": 1}),
-    ))
-
-    asyncio.run(adapter._handle_card_action_event(data))
-
-    [event] = routed
-    assert isinstance(event, MessageEvent) and event.message_type is MessageType.COMMAND
-    assert event.source.thread_id is None and event.reply_to_message_id is None
+    assert feishu_message_id("om_card:card:tok") == "om_card"  # a card click names its card
+    assert feishu_message_id(":card:tok") == ""  # no card: no reply target

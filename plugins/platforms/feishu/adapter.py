@@ -1474,6 +1474,7 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
                 "session_key": session_key,
                 "message_id": result.message_id or "",
                 "chat_id": chat_id,
+                "thread_id": str((metadata or {}).get("thread_id") or ""),
             }
         return result
 
@@ -1862,8 +1863,8 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
         """Synchronous SDK card-action callback.
 
         Approval/update-prompt buttons return the resolved card inline (the only reliable way
-        to sync all clients) and schedule the async resolution; other clicks are routed as
-        synthetic commands via ``_handle_card_action_event``.
+        to sync all clients) and schedule the async resolution; other clicks reach the agent
+        as replies to the card via ``_handle_card_action_event``.
         """
         loop = self._loop
         if not self._loop_accepts_callbacks(loop):
@@ -2033,10 +2034,11 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
                 # Correct the record so the user doesn't believe the command ran.
                 _chat = str(state.get("chat_id", "") or chat_id or "")
                 if _chat:
-                    try:
+                    try:  # under the approval card, in its topic: a top-level send opens a new topic
+                        _thread = state.get("thread_id")
                         await self.send(
-                            _chat,
-                            t("platform.shared.approval_expired"),
+                            _chat, t("platform.shared.approval_expired"), reply_to=state.get("message_id") or None,
+                            metadata={"thread_id": _thread} if _thread else None,
                         )
                     except Exception:
                         logger.debug("[Feishu] expired-approval notice failed", exc_info=True)
@@ -2080,34 +2082,8 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
         return False
 
     async def _handle_card_action_event(self, data: Any) -> None:
-        """Route Feishu interactive card button clicks as synthetic COMMAND events."""
-        event = getattr(data, "event", None)
-        token = str(getattr(event, "token", "") or "")
-        if token and self._is_card_action_duplicate(token):
-            logger.debug("[Feishu] Dropping duplicate card action token: %s", token)
-            return
-        context = getattr(event, "context", None)
-        chat_id = str(getattr(context, "open_chat_id", "") or "")
-        operator = getattr(event, "operator", None)
-        open_id = str(getattr(operator, "open_id", "") or "")
-        if not chat_id or not open_id:
-            logger.debug("[Feishu] Card action missing chat_id or operator open_id, dropping")
-            return
-        action = getattr(event, "action", None)
-        action_tag = str(getattr(action, "tag", "") or "button")
-        action_value = getattr(action, "value", {}) or {}
-        synthetic_text = f"/card {action_tag}"
-        if action_value:
-            try:
-                synthetic_text += f" {json.dumps(action_value, ensure_ascii=False)}"
-            except Exception:
-                pass
-        logger.info("[Feishu] Routing card action %r from %s in %s as synthetic command", action_tag, open_id, chat_id)
-        await self._dispatch_synthetic_event(
-            text=synthetic_text, message_type=MessageType.COMMAND, chat_id=chat_id,
-            sender_id=SimpleNamespace(open_id=open_id, user_id=None, union_id=None), event_chat_type="group",
-            raw_message=data, message_id=token or str(uuid.uuid4()),
-        )
+        from .feishu_card_action import handle_card_action_event
+        await handle_card_action_event(self, data)
 
     async def _dispatch_synthetic_event(
         self, *, text: str, message_type: MessageType, chat_id: str, sender_id: Any, event_chat_type: str,
@@ -3232,7 +3208,7 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
     async def _send_raw_message(
         self, *, chat_id: str, msg_type: str, payload: str, reply_to: Optional[str], metadata: Optional[dict[str, Any]],
     ) -> Any:
-        from .feishu_reaction import feishu_message_id  # a reaction's id → reacted message
+        from .feishu_reaction import feishu_message_id  # a reaction / card click id → its message
         thread_id = (metadata or {}).get("thread_id")
         effective_reply_to = feishu_message_id(reply_to or ((metadata or {}).get("reply_to_message_id") if thread_id else None))
         if effective_reply_to:

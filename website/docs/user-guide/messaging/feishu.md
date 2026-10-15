@@ -284,15 +284,15 @@ Grant the `application:bot.basic_info:read` scope to display peer bot names; wit
 
 ## Interactive Card Actions
 
-When users click buttons or interact with interactive cards sent by the bot, the adapter routes these as synthetic `/card` command events:
+When users click buttons or interact with interactive cards sent by the bot, the adapter routes each click to the agent as a reply to that card, in the card's chat and topic:
 
-- Button clicks become: `/card button {"key": "value", ...}`
-- The action's `value` payload from the card definition is included as JSON.
+- A button click becomes: `card:button {"value": {"key": "value", ...}}` (the action's `value` payload from the card definition). Form submissions carry `form_value`, selects and pickers `option` / `options`, inputs `input_value`.
+- The agent sees which card was clicked: its text is quoted, like any reply to a bot message, and the answer is posted as a reply to the card (inside its topic in topic groups).
 - Card actions are deduplicated with a 15-minute window to prevent double processing.
 
 Gateway-driven update prompts use a native Feishu `Yes` / `No` card instead of falling back to plain text replies. When `hermes update --gateway` needs confirmation, the adapter records the selected answer in Hermes's `.update_response` file and replaces the card inline with a resolved state.
 
-Card action events are dispatched with `MessageType.COMMAND`, so they flow through the normal command processing pipeline.
+Card action events are ordinary inbound messages (not slash commands), so they join the same session as a message typed in that chat or topic.
 
 This is also how **command approval** works — when the agent needs to run a dangerous command, it sends an interactive card with Allow Once / Session / Always / Deny buttons. The user clicks a button, and the card action callback delivers the approval decision back to the agent.
 

@@ -155,6 +155,18 @@ class TestFeishuExecApproval:
         assert state["message_id"] == "msg_002"
         assert state["chat_id"] == "oc_12345"
 
+    @pytest.mark.asyncio
+    async def test_remembers_the_topic_the_card_was_sent_in(self):
+        adapter = _make_adapter()
+        response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="msg_003"))
+        with patch.object(adapter, "_feishu_send_with_retry", new_callable=AsyncMock, return_value=response):
+            await adapter.send_exec_approval(
+                chat_id="oc_12345", command="echo test", session_key="s", metadata={"thread_id": "omt_topic"},
+            )
+
+        [state] = adapter._approval_state.values()
+        assert state["thread_id"] == "omt_topic"
+
 
 # ===========================================================================
 # send_update_prompt — interactive card with buttons
@@ -236,16 +248,32 @@ class TestResolveApproval:
         mock_resolve.assert_not_called()
         assert 5 in adapter._approval_state
 
+    @pytest.mark.asyncio
+    async def test_expired_approval_notice_replies_under_the_card_in_its_topic(self):
+        """A top-level send in a topic group opens a new topic; the correction belongs under the card."""
+        adapter = _make_adapter()
+        adapter._approval_state[7] = {
+            "session_key": "sess-7", "message_id": "om_card", "chat_id": "oc_12345", "thread_id": "omt_topic",
+        }
+        adapter.send = AsyncMock()
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=0):
+            await adapter._resolve_approval(7, "once", "Norbert", open_id="ou_user1", chat_id="oc_12345")
+
+        kwargs = adapter.send.await_args.kwargs
+        assert kwargs["reply_to"] == "om_card"
+        assert kwargs["metadata"] == {"thread_id": "omt_topic"}
+
 
 # ===========================================================================
 # _handle_card_action_event — non-approval card actions
 # ===========================================================================
 
 class TestNonApprovalCardAction:
-    """Non-approval card actions should still route as synthetic commands."""
+    """Non-approval card actions reach the agent (see test_feishu_card_action_routing)."""
 
     @pytest.mark.asyncio
-    async def test_routes_as_synthetic_command(self):
+    async def test_routes_to_the_agent(self):
         adapter = _make_adapter()
 
         data = _make_card_action_data(
@@ -265,7 +293,8 @@ class TestNonApprovalCardAction:
 
         mock_handle.assert_called_once()
         event = mock_handle.call_args[0][0]
-        assert "/card button" in event.text
+        assert event.text == 'card:button {"value": {"custom_action": "something_else"}}'
+        assert not event.is_command()
 
 
 # ===========================================================================

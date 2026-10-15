@@ -21,8 +21,9 @@ _REACTION_ID_MARK = ":reaction:"  # Feishu message ids never contain ':'
 
 
 def feishu_message_id(message_id: Optional[str]) -> Optional[str]:
-    """The Feishu message an inbound id names: the reacted message for a reaction, else the id itself."""
-    return message_id.partition(_REACTION_ID_MARK)[0] if message_id else message_id
+    """The Feishu message an inbound id names. A synthetic id (a reaction, a card click) is
+    ``<message id>:<kind>:<event>`` and names that message; any other id names itself."""
+    return message_id.partition(":")[0] if message_id else message_id
 
 
 async def handle_reaction_event(adapter: Any, event_type: str, data: Any) -> None:
