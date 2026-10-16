@@ -257,6 +257,14 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         return (self._use_draft_streaming and self._stream_is_message()
                 and getattr(type(self.adapter), "inline_tool_progress", False) is True)
 
+    def _draft_frames_time_paced(self) -> bool:
+        """The adapter opted out of the size trigger for its draft frames (``draft_frames_time_paced``):
+        each frame rewrites the whole message at the platform and a draft never reports flood control,
+        so past ``buffer_threshold`` the size trigger would send a frame on every tick. Checked on the
+        CLASS (MagicMock-safe)."""
+        return (self._use_draft_streaming
+                and getattr(type(self.adapter), "draft_frames_time_paced", False) is True)
+
     def on_tool_progress(self, line: str) -> None:
         """Thread-safe: a tool-progress line for the stream (native overlay, or inline in a draft)."""
         if line:
@@ -775,9 +783,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             # platform-limit check (_len_fn is for overflow).  It must not
             # override an active flood backoff: while a refusal is being
             # waited out, only the (server-requested) interval may fire an edit.
+            size_paced = not self._flood_strikes and not self._draft_frames_time_paced()
             should_edit = bool((elapsed >= self._current_edit_interval and self._accumulated)
-                               or (len(self._accumulated) >= self.cfg.buffer_threshold
-                                   and not self._flood_strikes))
+                               or (size_paced and len(self._accumulated) >= self.cfg.buffer_threshold))
         # Defer mid-stream edits while the buffer could still resolve to a silence
         # marker ("NO"→"NO_REPLY"); got_done always resolves the buffer.
         return should_edit and not _is_partial_silence_marker(

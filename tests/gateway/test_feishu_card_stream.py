@@ -777,3 +777,27 @@ async def test_a_command_reply_with_no_turn_stays_a_plain_card():
 
     assert fake.final_bodies() == [] and "card.create" not in fake.names()
     assert marked == []
+
+
+@pytest.mark.asyncio
+async def test_card_frames_are_paced_by_time_not_by_size():
+    """Each frame resends the whole card, so a reply past ``buffer_threshold`` must not stream a frame on
+    every consumer tick: only ``edit_interval`` paces frames (the final still seals everything)."""
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    cfg = StreamConsumerConfig(transport="auto", chat_type="dm", edit_interval=3600, buffer_threshold=1, cursor="")
+    consumer = GatewayStreamConsumer(adapter, "oc_chat", cfg, initial_reply_to_id="om_user_1")
+    task = asyncio.create_task(consumer.run())
+    await _sent(fake, lambda: consumer.on_delta("The first frame opens the card."))
+
+    for i in range(4):
+        consumer.on_delta(f" More text {i}.")
+        # A tick drains the queue and sends its frame before it yields, so an empty queue means done.
+        await async_wait_until(consumer._queue.empty, what="the consumer to take the delta")
+
+    assert len(fake.streamed()) == 1, "no frame may go out before edit_interval elapses"
+    final = "The first frame opens the card. More text 0. More text 1. More text 2. More text 3."
+    consumer.finish(final)
+    await task
+    (body,) = fake.final_bodies()
+    assert _final_text(body) == final
