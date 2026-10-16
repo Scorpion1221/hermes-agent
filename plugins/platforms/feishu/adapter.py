@@ -418,7 +418,8 @@ def normalize_feishu_message(
     if normalized_type == "share_chat":
         return _normalize_share_chat_message(payload)
     if normalized_type in {"interactive", "card"}:
-        return _normalize_interactive_message(normalized_type, payload)
+        from .feishu_card_inbound import normalize_interactive_message
+        return normalize_interactive_message(normalized_type, payload)
     return FeishuNormalizedMessage(raw_type=normalized_type, text_content="")
 
 
@@ -449,26 +450,6 @@ def _normalize_share_chat_message(payload: dict[str, Any]) -> FeishuNormalizedMe
     return FeishuNormalizedMessage(
         raw_type="share_chat", text_content="\n".join(lines), relation_kind="share_chat",
         metadata={"chat_id": share_id, "chat_name": chat_name},
-    )
-
-
-def _normalize_interactive_message(message_type: str, payload: dict[str, Any]) -> FeishuNormalizedMessage:
-    from .feishu_card_text import render_json_card
-    if card_text := render_json_card(payload):  # GET with card_msg_content_type=raw_card_content
-        return FeishuNormalizedMessage(raw_type=message_type, text_content=card_text, relation_kind="interactive")
-    card_payload = payload.get("card") if isinstance(payload.get("card"), dict) else payload
-    title = _first_non_empty_text(
-        _find_header_title(card_payload), payload.get("title"),
-        _find_first_text(card_payload, keys=("title", "summary", "subtitle")),
-    )
-    actions = _collect_action_labels(card_payload)
-    lines = ([title] if title else []) + [line for line in _collect_card_lines(card_payload) if line != title]
-    if actions:
-        lines.append(f"Actions: {', '.join(actions)}")
-    return FeishuNormalizedMessage(
-        raw_type=message_type,
-        text_content="\n".join(lines[:12]).strip() or FALLBACK_INTERACTIVE_TEXT,
-        relation_kind="interactive", metadata={"title": title, "actions": actions},
     )
 
 
@@ -2596,6 +2577,9 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
         message_id = str(getattr(message, "message_id", "") or "")
         logger.info("[Feishu] Received raw message type=%s message_id=%s", raw_type, message_id)
         normalized = self._normalize(raw_type, raw_content, getattr(message, "mentions", None))
+        if raw_type in {"interactive", "card"}:  # the event body is the card's degraded form; GET has its json_card
+            from .feishu_card_inbound import hydrate_card
+            normalized = await hydrate_card(self, message_id, normalized)
         if raw_type == "merge_forward":  # the event body is a placeholder; the forwarded messages come from GET
             from .feishu_forward import expand_merge_forward
             normalized, media_urls, media_types = await expand_merge_forward(self, message_id, normalized)
