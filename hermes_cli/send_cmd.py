@@ -243,7 +243,8 @@ def cmd_send(args: argparse.Namespace) -> None:
 # (flags, add_argument kwargs) in --help order.
 _SEND_ARGUMENTS = (
     (("-t", "--to"), dict(metavar="TARGET", default=None, help=(
-        "Delivery target. Format: 'platform' (home channel), "
+        "Delivery target. Format: 'platform' (the current conversation when run inside one of its "
+        "sessions, e.g. from the agent's terminal; otherwise the home channel), "
         "'platform:chat_id', 'platform:chat_id:thread_id', or "
         "'platform:#channel-name'. Examples: telegram, "
         "telegram:-1001234567890:17585, discord:#ops, slack:C0123ABCD, signal:+15551234567."))),

@@ -376,6 +376,23 @@ _PLATFORM_NOTES = {
 }
 
 
+def _reply_target_lines(src: SessionSource, redact_pii: bool) -> list[str]:
+    """This conversation's exact send target. Without it the only raw chat id in the prompt is the
+    home channel's, so a model told to send "here" copies that and the message lands in another chat
+    (usually the owner's DM). Hidden under PII redaction, where it would leak the raw chat id."""
+    from gateway.session_context import NON_MESSAGING_SESSION_SURFACES
+    platform = src.platform.value
+    if redact_pii or not src.chat_id or platform in NON_MESSAGING_SESSION_SURFACES:
+        return []
+    target = ":".join(str(part) for part in (platform, src.chat_id, src.thread_id) if part)
+    return [
+        f"**Reply Target:** `{neutralize_untrusted_inline_text(target)}` — use this exact string as the "
+        "target (`hermes send --to`, a cron job's `deliver`) when sending into this conversation. Do NOT "
+        f"use the bare `{platform}` form for that: outside a live conversation (a scheduled task) it "
+        "resolves to the home channel below, which is usually a different chat."
+    ]
+
+
 def build_session_context_prompt(context: SessionContext, *, redact_pii: bool = False) -> str:
     """Build the "Current Session Context" system prompt section.
 
@@ -404,6 +421,7 @@ def build_session_context_prompt(context: SessionContext, *, redact_pii: bool = 
             chat = src.chat_name or _chat_label(src.chat_id)
             desc = SessionSource._describe(src.chat_type, user, chat)
         lines.append(f"**Source:** {platform_name} ({_format_untrusted_prompt_value(desc)})")
+        lines.extend(_reply_target_lines(src, redact_pii))
 
     if src.chat_topic:
         lines.append(f"**Channel Topic:** {_format_untrusted_prompt_value(src.chat_topic)}")
