@@ -111,8 +111,9 @@ class TestFeishuFallbackThreadRouting:
 
     @pytest.mark.asyncio
     async def test_create_uses_thread_id_when_available(self):
-        """When reply_to=None and metadata has thread_id, message.create
-        should use receive_id_type='thread_id'."""
+        """When reply_to=None, metadata has thread_id and the topic has no
+        message to reply to, the last-resort message.create addresses the
+        topic (receive_id_type='thread_id'), never the main chat."""
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         # We test the _send_raw_message method directly by mocking the client
@@ -136,6 +137,7 @@ class TestFeishuFallbackThreadRouting:
         async def _run_blocking_passthrough(func, *args):
             return func(*args)
         adapter._run_blocking = _run_blocking_passthrough
+        adapter._fetch_last_message_in_thread = AsyncMock(return_value=None)
 
         # Call _send_raw_message with reply_to=None and thread_id in metadata
         import json
