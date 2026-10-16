@@ -673,18 +673,30 @@ def test_quoted_card_v2_reply_reads_as_its_content():
     assert client.message_gets[0].card_msg_content_type == "raw_card_content"
 
 
-def test_quoted_merge_forward_reads_as_its_transcript_without_downloading_media():
+def test_a_reply_to_a_merge_forward_attaches_the_forwarded_images_and_files():
+    """The forward's children download through the forward itself (FakeFeishu answers 234003 for any other id)."""
     items = [
         forward_root(),
         item("om_a", "text", {"text": "the numbers"}, at=1),
         item("om_i", "image", {"image_key": "img_chart"}, at=2),
+        forward_root(NESTED, upper=ROOT, at=3),
+        item("om_f", "file", {"file_key": "file_report", "file_name": "report.pdf"}, upper=NESTED, at=4),
+        item("om_v", "audio", {"file_key": "file_voice", "duration": 2000}, at=5),
     ]
     client = FakeFeishu({ROOT: items}, users={"ou_alice": "Alice"})
 
-    quoted = asyncio.run(make_adapter(client)._fetch_quoted_reply(ROOT)).text
+    event = dispatched_event(
+        make_adapter(client), inbound_message("om_q", "text", json.dumps({"text": "what is this?"}), parent_id=ROOT),
+    )
 
-    assert quoted == "[Merged forward message]\n- Alice: the numbers\n- Alice: [Image]"
-    assert client.resource_gets == []
+    assert event.reply_to_text == "\n".join([
+        "[Merged forward message]", "- Alice: the numbers", "- Alice: [Image]", "- Alice: [Merged forward message]",
+        "  - Alice: [Attachment: report.pdf]", "- Alice: [Voice message]",
+    ])
+    assert sorted((r.message_id, r.file_key) for r in client.resource_gets) == [(ROOT, "file_report"), (ROOT, "img_chart")]
+    assert event.media_types == ["image/png", "application/pdf"]  # the forwarded voice note stays text
+    assert all(os.path.isfile(path) for path in event.media_urls)
+    assert event.text == "what is this?" and event.message_type.value == "text"
 
 
 def test_quoted_fetch_through_the_loaded_plugin_uses_its_bound_sdk_request(monkeypatch):
@@ -720,6 +732,48 @@ def test_quoted_message_lookup_failure_returns_none_and_retries_next_time():
     assert asyncio.run(adapter._fetch_quoted_reply("om_gone")).text is None
     assert asyncio.run(adapter._fetch_quoted_reply("om_gone")).text is None
     assert len(client.message_gets) == 2
+
+
+# --- inbound cards ---
+
+UPGRADE_PLACEHOLDER = {"title": "", "elements": [[{"tag": "text", "text": "请升级至最新版本客户端，以查看内容"}]]}
+
+
+def test_an_inbound_card_v2_is_fetched_and_reads_as_its_content():
+    """Another bot's Card 2.0 (or one card forwarded alone) arrives as an upgrade placeholder; GET has its json_card."""
+    card = json_card([markdown(text("Deploy "), text("done", "bold"))], header=node("card_header", title=text("Release")))
+    client = FakeFeishu({"om_card": [item("om_card", "interactive", card, upper=None, sender="cli_peer", sender_type="app")]})
+
+    event = dispatched_event(make_adapter(client), inbound_message("om_card", "interactive", json.dumps(UPGRADE_PLACEHOLDER)))
+
+    assert event.text == "Release\n\nDeploy **done**"
+    (request,) = client.message_gets
+    assert (request.message_id, request.card_msg_content_type) == ("om_card", "raw_card_content")
+
+
+def test_an_inbound_template_card_reads_as_its_variable_values():
+    template = {"type": "template", "data": {"template_id": "ctp_x", "template_variable": {
+        "alert_title": "Build Failed", "service": "payments-api", "branch": "main", "build_id": "build_123",
+        "log_url": "https://example.com/logs", "details": {"service_copy": "payments-api", "owner": "Alice"},
+    }}}
+    client = FakeFeishu({"om_tpl": [item("om_tpl", "interactive", template, upper=None)]})
+
+    event = dispatched_event(make_adapter(client), inbound_message("om_tpl", "interactive", json.dumps(UPGRADE_PLACEHOLDER)))
+
+    assert event.text == "Build Failed\npayments-api\nmain\nAlice"
+
+
+@pytest.mark.parametrize("failure", ["refused", "raises", "unreadable"])
+def test_an_inbound_card_whose_fetch_fails_keeps_its_event_body(failure):
+    legacy = {"header": {"title": {"tag": "plain_text", "content": "Requester: Bob"}}, "elements": []}
+    client = FakeFeishu({"om_card": [item("om_card", "interactive", {"json_card": "{not json"}, upper=None)]},
+                        get_ok=failure != "refused")
+    if failure == "raises":
+        client.im.v1.message.get = Mock(side_effect=RuntimeError("network down"))
+
+    event = dispatched_event(make_adapter(client), inbound_message("om_card", "interactive", json.dumps(legacy)))
+
+    assert event.text == "Requester: Bob"
 
 
 # --- card JSON rendering ---
