@@ -1353,6 +1353,12 @@ platform:
       unauthorized: "Solo un utente Matrix autorizzato può usare questi controlli."
       not_requester: "Solo l'utente che ha richiesto questa azione può usare questi controlli."
   feishu:
+    card_action:
+      sent: "Ricevuto, in elaborazione"
+      denied: "Non puoi usare questa scheda"
+      already_handled: "Già gestita"
+      retry: "Impossibile verificare l'autorizzazione. Riprova"
+      handled_by: "✅ Gestita da {user}"
     approval:
       action_session: "Sessione"
       action_always: "Sempre"

@@ -1353,6 +1353,12 @@ platform:
       unauthorized: "Bu kontrolleri yalnızca yetkili bir Matrix kullanıcısı kullanabilir."
       not_requester: "Bu kontrolleri yalnızca bu işlemi isteyen kullanıcı kullanabilir."
   feishu:
+    card_action:
+      sent: "Alındı, işleniyor"
+      denied: "Bu kartı kullanamazsınız"
+      already_handled: "Zaten işlendi"
+      retry: "Yetki doğrulanamadı. Tekrar deneyin"
+      handled_by: "✅ {user} tarafından işlendi"
     approval:
       action_session: "Oturum"
       action_always: "Her zaman"

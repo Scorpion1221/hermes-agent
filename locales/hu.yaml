@@ -1370,6 +1370,12 @@ platform:
       unauthorized: "Ezeket a vezérlőket csak jogosult Matrix-felhasználó használhatja."
       not_requester: "Ezeket a vezérlőket csak az a felhasználó használhatja, aki a műveletet kérte."
   feishu:
+    card_action:
+      sent: "Megkaptuk, feldolgozás alatt"
+      denied: "Nem használhatod ezt a kártyát"
+      already_handled: "Már feldolgozva"
+      retry: "Nem sikerült ellenőrizni a jogosultságot. Próbáld újra"
+      handled_by: "✅ Feldolgozta: {user}"
     approval:
       action_session: "Munkamenet"
       action_always: "Mindig"

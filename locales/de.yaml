@@ -1353,6 +1353,12 @@ platform:
       unauthorized: "Nur ein autorisierter Matrix-Benutzer kann diese Steuerelemente verwenden."
       not_requester: "Nur der Benutzer, der diese Aktion angefordert hat, kann diese Steuerelemente verwenden."
   feishu:
+    card_action:
+      sent: "Erhalten — wird bearbeitet"
+      denied: "Du darfst diese Karte nicht verwenden"
+      already_handled: "Bereits erledigt"
+      retry: "Berechtigung konnte nicht geprüft werden. Bitte erneut versuchen"
+      handled_by: "✅ Erledigt von {user}"
     approval:
       action_session: "Sitzung"
       action_always: "Dauerhaft"

@@ -1353,6 +1353,12 @@ platform:
       unauthorized: "لا يمكن استخدام عناصر التحكم هذه إلا لمستخدم Matrix مصرّح له."
       not_requester: "لا يمكن استخدام عناصر التحكم هذه إلا للمستخدم الذي طلب هذا الإجراء."
   feishu:
+    card_action:
+      sent: "تم الاستلام، جارٍ المعالجة"
+      denied: "لا يمكنك استخدام هذه البطاقة"
+      already_handled: "تمت معالجتها بالفعل"
+      retry: "تعذّر التحقق من الإذن. حاول مرة أخرى"
+      handled_by: "✅ عالجها {user}"
     approval:
       action_session: "الجلسة"
       action_always: "دائمًا"

@@ -83,13 +83,19 @@ async def finish(adapter: Any, event: Any, failed: bool) -> None:
 
 
 class FeishuBadgesMixin:
-    """The gateway's processing hooks, as Feishu badges on the adapter."""
+    """The gateway's processing hooks, as Feishu badges on the adapter (and the turn record a card click
+    is checked against, see ``feishu_card_action``)."""
 
     async def on_processing_start(self, event: Any) -> None:
+        from .feishu_card_action import note_turn
+        note_turn(self, event, running=True)
         await mark(self, event, RUNNING)
 
     async def on_processing_complete(self, event: Any, outcome: Any) -> None:
         from gateway.platforms.event import ProcessingOutcome
+
+        from .feishu_card_action import note_turn
+        note_turn(self, event, running=False)
         await finish(self, event, failed=outcome is ProcessingOutcome.FAILURE)
 
     async def mark_event_queued(self, event: Any) -> None:

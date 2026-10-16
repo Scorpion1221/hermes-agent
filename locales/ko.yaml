@@ -1353,6 +1353,12 @@ platform:
       unauthorized: "권한이 있는 Matrix 사용자만 이 컨트롤을 사용할 수 있어요."
       not_requester: "이 작업을 요청한 사용자만 이 컨트롤을 사용할 수 있어요."
   feishu:
+    card_action:
+      sent: "접수했습니다. 처리 중입니다"
+      denied: "이 카드를 사용할 권한이 없습니다"
+      already_handled: "이미 처리된 카드입니다"
+      retry: "권한을 확인하지 못했습니다. 다시 시도하세요"
+      handled_by: "✅ {user} 님이 처리함"
     approval:
       action_session: "세션"
       action_always: "항상"

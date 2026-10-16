@@ -1353,6 +1353,12 @@ platform:
       unauthorized: "只有已授權的 Matrix 使用者可以使用這些控制項。"
       not_requester: "只有提出此操作的使用者可以使用這些控制項。"
   feishu:
+    card_action:
+      sent: "已收到，正在處理"
+      denied: "你沒有權限操作這張卡片"
+      already_handled: "這張卡片已經處理過了"
+      retry: "暫時無法確認權限，請稍後再試"
+      handled_by: "✅ 已由 {user} 處理"
     approval:
       action_session: "本次工作階段"
       action_always: "永久"

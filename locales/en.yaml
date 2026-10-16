@@ -1413,6 +1413,12 @@ platform:
       not_requester: "Only the user who requested this action can use these controls."
 
   feishu:
+    card_action:
+      sent: "Received — working on it"
+      denied: "You can't use this card"
+      already_handled: "Already handled"
+      retry: "Couldn't check who may use this card. Try again"
+      handled_by: "✅ Handled by {user}"
     approval:
       # Feishu keeps shorter button words than the shared card (emoji prefixes are added in code).
       action_session: "Session"

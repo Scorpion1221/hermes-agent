@@ -72,7 +72,7 @@ _LARK_SDK_IMPORTS = (
     ("lark_oapi.core", ("AccessTokenType", "HttpMethod")),
     ("lark_oapi.core.const", ("FEISHU_DOMAIN", "LARK_DOMAIN")),
     ("lark_oapi.core.model", ("BaseRequest",)),
-    ("lark_oapi.event.callback.model.p2_card_action_trigger", ("CallBackCard", "P2CardActionTriggerResponse")),
+    ("lark_oapi.event.callback.model.p2_card_action_trigger", ("CallBackCard", "CallBackToast", "P2CardActionTriggerResponse")),
     ("lark_oapi.event.dispatcher_handler", ("EventDispatcherHandler",)),
 )
 lark = FeishuWSClient = None  # type: ignore[assignment]
@@ -1863,8 +1863,8 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
         """Synchronous SDK card-action callback.
 
         Approval/update-prompt buttons return the resolved card inline (the only reliable way
-        to sync all clients) and schedule the async resolution; other clicks reach the agent
-        as replies to the card via ``_handle_card_action_event``.
+        to sync all clients) and schedule the async resolution; any other click answers its card
+        once, for whoever may answer it (``feishu_card_action``).
         """
         loop = self._loop
         if not self._loop_accepts_callbacks(loop):
@@ -1878,8 +1878,8 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
                 return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
             if action_value.get("hermes_update_prompt_action"):
                 return self._handle_update_prompt_card_action(event=event, action_value=action_value, loop=loop)
-        self._submit_on_loop(loop, self._handle_card_action_event(data))
-        return self._card_response()
+        from .feishu_card_action import on_card_click
+        return on_card_click(self, data, loop)
 
     @staticmethod
     def _loop_accepts_callbacks(loop: Any) -> bool:
@@ -1909,17 +1909,11 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
         return "*" in allowed_ids or normalized in allowed_ids
 
     @staticmethod
-    def _card_response(card_data: Optional[dict[str, Any]] = None) -> Any:
-        """Synchronous card-callback response; ``card_data`` updates the card inline."""
-        if P2CardActionTriggerResponse is None:
-            return None
-        response = P2CardActionTriggerResponse()
-        if card_data is not None and CallBackCard is not None:
-            card = CallBackCard()
-            card.type = "raw"
-            card.data = card_data
-            response.card = card
-        return response
+    def _card_response(card_data: Optional[dict[str, Any]] = None, *, toast: Optional[tuple[str, str]] = None) -> Any:
+        """Synchronous card-callback response; ``card_data`` updates the card inline, ``toast`` is a
+        ``(type, text)`` popup for the clicker (type: success / info / warning / error)."""
+        from .feishu_card_action import callback_response
+        return callback_response(card_data, toast)
 
     def _validate_card_action(
         self, *, event: Any, state: dict[str, str], label: str, ident: Any,
@@ -1953,11 +1947,11 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
         state = self._approval_state.get(approval_id)
         if not state:
             logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
-            return self._card_response()
+            return self._card_response(toast=("info", t("platform.feishu.card_action.already_handled")))
         choice = _APPROVAL_CHOICE_MAP.get(action_value.get("hermes_action"), "deny")
         checked = self._validate_card_action(event=event, state=state, label="approval", ident=approval_id)
         if checked is None:
-            return self._card_response()
+            return self._card_response(toast=("error", t("platform.feishu.card_action.denied")))
         open_id, chat_id, user_name = checked
         coro = self._resolve_approval(
             approval_id=approval_id, choice=choice, user_name=user_name, open_id=open_id, chat_id=chat_id,
@@ -1975,14 +1969,14 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
         state = self._update_prompt_state.get(prompt_id)
         if not state:
             logger.debug("[Feishu] Update prompt %s already resolved or unknown", prompt_id)
-            return self._card_response()
+            return self._card_response(toast=("info", t("platform.feishu.card_action.already_handled")))
         answer = str(action_value.get("hermes_update_prompt_action", "") or "").strip().lower()
         if answer not in {"y", "n"}:
             logger.debug("[Feishu] Card action has invalid update prompt answer=%r", answer)
             return self._card_response()
         checked = self._validate_card_action(event=event, state=state, label="update prompt", ident=prompt_id)
         if checked is None:
-            return self._card_response()
+            return self._card_response(toast=("error", t("platform.feishu.card_action.denied")))
         open_id, chat_id, user_name = checked
         coro = self._resolve_update_prompt(prompt_id, answer, user_name, open_id=open_id, chat_id=chat_id)
         if not self._submit_on_loop(loop, coro):

@@ -1353,6 +1353,12 @@ platform:
       unauthorized: "Slegs 'n gemagtigde Matrix-gebruiker kan hierdie kontroles gebruik."
       not_requester: "Slegs die gebruiker wat hierdie aksie aangevra het, kan hierdie kontroles gebruik."
   feishu:
+    card_action:
+      sent: "Ontvang — word verwerk"
+      denied: "Jy kan nie hierdie kaart gebruik nie"
+      already_handled: "Reeds hanteer"
+      retry: "Kon nie toestemming nagaan nie. Probeer weer"
+      handled_by: "✅ Hanteer deur {user}"
     approval:
       action_session: "Sessie"
       action_always: "Altyd"
