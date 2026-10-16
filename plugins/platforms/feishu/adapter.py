@@ -109,6 +109,7 @@ _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 from .feishu_message_time import message_sent_at  # noqa: E402
 from .feishu_card_scan import _find_first_text, _find_header_title, _walk_nodes  # noqa: E402
 from .feishu_media_types import _AUDIO_EXTENSIONS, _IMAGE_EXTENSIONS, _VIDEO_EXTENSIONS  # noqa: E402
+from .feishu_group_access import FeishuGroupRule
 _DOCUMENT_MIME_TO_EXT = {mime: ext for ext, mime in SUPPORTED_DOCUMENT_TYPES.items()}
 _FEISHU_IMAGE_UPLOAD_TYPE = "message"
 _FEISHU_FILE_UPLOAD_TYPE = "stream"
@@ -291,16 +292,6 @@ class FeishuAdapterSettings:
     quote_chain_max_depth: int = 20  # quoted messages walked toward the root; 0/1 = the direct quote only
     render_mode: str = "card"  # "card": Card JSON 2.0 markdown; "post": post md / text (upstream)
     streaming_transport: str = "cardkit"  # "cardkit": stream into one CardKit card; "edit": edit-based previews
-
-
-@dataclass
-class FeishuGroupRule:
-    """Per-group policy rule for controlling which users may interact with the bot."""
-
-    policy: str  # "open" | "allowlist" | "blacklist" | "admin_only" | "disabled"
-    allowlist: set[str] = field(default_factory=set)
-    blacklist: set[str] = field(default_factory=set)
-    require_mention: Optional[bool] = None  # None = inherit global
 
 
 @dataclass
@@ -971,9 +962,10 @@ def _sdk_build(request_cls: Any, **fields: Any) -> Any:
 
 from .feishu_badges import FeishuBadgesMixin  # noqa: E402
 from .feishu_media_types import FeishuMediaTypesMixin  # noqa: E402
+from .feishu_group_access import FeishuGroupAccessMixin
 
 
-class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapter):
+class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, FeishuGroupAccessMixin, BasePlatformAdapter):
     """Feishu/Lark bot adapter."""
     # Answers /p/<profile>/... on the default listener for a served secondary (shared_ingress).
     serves_profile_prefix: bool = True
@@ -1062,6 +1054,7 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
                     blacklist=_id_set(rule_cfg.get("blacklist", [])),
                     # Only override when explicitly set — missing vs false must not collapse.
                     require_mention=_to_boolean(rule_cfg["require_mention"]) if "require_mention" in rule_cfg else None,
+                    policy_explicit="policy" in rule_cfg,
                 )
 
         # Scoped read: under multiplex a secondary profile's .env must govern its own adapter; yaml
@@ -2902,34 +2895,6 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
         if text:
             self._warned_empty_allowlist_deny = True
             logger.warning(text)
-
-    def _require_mention_for(self, chat_id: str) -> bool:
-        rule = self._group_rules.get(chat_id) if chat_id else None
-        if rule and rule.require_mention is not None:
-            return rule.require_mention
-        return self._require_mention
-
-    def _allow_group_message(self, sender_id: Any, chat_id: str = "", *, is_bot: bool = False) -> bool:
-        """Per-group policy gate for non-DM traffic."""
-        sender_ids = {getattr(sender_id, "open_id", None), getattr(sender_id, "user_id", None)} - {None}
-        if sender_ids and self._admins and (sender_ids & self._admins):
-            return True
-        rule = self._group_rules.get(chat_id) if chat_id else None
-        if rule:
-            policy, allowlist, blacklist = rule.policy, rule.allowlist, rule.blacklist
-        else:
-            policy, allowlist, blacklist = self._default_group_policy or self._group_policy, self._allowed_group_users, set()
-        # Channel locks apply to everyone; allowlist/blacklist only gate humans (bots were
-        # already cleared upstream by FEISHU_ALLOW_BOTS).
-        if policy in ("disabled", "admin_only"):
-            return False
-        if policy == "open" or is_bot:
-            return True
-        if policy == "allowlist":
-            return bool(sender_ids and (sender_ids & allowlist))
-        if policy == "blacklist":
-            return bool(sender_ids and not (sender_ids & blacklist))
-        return bool(sender_ids and (sender_ids & self._allowed_group_users))
 
     def _mentions_self(self, message: Any) -> bool:
         # @_all is Feishu's @everyone placeholder (platforms.feishu.extra.respond_to_at_all: false ignores it).

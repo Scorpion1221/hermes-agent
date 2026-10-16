@@ -448,6 +448,16 @@ class GatewayAuthorizationMixin:
             return bool(sender_allow.strip())
         return isinstance(sender_allow, (list, tuple, set)) and any(str(item).strip() for item in sender_allow)
 
+    def _adapter_group_rule_authorizes(self, source, sender_ids, adapter_profile) -> bool:
+        """Whether the receiving adapter's explicit rule for THIS group names the sender (Feishu
+        ``group_rules.<chat_id>``: ``open``, or an ``allowlist`` containing them). Without this check,
+        a member that intake admitted is silently ignored by FEISHU_ALLOWED_USERS. The adapter
+        decides through ``authorizes_group_sender(chat_id, sender_ids)``, and default policies
+        never count (SECURITY.md §2.6). ``is True`` keeps a MagicMock adapter from authorizing."""
+        adapter = self._authorization_adapter(source.platform, adapter_profile)
+        check = getattr(adapter, "authorizes_group_sender", None) if adapter is not None else None
+        return callable(check) and check(source.chat_id, sender_ids) is True
+
     def _pairing_store_for(self, source: SessionSource):
         """Per-profile PairingStore for a source, else the global ``self.pairing_store``."""
         per_profile = getattr(self, "pairing_stores", None) or {}
@@ -660,6 +670,10 @@ class GatewayAuthorizationMixin:
         sender_ids = [user_id, *(a for a in getattr(source, "auth_aliases", ()) or () if a and a != user_id)]
         platform_name = source.platform.value if source.platform else ""
         if pairing_store is not None and any(pairing_store.is_approved(platform_name, i) for i in sender_ids):
+            return True
+        # A per-chat rule the operator wrote for this group (it names the chat or the sender), like
+        # TELEGRAM_GROUP_ALLOWED_CHATS. Adapter-time grant: stored routes (plugin injection) skip it.
+        if is_group and allow_adapter_delegation and self._adapter_group_rule_authorizes(source, sender_ids, adapter_profile):
             return True
 
         platform_allowlist = _auth_env(platform_allow_env)
