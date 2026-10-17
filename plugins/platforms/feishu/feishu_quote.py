@@ -11,8 +11,8 @@ quoted message did not arrive in time, never a late reply. Fetched messages are 
 and a fetch the budget gave up on still completes into the caches for the next reply in that chain.
 
 Messages are fetched with card bodies as raw ``json_card``, so a quoted Card JSON 2.0 card (the
-bot's own replies) reads as its content and a quoted merge-forward as its transcript (text only).
-Images and files of the directly quoted message, never of its ancestors, are downloaded and
+bot's own replies) reads as its content and a quoted merge-forward as its transcript.
+Images and files of the directly quoted message (of a quoted forward, its children's), never of its ancestors, are downloaded and
 attached to the event (capped), as other adapters attach quoted images; a quoted folder is listed
 (its tree follows the quoted message's text) and its files share that cap. The download shares the
 walk's time budget and is cached per quoted message (while its files exist), so a slow download
@@ -129,8 +129,8 @@ async def _build_node(adapter: Any, message_id: str, items: list[Any]) -> QuoteN
         message_id=message_id, msg_type=msg_type, text=transcript.text if transcript else "",
         sender=getattr(item, "sender", None), parent_id=str(getattr(item, "parent_id", "") or ""),
     )
-    if transcript is not None:
-        return node
+    if transcript is not None:  # its children's media download through the forward itself, the outermost one
+        return dataclasses.replace(node, image_keys=tuple(transcript.image_keys), media_refs=tuple(transcript.media_refs))
     raw_content = getattr(getattr(item, "body", None), "content", "") or ""
     normalized = adapter._normalize(msg_type, raw_content, getattr(item, "mentions", None))
     return dataclasses.replace(

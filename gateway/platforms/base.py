@@ -1291,7 +1291,7 @@ MEDIA_DELIVERY_EXTS: tuple[str, ...] = (
     ".xlsx", ".xls", ".ods", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml",  # spreadsheets/data
     ".kmz", ".kml", ".geojson", ".gpx",  # geospatial / GIS
     ".pptx", ".ppt", ".odp", ".key",  # presentations
-    ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".apk", ".ipa",  # archives
+    ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".apk", ".ipa", ".skill",  # archives, skill packages
     ".html", ".htm")  # web / rendered output
 
 # Bare extensions (no dot) longest-first so a shorter ext never matches as a prefix of a longer one.
@@ -1354,8 +1354,8 @@ MEDIA_EXTENSIONLESS_TAG_RE = re.compile(
     r'''[`"'*_]{0,3}MEDIA:\s*'''
     r'''(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|'''
     r'''(?:~/|/|[A-Za-z]:[/\\])[^\s\n`"']+?)'''
-    r'''(?=[`"'\s,;:)\]}''' + _MEDIA_CJK_TERMINATORS + r''']|MEDIA:|$)'''
-    r'''[`"'*_]{0,3}\s*''',
+    r'''(?=[`"'\s,;:)\]}''' + _MEDIA_CJK_TERMINATORS + r''']|[*_]{1,3}(?:[\s,;:)\]}''' + _MEDIA_CJK_TERMINATORS + r''']|\.(?:\s|$)|$)|MEDIA:|$)'''
+    r'''[`"'*_]{0,3}\s*''',  # a closing ``**``/``_`` run (then a delimiter) ends the path: ``my_file.py`` keeps its ``_``
     re.IGNORECASE)
 
 
@@ -1463,8 +1463,8 @@ def _extensionless_media_matches(masked: str):
         path = _normalize_media_tag_path(match.group("path"))
         if path and _path_lacks_deliverable_extension(path):
             resolved = _match_extensionless_path(masked, match)
-            if resolved is not None:
-                yield match, resolved[0], resolved[1]
+            if resolved is not None:  # the span takes the closing emphasis the opening one matched
+                yield match, resolved[0], resolved[1] + len(re.match(r"[*_]{0,3}", masked[resolved[1]:])[0])
 
 
 def _real_media_tag_spans(masked: str) -> list:

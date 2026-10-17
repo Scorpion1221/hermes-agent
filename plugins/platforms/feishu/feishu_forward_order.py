@@ -1,15 +1,16 @@
-"""A merge-forward, a folder or a quoted reply reaches the agent before the messages its sender sends behind it.
+"""A merge-forward, a card, a folder or a quoted reply reaches the agent before the messages its sender sends behind it.
 
 Inbound events are processed concurrently. Expanding a forward awaits a message GET, a name lookup
-and child-media downloads; a folder awaits its listing and file downloads; a quoted reply awaits the
+and child-media downloads; a card awaits the GET that reads its json_card; a folder awaits its listing and file downloads; a quoted reply awaits the
 quoted message, its reply chain and its media (time-boxed, but seconds on a cold cache). The note
 Feishu sends after a forward or a folder ("please review these"), or a plain follow-up to a quoted
 reply, would otherwise overtake it and be answered on its own, with the slow message arriving later
 as a second (interrupting) turn. While a sender's forward, folder or explicit quote is being
 processed, that sender's next messages in the same chat and topic wait for it (bounded; downloads
 stop at ``DOWNLOAD_BUDGET_SECONDS``, so the slow message is normally dispatched well inside the
-hold). A forward or folder then opens the text batch and its note merges into it; its own text (the
-transcript, the folder tree) does not count toward ``text_batch_max_chars``, or the note would flush it.
+hold). A forward, card or folder then opens the text batch and its note merges into it; its own text
+(the transcript, the card, the folder tree) does not count toward ``text_batch_max_chars``, or the
+note would flush it.
 
 A command is never held and holds nothing: ``/stop``, ``/approve`` and clarify-style control reach
 the base adapter's busy guard at once. A message posted into a topic names the topic's root without
@@ -66,8 +67,8 @@ def _normalize(adapter: Any, message: Any) -> Any:
 
 
 def _expands(normalized: Any) -> bool:
-    """A forward is expanded by GET, a folder (native or in a post) listed and downloaded: both after arrival."""
-    return normalized.raw_type == "merge_forward" or bool(normalized.folder_refs)
+    """A forward or a card is read by GET, a folder (native or in a post) listed and downloaded: all after arrival."""
+    return normalized.raw_type in {"merge_forward", "interactive", "card"} or bool(normalized.folder_refs)
 
 
 def _is_command(normalized: Any) -> bool:
@@ -86,7 +87,7 @@ def _quotes_explicitly(message: Any) -> bool:
 
 
 def batch_chars(adapter: Any, batch: Any, text: str) -> int:
-    """Size of a pending text batch for the flush cap, minus the expansion of a forward or folder that opened it.
+    """Size of a pending text batch for the flush cap, minus the expansion of a forward, card or folder that opened it.
 
     The first time a batch is measured nothing has been merged into it yet, so its text is still
     exactly the opener's own; that length is remembered on the batch for later merges.
