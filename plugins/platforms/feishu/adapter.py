@@ -3086,28 +3086,6 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
         return lock
 
     # --- Outbound payload construction and send pipeline ---
-    @staticmethod
-    def _get_audio_duration_ms(file_path: str) -> int:
-        """OGG/Opus duration in ms (pure Python): last granule position / 48000 Hz; 0 on non-OGG or error."""
-        import struct
-        try:
-            with open(file_path, "rb") as f:
-                data = f.read()
-            pos = last_granule = 0
-            while pos < len(data) - 27:
-                pos = data.find(b"OggS", pos)
-                if pos == -1 or pos + 27 > len(data):
-                    break
-                granule = struct.unpack_from("<q", data, pos + 6)[0]
-                num_segments = data[pos + 26]
-                last_granule = granule if granule > 0 else last_granule
-                if pos + 27 + num_segments > len(data):
-                    break
-                pos += num_segments + sum(data[pos + 27 : pos + 27 + num_segments])
-            return int(last_granule / 48000 * 1000) if last_granule > 0 else 0
-        except Exception:
-            return 0
-
     async def _send_uploaded_file_message(
         self, *, chat_id: str, file_path: str, reply_to: Optional[str], metadata: Optional[dict[str, Any]],
         caption: Optional[str] = None, file_name: Optional[str] = None, outbound_message_type: str = "file",
@@ -3205,6 +3183,9 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
         from .feishu_reaction import feishu_message_id  # a reaction / card click id → its message
         thread_id = (metadata or {}).get("thread_id")
         effective_reply_to = feishu_message_id(reply_to or ((metadata or {}).get("reply_to_message_id") if thread_id else None))
+        if thread_id and not effective_reply_to:
+            # create takes no thread_id receive_id_type (99992402): reply to a message in the topic instead.
+            effective_reply_to = await self._fetch_last_message_in_thread(thread_id)
         if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload, msg_type=msg_type, reply_in_thread=bool(thread_id), uuid_value=str(uuid.uuid4()),
@@ -3212,7 +3193,8 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
             request = self._build_reply_message_request(effective_reply_to, body)
             return await self._run_blocking(self._client.im.v1.message.reply, request)
         if thread_id:
-            # reply→create fallback inside a topic: thread_id as receive_id keeps it in the topic.
+            # Last resort, no message in the topic to reply to: create addressed to the topic (Feishu may still
+            # refuse it, but posting at the chat root instead would take the message out of the topic).
             receive_id, receive_id_type = thread_id, "thread_id"
         elif chat_id.startswith("feishu_user_id:"):
             receive_id, receive_id_type = chat_id.split(":", 1)[1], "user_id"
@@ -3768,6 +3750,17 @@ _MIGRATION_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 _MIGRATION_AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"}
 
 
+def _session_topic_anchor(thread_id: str) -> Optional[str]:
+    """The live Feishu session's inbound message when the send targets that session's own topic
+    (``hermes send`` in the agent's terminal inherits HERMES_SESSION_*): a reply to it lands in the topic."""
+    from gateway.session_context import get_session_env
+    if get_session_env("HERMES_SESSION_PLATFORM", "") != "feishu":
+        return None
+    if get_session_env("HERMES_SESSION_THREAD_ID", "") != thread_id:
+        return None  # another topic: its inbound message would graft the reply into the wrong one
+    return get_session_env("HERMES_SESSION_MESSAGE_ID", "").strip() or None
+
+
 async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False):
     """standalone_sender_fn: out-of-process delivery (cron without gateway) via a transient adapter."""
     if not await asyncio.to_thread(_load_lark_oapi):
@@ -3776,6 +3769,8 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
         adapter = FeishuAdapter(pconfig)
         adapter._client = adapter._build_lark_client(_sdk_domain(getattr(adapter, "_domain_name", "feishu")))
         metadata = {"thread_id": thread_id} if thread_id else None
+        if metadata and (anchor := _session_topic_anchor(thread_id)):
+            metadata["reply_to_message_id"] = anchor
         last_result = None
         if message.strip():
             last_result = await adapter.send(chat_id, message, metadata=metadata)

@@ -235,9 +235,9 @@ def _handle_send(args):
     media_dropped: list = []
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files, dropped=media_dropped)
     mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
-    used_home_channel = not chat_id
-    if used_home_channel:
-        chat_id, err = _home_chat_id(config, platform, platform_name)
+    note = None
+    if not chat_id:
+        chat_id, thread_id, note, err = _bare_target_destination(config, platform, platform_name)
         if err:
             return tool_error(err)
     if duplicate_skip := _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id):
@@ -276,9 +276,12 @@ def _handle_send(args):
                                               media_files=media_files, force_document=force_document_attachments,
                                               **handler_args))
         if isinstance(result, dict) and result.get("success"):
-            if used_home_channel:
-                result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
-            if mirror_text and _mirror_sent_message(platform_name, chat_id, mirror_text, thread_id):
+            if note:
+                result["note"] = note
+            # Never mirror into the conversation this send runs in: its own tool call already records the
+            # send, and a mirror row would land between that call and its result in the live transcript.
+            if (mirror_text and (str(chat_id), thread_id or None) != _current_conversation(platform_name)
+                    and _mirror_sent_message(platform_name, chat_id, mirror_text, thread_id)):
                 result["mirrored"] = True
             if media_dropped:
                 # The text went out but an attachment the caller asked for did not: a script reading
@@ -390,6 +393,28 @@ def _secret_sources_state(user_config):
     except Exception:
         states = []
     return ", ".join(states) or "none configured"
+
+
+def _current_conversation(platform_name):
+    """``(chat_id, thread_id)`` of the sender's own conversation when it is on ``platform_name``, else
+    ``(None, None)``: bound for a gateway turn and inherited (HERMES_SESSION_*) by ``hermes send`` in its
+    terminal. A cron run binds no conversation, nor does a plain shell."""
+    from gateway.session_context import get_session_env
+    if get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower() != platform_name:
+        return None, None
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "").strip()
+    return (chat_id, thread_id or None) if chat_id else (None, None)
+
+
+def _bare_target_destination(config, platform, platform_name):
+    """``(chat_id, thread_id, note, error)`` for a bare ``platform`` target: the sender's own conversation
+    on that platform, else (cron, a plain shell, a conversation elsewhere) its home channel."""
+    chat_id, thread_id = _current_conversation(platform_name)
+    if chat_id:
+        return chat_id, thread_id, f"Sent to the current {platform_name} conversation (chat_id: {chat_id})", None
+    chat_id, err = _home_chat_id(config, platform, platform_name)
+    return chat_id, None, f"Sent to {platform_name} home channel (chat_id: {chat_id})", err
 
 
 def _home_chat_id(config, platform, platform_name):
