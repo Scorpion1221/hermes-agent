@@ -660,6 +660,8 @@ class GatewayInboundMixin(GatewayClarifyReplyMixin, GatewayPluginInjectionMixin)
             _demote = "because the running agent has active subagents (#30170)"
         elif await self._session_has_compression_in_flight(_quick_key):
             _demote = "because context compression is in flight (#56391)"
+        elif self._busy_upload_waits_for_next_turn(event):
+            _demote = "because an upload waits for the next turn"
         else:
             await self._hm_busy_interrupt(event, source, running_agent, _quick_key)
             return None

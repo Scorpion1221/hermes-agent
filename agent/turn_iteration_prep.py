@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
 from agent.display import KawaiiSpinner
-from agent.interrupt_control import interrupt_issuer, interrupted_during_api_call_reason
+from agent.interrupt_control import interrupt_issuer, interrupted_during_api_call_reason, notify_steer_consumed
 from agent.turn_context_compaction import _reanchor
 from agent.turn_truncation import boosted_output_cap
 
@@ -290,6 +290,7 @@ def _inject_steer_after_newest_tool_result(agent: Any, messages: Any, steer_text
             from agent.prompt_builder import steer_user_row
             messages.insert(_si + 1, steer_user_row(steer_text))
             logger.debug("Pre-API-call steer drain: appended user row after tool msg at index %d", _si)
+            notify_steer_consumed(agent)
             return
     from agent.agent_runtime_helpers import _requeue_pending_steer
     _requeue_pending_steer(agent, steer_text)
@@ -370,6 +371,7 @@ def begin_iteration(
     _redirect_text = agent._drain_pending_redirect()
     if _redirect_text:
         _apply_active_turn_redirect(agent, messages, _redirect_text)
+        notify_steer_consumed(agent)
         if isinstance(original_user_message, str):
             original_user_message = (
                 f"{original_user_message}\n\n" f"User correction during the turn: {_redirect_text}"

@@ -119,7 +119,6 @@ _FEISHU_DOC_UPLOAD_TYPES = {
     ".pdf": "pdf", ".doc": "doc", ".docx": "doc", ".xls": "xls", ".xlsx": "xls", ".ppt": "ppt", ".pptx": "ppt",
 }
 # --- Connection, retry and batching tuning ---
-_MAX_TEXT_INJECT_BYTES = 100 * 1024
 _FEISHU_CONNECT_ATTEMPTS = 3
 _FEISHU_SEND_ATTEMPTS = 3
 _FEISHU_APP_LOCK_SCOPE = "feishu-app-id"
@@ -1335,8 +1334,8 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, FeishuGroupAccessM
 
     # CardKit streaming: one card per turn is the reply (upstream's stream-is-the-message draft contract), with
     # tool-progress lines kept in it, in order with the text; every frame resends the card, so frames are time-paced.
-    draft_stream_is_message = inline_tool_progress = True
-    draft_frames_time_paced = True
+    draft_stream_is_message = inline_tool_progress = draft_frames_time_paced = True
+    queue_busy_uploads = True  # a file, folder or archive sent mid-turn waits for the next turn, never interrupts
 
     def supports_draft_streaming(self, chat_type: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
                                  chat_id: Optional[str] = None) -> bool:
@@ -1356,6 +1355,11 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, FeishuGroupAccessM
                                  metadata: Optional[dict[str, Any]] = None) -> SendResult:
         from .feishu_stream import abandon
         return await abandon(self, chat_id, content, metadata)
+
+    async def seal_live_reply(self, chat_id: str) -> None:
+        """A mid-turn follow-up entered the turn: its answer streams in a fresh card below it."""
+        from .feishu_stream import seal_for_prompt
+        await seal_for_prompt(self, chat_id)
 
     async def send_clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
                            session_key: str, metadata: Optional[dict[str, Any]] = None) -> SendResult:
@@ -2621,17 +2625,6 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, FeishuGroupAccessM
             ))
         return media_urls, media_types
 
-    @staticmethod
-    def _resolve_media_message_type(media_type: str, *, default: MessageType) -> MessageType:
-        normalized = (media_type or "").lower()
-        if normalized.startswith("image/"):
-            return MessageType.PHOTO
-        if normalized.startswith("audio/"):
-            return MessageType.AUDIO
-        if normalized.startswith("video/"):
-            return MessageType.VIDEO
-        return default
-
     def _resolve_normalized_message_type(self, normalized: FeishuNormalizedMessage, media_types: list[str]) -> MessageType:
         preferred = normalized.preferred_message_type
         if preferred == "audio":
@@ -2647,22 +2640,6 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, FeishuGroupAccessM
             default = MessageType.PHOTO if preferred == "photo" else MessageType.DOCUMENT
             return self._resolve_media_message_type(media_types[0] if media_types else "", default=default)
         return MessageType.TEXT
-
-    async def _maybe_extract_text_document(self, cached_path: str, media_type: str) -> str:
-        if not cached_path or not media_type.startswith("text/"):
-            return ""
-        try:
-            if os.path.getsize(cached_path) > _MAX_TEXT_INJECT_BYTES:
-                return ""
-            ext = Path(cached_path).suffix.lower()
-            if ext not in {".txt", ".md"} and media_type not in {"text/plain", "text/markdown"}:
-                return ""
-            content = Path(cached_path).read_text(encoding="utf-8-sig")
-            display_name = self._display_name_from_cached_path(cached_path)
-            return f"[Content of {display_name}]:\n{content}"
-        except (OSError, UnicodeDecodeError):
-            logger.warning("[Feishu] Failed to inject text document content from %s", cached_path, exc_info=True)
-            return ""
 
     async def _fetch_message_resource(self, *, message_id: str, file_key: str, resource_type: str) -> Any:
         """GET im/v1/messages/{id}/resources/{key}; returns the SDK response (caller checks success)."""
