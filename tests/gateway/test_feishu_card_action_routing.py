@@ -287,9 +287,9 @@ def _turn(adapter, open_id, *, thread_id=None, chat_id="oc_chat"):
     asyncio.run(adapter.on_processing_start(SimpleNamespace(message_id=f"om_{open_id}", source=source)))
 
 
-def _press(adapter, token="tok_1", open_id="ou_asker"):
+def _press(adapter, token="tok_1", open_id="ou_asker", value=None):
     """Click ``om_bot`` from the SDK thread against a live adapter loop; returns the callback response."""
-    data = _click(token)
+    data = _click(token, value=value)
     data.event.operator = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
     with _LoopThread() as loop:
         adapter._loop = loop
@@ -338,6 +338,40 @@ def test_an_admin_may_answer_a_card_someone_else_asked_for(callback_types):
 
     assert response.toast.type == "success"
     assert len(adapter.routed) == 1
+
+
+_OPEN = {"swp": "approve", "hermes_card_click": "anyone"}
+
+
+def test_anyone_in_the_group_may_click_a_control_opened_to_everyone(callback_types):
+    adapter = _clickable(admins=["ou_boss"])
+
+    response = _press(adapter, open_id="ou_stranger", value=_OPEN)
+
+    assert response.toast.type == "success"
+    [event] = adapter.routed
+    assert event.source.user_id == "ou_stranger"  # the agent hears it from the clicker
+    assert '"hermes_card_click": "anyone"' in event.text
+    adapter._client.im.v1.message.patch.assert_called_once()
+
+
+def test_a_card_opened_to_everyone_is_still_answered_once(callback_types):
+    adapter = _clickable()
+
+    _press(adapter, token="tok_1", open_id="ou_stranger", value=_OPEN)
+    second = _press(adapter, token="tok_2", open_id="ou_someone_else", value=_OPEN)
+
+    assert second.toast.type == "info"
+    assert len(adapter.routed) == 1
+
+
+def test_another_value_does_not_open_the_click(callback_types):
+    adapter = _clickable()
+
+    response = _press(adapter, open_id="ou_stranger", value={"hermes_card_click": "admins"})
+
+    assert response.toast.type == "error"
+    assert adapter.routed == []
 
 
 def test_anyone_in_a_dm_may_answer(callback_types):

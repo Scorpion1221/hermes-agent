@@ -1,7 +1,9 @@
 """Clicks on this bot's Feishu cards (other than its own approval / update prompts).
 
 A click answers the card, once. Only an admin, the user the card answers or, in a DM, the user there may
-click; anyone else gets an error toast and the card is left as it was. A card answers the user whose turn was
+click; anyone else gets an error toast and the card is left as it was. A control whose callback value carries
+``"hermes_card_click": "anyone"`` opens its click to everyone in the chat (a card meant for a group, such as a
+release approval; the agent still decides what the click means). A card answers the user whose turn was
 running in its chat (and topic) when it was sent, however it was sent (the adapter or the agent's own
 ``lark-cli``): the processing hooks record each turn (:func:`note_turn`). A card no recorded turn explains
 (sent before a restart) answers the sender of the message it replies to, through the bot's own replies but
@@ -45,6 +47,7 @@ _CACHE_SIZE = 1024
 _OWNER_HOPS = 4  # how far up the bot's own replies a card no turn explains looks for its asker
 _RETRY_AFTER_FAILED_LOOKUP_SECONDS = 30.0
 _CLOCK_SLACK_SECONDS = 5.0  # Feishu's create_time against this host's clock
+_OPEN_CLICK = ("hermes_card_click", "anyone")  # in a control's callback value: anyone in the chat may click
 _LOOKUP_BUDGET_SECONDS = 2.0  # leaves headroom inside Feishu's ~3 s card-callback deadline
 # What the user did: a button's value, a submitted form's values, a select / picker choice, a typed input.
 _ACTION_FIELDS = ("name", "value", "form_value", "option", "options", "input_value", "checked")
@@ -64,6 +67,7 @@ class _Click:
     union_id: str
     operator_ids: frozenset[str]
     token: str
+    open_to_all: bool = False
 
 
 @dataclass(frozen=True)
@@ -129,9 +133,11 @@ def _parse(data: Any) -> Optional[_Click]:
         return None
     user_id = str(getattr(operator, "user_id", "") or "")
     union_id = str(getattr(operator, "union_id", "") or "")
+    value = getattr(getattr(event, "action", None), "value", None)
     return _Click(chat_id=chat_id, card_id=str(getattr(context, "open_message_id", "") or ""), open_id=open_id,
                   user_id=user_id, union_id=union_id, operator_ids=frozenset(i for i in (open_id, user_id, union_id) if i),
-                  token=str(getattr(event, "token", "") or ""))
+                  token=str(getattr(event, "token", "") or ""),
+                  open_to_all=isinstance(value, dict) and value.get(_OPEN_CLICK[0]) == _OPEN_CLICK[1])
 
 
 def callback_response(card_data: Optional[dict[str, Any]], toast: Optional[tuple[str, str]]) -> Any:
@@ -153,7 +159,7 @@ def callback_response(card_data: Optional[dict[str, Any]], toast: Optional[tuple
 # --- Who may click ---
 
 def _may_click(adapter: Any, click: _Click, audience: _Audience) -> bool:
-    if click.operator_ids & adapter._admins or audience.dm:
+    if click.open_to_all or click.operator_ids & adapter._admins or audience.dm:
         return True
     if audience.owner:
         return bool(audience.owner & click.operator_ids)
@@ -162,7 +168,7 @@ def _may_click(adapter: Any, click: _Click, audience: _Audience) -> bool:
 
 
 def _may_click_cached(adapter: Any, click: _Click) -> Optional[bool]:
-    if click.operator_ids & adapter._admins:
+    if click.open_to_all or click.operator_ids & adapter._admins:
         return True
     audience = _audiences(adapter).get((click.chat_id, click.card_id))
     return _may_click(adapter, click, audience) if isinstance(audience, _Audience) else None
