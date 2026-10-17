@@ -579,6 +579,8 @@ Set `require_mention: false` on a `group_rules` entry to skip the @-mention requ
 
 Groups not listed in `group_rules` fall back to `default_group_policy` (defaults to the value of `FEISHU_GROUP_POLICY`).
 
+A chat's own `open` rule, an `allowlist` rule that names the sender, or an `allowlist` / `admin_only` rule for a sender in `admins` also authorizes that sender in the gateway, so they do not need to be in `FEISHU_ALLOWED_USERS` too. The rule must set `policy` explicitly. `blacklist`, `default_group_policy` and `FEISHU_GROUP_POLICY` admit at intake only, so those senders still need `FEISHU_ALLOWED_USERS`, pairing, or `FEISHU_ALLOW_ALL_USERS`.
+
 ## Deduplication
 
 Inbound messages are deduplicated using message IDs with a 24-hour TTL. The dedup state is persisted across restarts to `~/.hermes/feishu_seen_message_ids.json`.
