@@ -603,6 +603,8 @@ class GatewayBusySessionMixin:
         )
         if demoted_for_compression:
             effective_mode = self._demote_interrupt(session_key, "context compression is in flight (#56391)")
+        if effective_mode == "interrupt" and self._busy_upload_waits_for_next_turn(event):
+            effective_mode = self._demote_interrupt(session_key, "an upload waits for the next turn")
         if effective_mode in {"interrupt", "steer"} and self._busy_followup_is_cross_sender(event, running_agent):
             # Steer, redirect and interrupt are the turn owner's corrections. In a shared group/topic
             # session another participant's message is not: it gets its own turn instead of being
@@ -661,6 +663,15 @@ class GatewayBusySessionMixin:
         owner = _ids(getattr(running_agent, "_user_id", None), getattr(running_agent, "_user_id_alt", None))
         sender = _ids(event.source.user_id, getattr(event.source, "user_id_alt", None))
         return bool(owner) and bool(sender) and not owner & sender
+
+    def _busy_upload_waits_for_next_turn(self, event: MessageEvent) -> bool:
+        """An upload (file, folder, archive, picture) sent to a busy session is material for the work,
+        not a correction: on an adapter that opts in (``queue_busy_uploads``) it waits for the next
+        turn instead of interrupting the running one. A voice note keeps its transcript path."""
+        if not (event.media_urls or event.media_types) or self._event_is_voice_only(event):
+            return False
+        adapter = self._delivery_adapter_for(event.source)
+        return getattr(type(adapter), "queue_busy_uploads", False) is True
 
     @staticmethod
     def _demote_interrupt(session_key: str, why: str) -> str:

@@ -1363,6 +1363,8 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
     # with tool-progress lines kept in it, in order with the text.
     draft_stream_is_message = True
     inline_tool_progress = True
+    # A file, folder or archive sent mid-turn waits for the next turn instead of interrupting this one.
+    queue_busy_uploads = True
 
     def supports_draft_streaming(self, chat_type: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
                                  chat_id: Optional[str] = None) -> bool:
@@ -2643,17 +2645,6 @@ class FeishuAdapter(FeishuBadgesMixin, FeishuMediaTypesMixin, BasePlatformAdapte
                 fallback_filename=ref.file_name,
             ))
         return media_urls, media_types
-
-    @staticmethod
-    def _resolve_media_message_type(media_type: str, *, default: MessageType) -> MessageType:
-        normalized = (media_type or "").lower()
-        if normalized.startswith("image/"):
-            return MessageType.PHOTO
-        if normalized.startswith("audio/"):
-            return MessageType.AUDIO
-        if normalized.startswith("video/"):
-            return MessageType.VIDEO
-        return default
 
     def _resolve_normalized_message_type(self, normalized: FeishuNormalizedMessage, media_types: list[str]) -> MessageType:
         preferred = normalized.preferred_message_type

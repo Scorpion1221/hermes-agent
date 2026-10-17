@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from gateway.platforms.base import SUPPORTED_DOCUMENT_TYPES
+from gateway.platforms.event import MessageType
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 _AUDIO_EXTENSIONS = {".ogg", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".opus", ".webm"}
@@ -92,3 +93,14 @@ class FeishuMediaTypesMixin:
         if normalized_ext in {".jpg", ".jpeg"}:
             return "image/jpeg"
         return f"image/{normalized_ext.lstrip('.') or 'jpeg'}"
+
+    @staticmethod
+    def _resolve_media_message_type(media_type: str, *, default: MessageType) -> MessageType:
+        normalized = (media_type or "").lower()
+        if normalized.startswith("image/"):
+            return MessageType.PHOTO
+        if normalized.startswith("audio/"):
+            return MessageType.AUDIO
+        if normalized.startswith("video/"):
+            return MessageType.VIDEO
+        return default
