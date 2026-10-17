@@ -105,6 +105,27 @@ def test_reaction_on_own_message_replies_to_it_with_quote_and_topic():
     assert (quote_get.message_id, quote_get.card_msg_content_type) == ("om_bot", "raw_card_content")
 
 
+def test_a_reaction_asks_for_no_answer():
+    adapter = _adapter()
+    routed = _wire_routing(adapter, _bot_message())
+
+    _route(adapter, _reaction("evt_1", emoji="OK"))
+
+    [event] = routed
+    assert event.reply_expected is False
+
+
+def test_a_silent_answer_to_a_reaction_stays_silent():
+    from gateway.response_filters import silence_allowed
+
+    adapter = _adapter()
+    routed = _wire_routing(adapter, _bot_message())
+    _route(adapter, _reaction("evt_1", emoji="OK"))
+
+    [event] = routed
+    assert silence_allowed(None, event.reply_expected)  # a human turn, yet no "only a silence marker" notice
+
+
 def _topic_message_session_key(adapter, *, thread_id):
     """Session key of an ordinary inbound message from the same user in that chat and topic."""
     message = SimpleNamespace(

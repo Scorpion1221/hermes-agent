@@ -1,7 +1,8 @@
 """User reactions on this bot's own Feishu messages, routed as synthetic replies to that message.
 
 A reaction becomes the text ``reaction:<added|removed>:<EMOJI>``, quoting the reacted message, in that
-message's topic. Its ``message_id`` names the reaction, not the reacted message: the gateway keys its
+message's topic. A reaction asks for no answer (``reply_expected=False``): the agent may stay silent, and
+when it does the gateway sends nothing instead of its "only returned a silence marker" notice. Its ``message_id`` names the reaction, not the reacted message: the gateway keys its
 inbound transcript dedupe, input ownership and delivery ledger on that id, so a second reaction on one
 message must not read as a replay of the first. Wherever the adapter hands an inbound id to Feishu (the
 reply target of every send, the processing badge) it maps it back with :func:`feishu_message_id`.
@@ -48,6 +49,7 @@ async def handle_reaction_event(adapter: Any, event_type: str, data: Any) -> Non
         raw_message=data, message_id=_reaction_id(message_id, data),
         thread_id=str(getattr(msg, "thread_id", "") or "") or None,
         reply_to_message_id=message_id, reply_to_text=reply_to_text, reply_to_is_own_message=True,
+        reply_expected=False,
     )
 
 
