@@ -3,9 +3,10 @@
 The stream consumer calls ``send_draft`` with the whole text so far for each frame; the first frame of a
 turn creates a streaming card and sends it as a reply, later frames replace the card's text. The turn's
 final ``send()`` does not post a new message: it seals the open card with the final text (seal-
-interception, like the relay adapter for Slack), and the sealed card IS the reply. ``abandon_open_draft``
-seals an orphaned card in place when the turn dies (/stop, /new). Mid-turn sends that are not the final
-carry ``metadata["_interim_send"]`` and never seal.
+interception, like the relay adapter for Slack), and the sealed card IS the reply. A seal runs to the end
+even when its sender is cancelled, and the gateway's resend of that same final is answered by it.
+``abandon_open_draft`` seals an orphaned card in place when the turn dies (/stop, /new). Mid-turn sends
+that are not the final carry ``metadata["_interim_send"]`` and never seal.
 
 A card is keyed by the consumer's per-turn draft id. Only a turn-final send (marked ``notify``, as the
 consumer's final and the gateway's final lane are) replying to the same message seals it; status bubbles,
@@ -28,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from gateway.platforms.base import SendResult
+from gateway.stream_consumer_fences import ensure_closed_code_fences
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,8 @@ COMPLETE = "DONE"
 MAX_CARD_AGE_SECONDS = 540.0
 # Roll over well before a markdown element's ~30k-character limit (headroom for the render pass).
 MAX_CARD_CHARS = 24_000
+# How long the gateway's resend of a final waits for the orphaned seal of that final (see ``_seal_final``).
+ORPHAN_WAIT_SECONDS = 30.0
 _STATE_CAP = 512
 
 
@@ -135,6 +139,8 @@ class CardStreams:
     def __init__(self) -> None:
         self.open: OrderedDict[str, TurnStream] = OrderedDict()
         self.sealed: OrderedDict[str, int] = OrderedDict()
+        # (chat, reply anchor) -> (seal task, final text) of a final seal whose sender was cancelled.
+        self.orphaned: OrderedDict[str, tuple[asyncio.Future, str]] = OrderedDict()
 
     def _evict(self, mapping: OrderedDict) -> None:
         while len(mapping) > _STATE_CAP:
@@ -162,6 +168,28 @@ class CardStreams:
         if (metadata or {}).get("notify") is not True:
             return None
         return self.for_turn(chat_id, metadata)
+
+    @staticmethod
+    def _anchor_key(chat_id: str, metadata: Optional[dict[str, Any]]) -> str:
+        md = metadata or {}
+        return f"{chat_id}:{md.get('reply_to_message_id') or md.get('message_id')}"
+
+    def orphan(self, chat_id: str, metadata: Optional[dict[str, Any]], seal: asyncio.Future, content: str) -> None:
+        key = self._anchor_key(chat_id, metadata)
+        self.orphaned[key] = (seal, content)
+        self.orphaned.move_to_end(key)
+        self._evict(self.orphaned)
+
+    def take_orphan(self, chat_id: str, content: str, metadata: Optional[dict[str, Any]]) -> Optional[asyncio.Future]:
+        """The orphaned final seal a gateway-lane final for the same message is the resend of. The first such
+        final consumes the orphan whatever its text; the seal is returned only when that final is the text it
+        sealed (compared ignoring whitespace and an unclosed fence the seal closed)."""
+        if (metadata or {}).get("notify") is not True:
+            return None
+        seal, sealed = self.orphaned.pop(self._anchor_key(chat_id, metadata), (None, ""))
+        if seal is None or _squash(ensure_closed_code_fences(content)) != _squash(ensure_closed_code_fences(sealed)):
+            return None
+        return seal
 
 
 def _registry(adapter: Any) -> CardStreams:
@@ -336,6 +364,11 @@ async def seal_with_final(adapter: Any, chat_id: str, content: str, metadata: Op
     """Seal the turn's open card with the final text; None when no card is open (a plain send follows).
     ``stream_final``: the stream consumer's own final (its metadata names the user's message)."""
     streams = _registry(adapter)
+    # The gateway's resend of a final whose seal was cancelled, checked before the open streams: in a topic a
+    # later turn's card replies to the same root and must not be sealed with this turn's final. Only the
+    # gateway's lane: a consumer's own final (``stream_final``) is never a resend.
+    if not stream_final and (resent := await _resent_final(streams, chat_id, content, metadata)) is not None:
+        return resent
     key = streams.match(chat_id, metadata)
     if key is None:
         md = dict(metadata or {})
@@ -345,12 +378,52 @@ async def seal_with_final(adapter: Any, chat_id: str, content: str, metadata: Op
         # ends as (footer, DONE). Command replies and notices are not the consumer's final: plain cards.
         stream = TurnStream(key="", draft_id=-1, chat_id=chat_id, reply_to=md.get("reply_to_message_id"),
                             metadata=md, started_at=_now())
-        async with stream.lock:
-            return await _seal_turn(adapter, stream, content)
+        return await _seal_final(adapter, streams, stream, content, metadata)
     stream = streams.open.pop(key)
     streams.tombstone(key, stream.draft_id)
-    async with stream.lock:
-        return await _seal_turn(adapter, stream, content)
+    return await _seal_final(adapter, streams, stream, content, metadata)
+
+
+async def _seal_final(adapter: Any, streams: CardStreams, stream: TurnStream, content: str,
+                      metadata: Optional[dict[str, Any]]) -> Optional[SendResult]:
+    """Seal the turn's cards with its final, to the end even when the sender stops waiting.
+
+    Feishu applies a card update it received whether or not its answer is still awaited, and the gateway
+    cancels a stream consumer that takes over 5 s to finish. A cancelled sender learns nothing, so the gateway
+    sends the same final again: the seal is kept for that resend (``_resent_final``), which then answers with
+    the card that already shows the final instead of opening a second one."""
+    async def _locked() -> Optional[SendResult]:
+        async with stream.lock:
+            return await _seal_turn(adapter, stream, content)
+
+    seal = asyncio.ensure_future(_locked())
+    try:
+        return await asyncio.shield(seal)
+    except asyncio.CancelledError:
+        seal.add_done_callback(_log_orphan_failure)
+        streams.orphan(stream.chat_id, metadata, seal, content)
+        raise
+
+
+def _log_orphan_failure(seal: asyncio.Future) -> None:
+    if not seal.cancelled() and seal.exception() is not None:
+        logger.warning("[Feishu] A final card seal failed after its sender stopped waiting",
+                       exc_info=seal.exception())
+
+
+async def _resent_final(streams: CardStreams, chat_id: str, content: str,
+                        metadata: Optional[dict[str, Any]]) -> Optional[SendResult]:
+    """The orphaned seal's result when ``content`` is the final it sealed (the gateway resending it); None
+    otherwise, and when the seal failed or is still unanswered after ``ORPHAN_WAIT_SECONDS`` (the resend is
+    then delivered as usual: a possible duplicate, never a lost answer)."""
+    seal = streams.take_orphan(chat_id, content, metadata)
+    if seal is None:
+        return None
+    try:
+        result = await asyncio.wait_for(asyncio.shield(seal), ORPHAN_WAIT_SECONDS)
+    except Exception:  # health: allow BLE001 -- a timeout, or the seal's failure (logged by its callback)
+        return None
+    return result if result is not None and result.success else None
 
 
 async def _seal_turn(adapter: Any, stream: TurnStream, content: str) -> Optional[SendResult]:

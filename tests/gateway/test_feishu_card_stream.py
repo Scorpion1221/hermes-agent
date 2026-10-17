@@ -7,6 +7,7 @@ CardKit / IM call, so the tests see exactly what Feishu would receive.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import json
 from types import SimpleNamespace
@@ -801,3 +802,71 @@ async def test_card_frames_are_paced_by_time_not_by_size():
     await task
     (body,) = fake.final_bodies()
     assert _final_text(body) == final
+
+
+
+def _slow_card_updates(monkeypatch) -> tuple[asyncio.Event, asyncio.Event]:
+    """``card.update`` (the seal) waits for ``answer`` once it reached Feishu (``updating``)."""
+    from plugins.platforms.feishu import feishu_cardkit as ck
+
+    updating, answer = asyncio.Event(), asyncio.Event()
+    original = ck.replace_card
+
+    async def _slow_update(*args, **kwargs):
+        updating.set()
+        await answer.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(ck, "replace_card", _slow_update)
+    return updating, answer
+
+
+@pytest.mark.asyncio
+async def test_a_final_seal_cancelled_mid_flight_is_not_answered_with_a_second_card(monkeypatch):
+    """The gateway gives the stream consumer 5 s to finish, then cancels it. When Feishu is slow to answer
+    the final ``card.update``, the seal still lands, but the cancelled consumer cannot report it, so the
+    gateway sends the same final again: that resend must answer with the sealed card, not open a new one."""
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    updating, answer = _slow_card_updates(monkeypatch)
+    consumer = _consumer(adapter)
+    task = asyncio.create_task(consumer.run())
+    await _sent(fake, lambda: consumer.on_delta("The answer is 42."))
+    consumer.finish("The answer is 42.")
+    await async_wait_until(updating.is_set, what="the final seal to reach Feishu")
+    task.cancel()  # the gateway's 5 s join gave up
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert not consumer.final_response_sent, "the cancelled consumer cannot vouch for the seal"
+
+    answer.set()  # Feishu applies the update after all
+    resend = await adapter.send("oc_chat", "The answer is 42.", reply_to="om_user_1", metadata=dict(FINAL))
+
+    assert resend.success and resend.message_id == "om_reply_1"
+    assert fake.names().count("card.create") == 1
+    assert fake.names().count("message.reply") + fake.names().count("message.create") == 1
+    (body,) = fake.final_bodies()
+    assert _final_text(body) == "The answer is 42."
+
+
+@pytest.mark.asyncio
+async def test_a_different_final_after_a_cancelled_seal_is_still_delivered(monkeypatch):
+    """Only the resend of the sealed final is absorbed: a different answer for the same message (the
+    gateway's error notice, a transformed final) goes out as usual."""
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    updating, answer = _slow_card_updates(monkeypatch)
+    await adapter.send_draft("oc_chat", 81, "draft", metadata={"reply_to_message_id": "om_user_1"})
+    seal = asyncio.create_task(adapter.send("oc_chat", "draft, final", reply_to="om_user_1", metadata=dict(FINAL)))
+    await async_wait_until(updating.is_set, what="the final seal to reach Feishu")
+    seal.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await seal
+    answer.set()
+
+    other = await adapter.send("oc_chat", "Something else entirely.", reply_to="om_user_1", metadata=dict(FINAL))
+
+    assert other.success
+    posted = [json.loads(r.request_body.content) for name, r in fake.calls
+              if name in {"message.reply", "message.create"} and "schema" in json.loads(r.request_body.content)]
+    assert [card["body"]["elements"][0]["content"] for card in posted] == ["Something else entirely."]
