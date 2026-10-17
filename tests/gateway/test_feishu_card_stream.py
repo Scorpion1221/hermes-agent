@@ -7,6 +7,7 @@ CardKit / IM call, so the tests see exactly what Feishu would receive.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import json
 from types import SimpleNamespace
@@ -777,3 +778,217 @@ async def test_a_command_reply_with_no_turn_stays_a_plain_card():
 
     assert fake.final_bodies() == [] and "card.create" not in fake.names()
     assert marked == []
+
+
+@pytest.mark.asyncio
+async def test_card_frames_are_paced_by_time_not_by_size():
+    """Each frame resends the whole card, so a reply past ``buffer_threshold`` must not stream a frame on
+    every consumer tick: only ``edit_interval`` paces frames (the final still seals everything)."""
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    cfg = StreamConsumerConfig(transport="auto", chat_type="dm", edit_interval=3600, buffer_threshold=1, cursor="")
+    consumer = GatewayStreamConsumer(adapter, "oc_chat", cfg, initial_reply_to_id="om_user_1")
+    task = asyncio.create_task(consumer.run())
+    await _sent(fake, lambda: consumer.on_delta("The first frame opens the card."))
+
+    for i in range(4):
+        consumer.on_delta(f" More text {i}.")
+        # A tick drains the queue and sends its frame before it yields, so an empty queue means done.
+        await async_wait_until(consumer._queue.empty, what="the consumer to take the delta")
+
+    assert len(fake.streamed()) == 1, "no frame may go out before edit_interval elapses"
+    final = "The first frame opens the card. More text 0. More text 1. More text 2. More text 3."
+    consumer.finish(final)
+    await task
+    (body,) = fake.final_bodies()
+    assert _final_text(body) == final
+
+
+
+def _slow_card_updates(monkeypatch) -> tuple[asyncio.Event, asyncio.Event]:
+    """``card.update`` (the seal) waits for ``answer`` once it reached Feishu (``updating``)."""
+    from plugins.platforms.feishu import feishu_cardkit as ck
+
+    updating, answer = asyncio.Event(), asyncio.Event()
+    original = ck.replace_card
+
+    async def _slow_update(*args, **kwargs):
+        updating.set()
+        await answer.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(ck, "replace_card", _slow_update)
+    return updating, answer
+
+
+@pytest.mark.asyncio
+async def test_a_final_seal_cancelled_mid_flight_is_not_answered_with_a_second_card(monkeypatch):
+    """The gateway gives the stream consumer 5 s to finish, then cancels it. When Feishu is slow to answer
+    the final ``card.update``, the seal still lands, but the cancelled consumer cannot report it, so the
+    gateway sends the same final again: that resend must answer with the sealed card, not open a new one."""
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    updating, answer = _slow_card_updates(monkeypatch)
+    consumer = _consumer(adapter)
+    task = asyncio.create_task(consumer.run())
+    await _sent(fake, lambda: consumer.on_delta("The answer is 42."))
+    consumer.finish("The answer is 42.")
+    await async_wait_until(updating.is_set, what="the final seal to reach Feishu")
+    task.cancel()  # the gateway's 5 s join gave up
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert not consumer.final_response_sent, "the cancelled consumer cannot vouch for the seal"
+
+    answer.set()  # Feishu applies the update after all
+    resend = await adapter.send("oc_chat", "The answer is 42.", reply_to="om_user_1", metadata=dict(FINAL))
+
+    assert resend.success and resend.message_id == "om_reply_1"
+    assert fake.names().count("card.create") == 1
+    assert fake.names().count("message.reply") + fake.names().count("message.create") == 1
+    (body,) = fake.final_bodies()
+    assert _final_text(body) == "The answer is 42."
+
+
+@pytest.mark.asyncio
+async def test_a_different_final_after_a_cancelled_seal_is_still_delivered(monkeypatch):
+    """Only the resend of the sealed final is absorbed: a different answer for the same message (the
+    gateway's error notice, a transformed final) goes out as usual."""
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    updating, answer = _slow_card_updates(monkeypatch)
+    await adapter.send_draft("oc_chat", 81, "draft", metadata={"reply_to_message_id": "om_user_1"})
+    seal = asyncio.create_task(adapter.send("oc_chat", "draft, final", reply_to="om_user_1", metadata=dict(FINAL)))
+    await async_wait_until(updating.is_set, what="the final seal to reach Feishu")
+    seal.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await seal
+    answer.set()
+
+    other = await adapter.send("oc_chat", "Something else entirely.", reply_to="om_user_1", metadata=dict(FINAL))
+
+    assert other.success
+    posted = [json.loads(r.request_body.content) for name, r in fake.calls
+              if name in {"message.reply", "message.create"} and "schema" in json.loads(r.request_body.content)]
+    assert [card["body"]["elements"][0]["content"] for card in posted] == ["Something else entirely."]
+
+
+async def _roll_mid_stream(adapter: FeishuAdapter, draft_id: int, shown: str, latest: str, final: str):
+    """``shown`` streams into a card that is then too old; the frame carrying ``latest`` rolls it over."""
+    md = {"reply_to_message_id": "om_user_1"}
+    await adapter.send_draft("oc_chat", draft_id, shown, metadata=md)
+    _only_stream(adapter).card.created_at -= feishu_stream.MAX_CARD_AGE_SECONDS + 1
+    await adapter.send_draft("oc_chat", draft_id, latest, metadata=md)
+    await adapter.send("oc_chat", final, reply_to="om_user_1", metadata=FINAL)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shown, latest, sealed, continued", [
+    # mid-sentence: the unfinished paragraph moves on whole
+    ("Para one is done.\n\nPara two is half", "Para one is done.\n\nPara two is half way through.",
+     "Para one is done.", "Para two is half way through."),
+    # mid-table: the table moves on whole, never split across cards
+    ("Intro.\n\n| a | b |\n|---|---|\n| 1 | 2 |", "Intro.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |",
+     "Intro.", "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |"),
+    # no paragraph boundary: the cut falls on the last whole line
+    ("Line one\nLine two is half", "Line one\nLine two is half done.", "Line one", "Line two is half done."),
+])
+async def test_a_rolled_over_card_is_cut_at_a_boundary_and_the_rest_moves_on(shown, latest, sealed, continued):
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+
+    await _roll_mid_stream(adapter, 80, shown, latest, latest)
+
+    first, last = fake.final_bodies()
+    assert _final_text(first).strip() == sealed and _footer(first) == "Continued below ↓"
+    assert _final_text(last).strip() == continued
+
+
+@pytest.mark.asyncio
+async def test_a_code_block_cut_by_a_rollover_is_closed_and_reopened_in_the_next_card():
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    shown = "```python\nx = 1\ny = 2\n"
+    whole = shown + "z = 3\n```\nAfter the code."
+
+    await _roll_mid_stream(adapter, 81, shown, whole, whole)
+
+    first, last = fake.final_bodies()
+    assert _final_text(first).strip() == "```python\nx = 1\ny = 2\n```"
+    assert _final_text(last).strip() == "```python\nz = 3\n```\nAfter the code."
+    second_card = fake.streamed()[1:]
+    assert second_card and all(frame.startswith("```python\n") for frame in second_card)
+
+
+@pytest.mark.asyncio
+async def test_a_block_closing_right_at_the_cut_keeps_its_fence_and_opens_no_empty_block():
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    shown = "```py\nx = 1\n"
+
+    await _roll_mid_stream(adapter, 82, shown, shown + "```\nAfter.", shown + "```\nAfter.")
+
+    first, last = fake.final_bodies()
+    assert _final_text(first).strip() == "```py\nx = 1\n```"
+    assert _final_text(last).strip() == "After."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shown, final", [
+    ("All of the answer.", "All of the answer."),
+    # the card closed the code block it ended in: the final's own closing fence is not a new card
+    ("```py\nx = 1\n", "```py\nx = 1\n```"),
+])
+async def test_a_turn_that_ends_right_after_a_rollover_marks_its_last_card_done(monkeypatch, shown, final):
+    now = [100.0]
+    monkeypatch.setattr(feishu_stream, "_now", lambda: now[0])
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    marked = _done_marked(adapter)
+    md = {"reply_to_message_id": "om_user_1"}
+    await adapter.send_draft("oc_chat", 83, shown, metadata=md)
+    now[0] += feishu_stream.MAX_CARD_AGE_SECONDS + 1
+    await feishu_stream.seal_quiet_cards(adapter)  # a long tool call: the quiet card rolls over
+
+    sent = await adapter.send("oc_chat", final, reply_to="om_user_1", metadata=FINAL)
+
+    rolled, done = fake.final_bodies()
+    assert _footer(rolled) == "Continued below ↓"
+    assert _final_text(done) == _final_text(rolled) and _footer(done) == "Done · 9m 1s"
+    assert fake.names().count("card.create") == 1
+    assert sent.success and marked == [(sent.message_id, "DONE")] and sent.message_id == "om_reply_1"
+
+
+@pytest.mark.asyncio
+async def test_after_a_quiet_rollover_inside_code_the_closing_fence_opens_no_empty_block(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(feishu_stream, "_now", lambda: now[0])
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    md = {"reply_to_message_id": "om_user_1"}
+    await adapter.send_draft("oc_chat", 84, "```py\nx = 1\n", metadata=md)
+    now[0] += feishu_stream.MAX_CARD_AGE_SECONDS + 1
+    await feishu_stream.seal_quiet_cards(adapter)
+
+    for frame in ("```py\nx = 1\n``", "```py\nx = 1\n```\nAfter", "```py\nx = 1\n```\nAfter the code."):
+        await adapter.send_draft("oc_chat", 84, frame, metadata=md)
+    await adapter.send("oc_chat", "```py\nx = 1\n```\nAfter the code.", reply_to="om_user_1", metadata=FINAL)
+
+    first, last = fake.final_bodies()
+    assert _final_text(first).strip() == "```py\nx = 1\n```"
+    assert _final_text(last) == "After the code."
+    assert all("```" not in frame for frame in fake.streamed()[1:])
+
+
+@pytest.mark.asyncio
+async def test_a_code_line_after_a_reopened_block_streams_at_once():
+    fake = FakeFeishu()
+    adapter = _adapter(fake)
+    md = {"reply_to_message_id": "om_user_1"}
+    await adapter.send_draft("oc_chat", 85, "```python\nx = 1\n", metadata=md)
+    _only_stream(adapter).card.created_at -= feishu_stream.MAX_CARD_AGE_SECONDS + 1
+    await feishu_stream.seal_quiet_cards(adapter)
+
+    await adapter.send_draft("oc_chat", 85, "```python\nx = 1\nz = 3", metadata=md)
+
+    assert fake.names().count("card.create") == 2
+    assert fake.streamed()[-1] == "```python\nz = 3"

@@ -3,9 +3,10 @@
 The stream consumer calls ``send_draft`` with the whole text so far for each frame; the first frame of a
 turn creates a streaming card and sends it as a reply, later frames replace the card's text. The turn's
 final ``send()`` does not post a new message: it seals the open card with the final text (seal-
-interception, like the relay adapter for Slack), and the sealed card IS the reply. ``abandon_open_draft``
-seals an orphaned card in place when the turn dies (/stop, /new). Mid-turn sends that are not the final
-carry ``metadata["_interim_send"]`` and never seal.
+interception, like the relay adapter for Slack), and the sealed card IS the reply. A seal runs to the end
+even when its sender is cancelled, and the gateway's resend of that same final is answered by it.
+``abandon_open_draft`` seals an orphaned card in place when the turn dies (/stop, /new). Mid-turn sends
+that are not the final carry ``metadata["_interim_send"]`` and never seal.
 
 A card is keyed by the consumer's per-turn draft id. Only a turn-final send (marked ``notify``, as the
 consumer's final and the gateway's final lane are) replying to the same message seals it; status bubbles,
@@ -13,9 +14,12 @@ progress, busy acks and command replies carry no ``notify`` and never seal. A se
 late frame for it never opens a second card.
 
 Long replies and long-running turns: Feishu closes a card's streaming window after about ten minutes and
-one markdown element holds about 30k characters. Before either limit the live card is sealed with what it
-shows plus a "continued below" footer and the rest of the reply streams into a fresh card; the turn's
-final seals whichever card is live, with only the text that card has not shown.
+one markdown element holds about 30k characters. Before either limit the live card is sealed with a
+"continued below" footer and the rest of the reply streams into a fresh card; the turn's final seals
+whichever card is live, with only the text that card has not shown. A card rolled over while the reply
+streams is cut at a paragraph or line boundary (``feishu_stream_cut``): the unfinished paragraph, table
+or code block moves to the next card, and a code block cut in two is closed in the sealed card and
+re-opened in the next one. A turn that ends right after a rollover re-seals that last card as the final.
 """
 
 from __future__ import annotations
@@ -28,6 +32,9 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from gateway.platforms.base import SendResult
+from gateway.stream_consumer_fences import ensure_closed_code_fences
+
+from .feishu_stream_cut import closed, closing_fence, cut_for_rollover, open_block
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +44,8 @@ COMPLETE = "DONE"
 MAX_CARD_AGE_SECONDS = 540.0
 # Roll over well before a markdown element's ~30k-character limit (headroom for the render pass).
 MAX_CARD_CHARS = 24_000
+# How long the gateway's resend of a final waits for the orphaned seal of that final (see ``_seal_final``).
+ORPHAN_WAIT_SECONDS = 30.0
 _STATE_CAP = 512
 
 
@@ -53,6 +62,7 @@ class LiveCard:
     sequence: int = 1
     shown: str = ""  # raw text the card currently shows (this card's part of the reply)
     plain_mentions: bool = False  # Feishu refused a mention in this card: render all as text
+    lead: str = ""  # a code block's opener line re-opened above ``shown`` (cut by the previous card)
 
     def next_sequence(self) -> int:
         self.sequence += 1
@@ -70,6 +80,8 @@ class TurnStream:
     metadata: Optional[dict[str, Any]]
     card: Optional[LiveCard] = None
     sealed_prefix: str = ""  # reply text shown by earlier cards of this turn
+    next_lead: str = ""  # the code block opener the next card re-opens ("" when the cut was outside code)
+    last_rolled: Optional[LiveCard] = None  # the card a rollover sealed last (re-sealed when the turn ends)
     first_message_id: Optional[str] = None
     started_at: Optional[float] = None  # monotonic time the turn's first card opened (the elapsed footer)
     # Serializes every card operation of the turn (frames, seal, rollover, prompt and quiet seals), so no
@@ -135,6 +147,8 @@ class CardStreams:
     def __init__(self) -> None:
         self.open: OrderedDict[str, TurnStream] = OrderedDict()
         self.sealed: OrderedDict[str, int] = OrderedDict()
+        # (chat, reply anchor) -> (seal task, final text) of a final seal whose sender was cancelled.
+        self.orphaned: OrderedDict[str, tuple[asyncio.Future, str]] = OrderedDict()
 
     def _evict(self, mapping: OrderedDict) -> None:
         while len(mapping) > _STATE_CAP:
@@ -162,6 +176,28 @@ class CardStreams:
         if (metadata or {}).get("notify") is not True:
             return None
         return self.for_turn(chat_id, metadata)
+
+    @staticmethod
+    def _anchor_key(chat_id: str, metadata: Optional[dict[str, Any]]) -> str:
+        md = metadata or {}
+        return f"{chat_id}:{md.get('reply_to_message_id') or md.get('message_id')}"
+
+    def orphan(self, chat_id: str, metadata: Optional[dict[str, Any]], seal: asyncio.Future, content: str) -> None:
+        key = self._anchor_key(chat_id, metadata)
+        self.orphaned[key] = (seal, content)
+        self.orphaned.move_to_end(key)
+        self._evict(self.orphaned)
+
+    def take_orphan(self, chat_id: str, content: str, metadata: Optional[dict[str, Any]]) -> Optional[asyncio.Future]:
+        """The orphaned final seal a gateway-lane final for the same message is the resend of. The first such
+        final consumes the orphan whatever its text; the seal is returned only when that final is the text it
+        sealed (compared ignoring whitespace and an unclosed fence the seal closed)."""
+        if (metadata or {}).get("notify") is not True:
+            return None
+        seal, sealed = self.orphaned.pop(self._anchor_key(chat_id, metadata), (None, ""))
+        if seal is None or _squash(ensure_closed_code_fences(content)) != _squash(ensure_closed_code_fences(sealed)):
+            return None
+        return seal
 
 
 def _registry(adapter: Any) -> CardStreams:
@@ -194,20 +230,24 @@ async def _write(adapter: Any, card: LiveCard, text: str) -> Any:
     from . import feishu_cardkit as ck
     from .feishu_card_render import has_card_mentions
 
-    result = await ck.stream_text(adapter, card.card_id, text, card.next_sequence(), plain_mentions=card.plain_mentions)
-    if not result.ok and result.code == ck.INVALID_USER_RESOURCE and not card.plain_mentions and has_card_mentions(text):
+    body = card.lead + text
+    result = await ck.stream_text(adapter, card.card_id, body, card.next_sequence(), plain_mentions=card.plain_mentions)
+    if not result.ok and result.code == ck.INVALID_USER_RESOURCE and not card.plain_mentions and has_card_mentions(body):
         card.plain_mentions = True
-        result = await ck.stream_text(adapter, card.card_id, text, card.next_sequence(), plain_mentions=True)
+        result = await ck.stream_text(adapter, card.card_id, body, card.next_sequence(), plain_mentions=True)
     return result
 
 
 async def _seal(adapter: Any, card: LiveCard, text: str, *, footer: str = "") -> bool:
-    """Replace ``card`` with its final body (streaming off). True only once Feishu accepted it."""
+    """Replace ``card`` with its final body (streaming off): ``text`` under the card's lead, with a code
+    block it ends inside closed. True only once Feishu accepted it."""
     from . import feishu_cardkit as ck
     from .feishu_card_render import has_card_mentions, strip_card_mentions
 
+    shown = closed(card.lead + text)
+
     def _body(plain: bool) -> dict:
-        return ck.final_card_body(strip_card_mentions(text) if plain else text, footer=footer)
+        return ck.final_card_body(strip_card_mentions(shown) if plain else shown, footer=footer)
 
     result = await ck.replace_card(adapter, card.card_id, _body(card.plain_mentions), card.next_sequence())
     if not result.ok and result.code == ck.INVALID_USER_RESOURCE and has_card_mentions(text):
@@ -222,13 +262,14 @@ async def _seal(adapter: Any, card: LiveCard, text: str, *, footer: str = "") ->
 
 
 async def _open_card(adapter: Any, stream: TurnStream, text: str) -> Optional[LiveCard]:
-    """Create a card, send it as this turn's reply, and stream ``text`` into it."""
+    """Create a card, send it as this turn's reply, and stream ``text`` into it (under the code block the
+    previous card's cut re-opens)."""
     from . import feishu_cardkit as ck
 
     card_id = await ck.create_card(adapter)
     if not card_id:
         return None
-    card = LiveCard(card_id=card_id, message_id="", created_at=_now())
+    card = LiveCard(card_id=card_id, message_id="", created_at=_now(), lead=stream.next_lead)
     try:
         response = await adapter._feishu_send_with_retry(
             chat_id=stream.chat_id, msg_type="interactive", payload=ck.card_message_content(card_id),
@@ -243,6 +284,7 @@ async def _open_card(adapter: Any, stream: TurnStream, text: str) -> Optional[Li
         await _seal(adapter, card, text)
         return None
     card.message_id = result.message_id
+    stream.next_lead = ""
     stream.first_message_id = stream.first_message_id or card.message_id
     if stream.started_at is None:
         stream.started_at = card.created_at
@@ -252,17 +294,53 @@ async def _open_card(adapter: Any, stream: TurnStream, text: str) -> Optional[Li
     return card
 
 
-async def _roll_over(adapter: Any, stream: TurnStream, *, footer: Optional[str] = None) -> bool:
-    """Seal the live card with what it shows and a "continued" footer; the next frame opens a new card.
-    The caller holds ``stream.lock``."""
+async def _roll_over(adapter: Any, stream: TurnStream, *, footer: Optional[str] = None,
+                     latest: Optional[str] = None) -> bool:
+    """Seal the live card with a "continued" footer (``footer`` replaces it); the next card continues.
+
+    ``latest`` is the card's part of the reply as of now, when the caller opens the next card with the rest
+    right away: the card is then cut at a paragraph or line boundary and the rest moves on. Without it the
+    card keeps everything it shows. A code block the cut falls in is re-opened in the next card. The caller
+    holds ``stream.lock``."""
+    rolled = footer is None
+    if not rolled:
+        # A prompt ends the segment: nothing re-opens below it, and no card above it is the reply's end.
+        stream.next_lead, stream.last_rolled = "", None
     card = stream.card
     if card is None:
         return True
-    if not await _seal(adapter, card, card.shown, footer=_continued_footer() if footer is None else footer):
+    head, opener = _cut(card, latest)
+    if not await _seal(adapter, card, head, footer=_continued_footer() if rolled else footer):
         return False
-    stream.sealed_prefix += card.shown
+    stream.sealed_prefix += head
+    if rolled:
+        stream.next_lead, stream.last_rolled = f"{opener}\n" if opener else "", card
     stream.card = None
     return True
+
+
+def _cut(card: LiveCard, latest: Optional[str]) -> tuple[str, str]:
+    """(what the sealed card keeps of its part, the code block opener the next card re-opens)."""
+    if latest is None:
+        return card.shown, open_block(card.lead + card.shown)
+    end = len(card.shown) if latest.startswith(card.shown) else len(latest)
+    lead = len(card.lead)
+    cut = cut_for_rollover(card.lead + latest, lead, lead + end, budget=MAX_CARD_CHARS)
+    if not cut.head.strip():  # no boundary past blank lines: never seal an empty card
+        return card.shown, open_block(card.lead + card.shown)
+    return cut.head, cut.opener
+
+
+def _skip_closing_fence(stream: TurnStream, part: str, *, final: bool = False) -> str:
+    """``part`` for the next card: when it starts with the closing fence of the block that card would
+    re-open, the sealed card's own closing fence already shows it, so neither is repeated. Mid-stream only
+    a whole closing line counts (a bare "```" may still grow into a code line)."""
+    fence = closing_fence(part, stream.next_lead)
+    if not fence or not (fence.endswith("\n") or final):
+        return part
+    stream.sealed_prefix += fence
+    stream.next_lead = ""
+    return part[len(fence):]
 
 
 def _needs_rollover(card: LiveCard, part: str) -> bool:
@@ -302,19 +380,11 @@ async def send_draft(adapter: Any, chat_id: str, draft_id: int, content: str,
 
 
 async def _frame(adapter: Any, streams: CardStreams, stream: TurnStream, content: str) -> SendResult:
-    if stream.card is not None and _needs_rollover(stream.card, _remainder(content, stream.sealed_prefix)):
-        await _roll_over(adapter, stream)
+    if stream.card is not None and _needs_rollover(stream.card, latest := _remainder(content, stream.sealed_prefix)):
+        await _roll_over(adapter, stream, latest=latest)
     part = _remainder(content, stream.sealed_prefix)
     if stream.card is None:
-        stream.card = await _open_card(adapter, stream, part)
-        if stream.card is not None:
-            return SendResult(success=True)
-        if stream.sealed_prefix:
-            # Earlier cards of this turn are on screen: the seal opens the last card, never a resend of
-            # the whole reply (the consumer's fallback would repeat what sealed cards show).
-            return SendResult(success=True)
-        streams.open.pop(stream.key, None)  # nothing on screen: the consumer falls back to send/edit
-        return SendResult(success=False, error="CardKit streaming card unavailable")
+        return await _open_next(adapter, streams, stream, part)
     if part == stream.card.shown:
         return SendResult(success=True)
     result = await _write(adapter, stream.card, part)
@@ -323,12 +393,31 @@ async def _frame(adapter: Any, streams: CardStreams, stream: TurnStream, content
         return SendResult(success=True)
     if result.expired:
         # The streaming window closed early: seal what is shown, continue in a fresh card.
-        await _roll_over(adapter, stream)
-        stream.card = await _open_card(adapter, stream, _remainder(content, stream.sealed_prefix))
+        if await _roll_over(adapter, stream, latest=part):
+            await _open_next(adapter, streams, stream, _remainder(content, stream.sealed_prefix))
         return SendResult(success=True)
     if _transient(result.code):
         return SendResult(success=True)  # the next frame, or the seal, carries the whole text again
     return SendResult(success=False, error=f"CardKit stream failed: [{result.code}] {result.msg}")
+
+
+async def _open_next(adapter: Any, streams: CardStreams, stream: TurnStream, part: str) -> SendResult:
+    """Open the turn's card for ``part``: its first, or the next one after a rollover."""
+    part = _skip_closing_fence(stream, part)
+    pending_fence = stream.next_lead and "\n" not in part and set(part.strip()) <= set("`~")
+    if stream.sealed_prefix and (not part.strip() or pending_fence):
+        # Nothing past the sealed cards yet, or only the start of the re-opened block's closing fence: a
+        # later frame, or the seal, opens the card.
+        return SendResult(success=True)
+    stream.card = await _open_card(adapter, stream, part)
+    if stream.card is not None:
+        return SendResult(success=True)
+    if stream.sealed_prefix:
+        # Earlier cards of this turn are on screen: the seal opens the last card, never a resend of
+        # the whole reply (the consumer's fallback would repeat what sealed cards show).
+        return SendResult(success=True)
+    streams.open.pop(stream.key, None)  # nothing on screen: the consumer falls back to send/edit
+    return SendResult(success=False, error="CardKit streaming card unavailable")
 
 
 async def seal_with_final(adapter: Any, chat_id: str, content: str, metadata: Optional[dict[str, Any]],
@@ -336,6 +425,11 @@ async def seal_with_final(adapter: Any, chat_id: str, content: str, metadata: Op
     """Seal the turn's open card with the final text; None when no card is open (a plain send follows).
     ``stream_final``: the stream consumer's own final (its metadata names the user's message)."""
     streams = _registry(adapter)
+    # The gateway's resend of a final whose seal was cancelled, checked before the open streams: in a topic a
+    # later turn's card replies to the same root and must not be sealed with this turn's final. Only the
+    # gateway's lane: a consumer's own final (``stream_final``) is never a resend.
+    if not stream_final and (resent := await _resent_final(streams, chat_id, content, metadata)) is not None:
+        return resent
     key = streams.match(chat_id, metadata)
     if key is None:
         md = dict(metadata or {})
@@ -345,12 +439,52 @@ async def seal_with_final(adapter: Any, chat_id: str, content: str, metadata: Op
         # ends as (footer, DONE). Command replies and notices are not the consumer's final: plain cards.
         stream = TurnStream(key="", draft_id=-1, chat_id=chat_id, reply_to=md.get("reply_to_message_id"),
                             metadata=md, started_at=_now())
-        async with stream.lock:
-            return await _seal_turn(adapter, stream, content)
+        return await _seal_final(adapter, streams, stream, content, metadata)
     stream = streams.open.pop(key)
     streams.tombstone(key, stream.draft_id)
-    async with stream.lock:
-        return await _seal_turn(adapter, stream, content)
+    return await _seal_final(adapter, streams, stream, content, metadata)
+
+
+async def _seal_final(adapter: Any, streams: CardStreams, stream: TurnStream, content: str,
+                      metadata: Optional[dict[str, Any]]) -> Optional[SendResult]:
+    """Seal the turn's cards with its final, to the end even when the sender stops waiting.
+
+    Feishu applies a card update it received whether or not its answer is still awaited, and the gateway
+    cancels a stream consumer that takes over 5 s to finish. A cancelled sender learns nothing, so the gateway
+    sends the same final again: the seal is kept for that resend (``_resent_final``), which then answers with
+    the card that already shows the final instead of opening a second one."""
+    async def _locked() -> Optional[SendResult]:
+        async with stream.lock:
+            return await _seal_turn(adapter, stream, content)
+
+    seal = asyncio.ensure_future(_locked())
+    try:
+        return await asyncio.shield(seal)
+    except asyncio.CancelledError:
+        seal.add_done_callback(_log_orphan_failure)
+        streams.orphan(stream.chat_id, metadata, seal, content)
+        raise
+
+
+def _log_orphan_failure(seal: asyncio.Future) -> None:
+    if not seal.cancelled() and seal.exception() is not None:
+        logger.warning("[Feishu] A final card seal failed after its sender stopped waiting",
+                       exc_info=seal.exception())
+
+
+async def _resent_final(streams: CardStreams, chat_id: str, content: str,
+                        metadata: Optional[dict[str, Any]]) -> Optional[SendResult]:
+    """The orphaned seal's result when ``content`` is the final it sealed (the gateway resending it); None
+    otherwise, and when the seal failed or is still unanswered after ``ORPHAN_WAIT_SECONDS`` (the resend is
+    then delivered as usual: a possible duplicate, never a lost answer)."""
+    seal = streams.take_orphan(chat_id, content, metadata)
+    if seal is None:
+        return None
+    try:
+        result = await asyncio.wait_for(asyncio.shield(seal), ORPHAN_WAIT_SECONDS)
+    except Exception:  # health: allow BLE001 -- a timeout, or the seal's failure (logged by its callback)
+        return None
+    return result if result is not None and result.success else None
 
 
 async def _seal_turn(adapter: Any, stream: TurnStream, content: str) -> Optional[SendResult]:
@@ -363,24 +497,39 @@ async def _seal_turn(adapter: Any, stream: TurnStream, content: str) -> Optional
     part = _remainder(whole, stream.sealed_prefix)
     if card is not None and len(part) > MAX_CARD_CHARS:
         # The final outgrew the live card: keep what it shows, continue the rest in a fresh card.
-        if not await _roll_over(adapter, stream):
+        if not await _roll_over(adapter, stream, latest=part):
             return None
         card = None
         part = _remainder(whole, stream.sealed_prefix)
     if card is None:
+        part = _skip_closing_fence(stream, part, final=True)
         if not part.strip():
-            return SendResult(success=True, message_id=stream.first_message_id)
+            return await _complete_last_card(adapter, stream)
         card = await _open_card(adapter, stream, part)
         if card is None:
             if stream.sealed_prefix:
                 # Earlier cards show the head: post only what they do not, never the whole reply again.
-                return await _plain_tail(adapter, stream, part)
+                return await _plain_tail(adapter, stream, closed(stream.next_lead + part))
             return None
     if await _seal(adapter, card, part, footer=_elapsed_footer(stream)):
         await _mark_complete(adapter, card.message_id)
         return SendResult(success=True, message_id=card.message_id)
     logger.warning("[Feishu] Sealing the reply card failed; delivering the final as a plain message")
     return None
+
+
+async def _complete_last_card(adapter: Any, stream: TurnStream) -> SendResult:
+    """The turn ended right after a rollover: the card that rolled over already shows the end of the
+    reply, so it is re-sealed as the final (the Done footer, the DONE reaction) instead of promising more
+    below. The reply is on screen either way, so a failed re-seal is no reason to send it again."""
+    last = stream.last_rolled
+    if last is None:
+        return SendResult(success=True, message_id=stream.first_message_id)
+    if await _seal(adapter, last, last.shown, footer=_elapsed_footer(stream)):
+        await _mark_complete(adapter, last.message_id)
+    else:
+        logger.info("[Feishu] Card %s keeps its continued footer (re-seal as final failed)", last.message_id)
+    return SendResult(success=True, message_id=last.message_id)
 
 
 async def _mark_complete(adapter: Any, message_id: str) -> None:
