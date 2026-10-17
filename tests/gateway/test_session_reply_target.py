@@ -1,7 +1,7 @@
 """The session prompt names this conversation's exact send target.
 
 Without it the only raw chat id in the prompt is the home channel's, so a model asked to send "here"
-(``hermes send --to``, a cron ``deliver``) copies that one and the message lands in another chat.
+(``hermes send --to``) copies that one and the message lands in another chat.
 """
 
 from __future__ import annotations

@@ -387,9 +387,9 @@ def _reply_target_lines(src: SessionSource, redact_pii: bool) -> list[str]:
     target = ":".join(str(part) for part in (platform, src.chat_id, src.thread_id) if part)
     return [
         f"**Reply Target:** `{neutralize_untrusted_inline_text(target)}` — use this exact string as the "
-        "target (`hermes send --to`, a cron job's `deliver`) when sending into this conversation. Do NOT "
-        f"use the bare `{platform}` form for that: outside a live conversation (a scheduled task) it "
-        "resolves to the home channel below, which is usually a different chat."
+        "`hermes send --to` target when sending into this conversation. A scheduled job created here "
+        f"delivers back to it by default (omit `deliver`); do NOT give one the bare `{platform}` form: "
+        "it resolves to the home channel below, which is usually a different chat."
     ]
 
 

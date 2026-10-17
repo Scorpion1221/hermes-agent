@@ -278,7 +278,10 @@ def _handle_send(args):
         if isinstance(result, dict) and result.get("success"):
             if note:
                 result["note"] = note
-            if mirror_text and _mirror_sent_message(platform_name, chat_id, mirror_text, thread_id):
+            # Never mirror into the conversation this send runs in: its own tool call already records the
+            # send, and a mirror row would land between that call and its result in the live transcript.
+            if (mirror_text and (str(chat_id), thread_id or None) != _current_conversation(platform_name)
+                    and _mirror_sent_message(platform_name, chat_id, mirror_text, thread_id)):
                 result["mirrored"] = True
             if media_dropped:
                 # The text went out but an attachment the caller asked for did not: a script reading
