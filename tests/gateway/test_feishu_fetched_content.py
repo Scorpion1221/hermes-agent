@@ -763,6 +763,42 @@ def test_an_inbound_template_card_reads_as_its_variable_values():
     assert event.text == "Build Failed\npayments-api\nmain\nAlice"
 
 
+def _release_card_client(**kwargs):
+    card = json_card([markdown(text("Deploy "), text("done", "bold"))], header=node("card_header", title=text("Release")))
+    return FakeFeishu({"om_card": [item("om_card", "interactive", card, upper=None, sender="cli_peer", sender_type="app")]},
+                      **kwargs)
+
+
+def test_a_note_sent_behind_a_slow_card_joins_it_as_one_turn_card_first():
+    """A card forwarded with a note: the card's GET must not let the note overtake it."""
+    client = _release_card_client()
+    client.get_delay = 0.5
+
+    turns = delivered_turns(
+        make_adapter(client),
+        inbound_event("om_card", "interactive", json.dumps(UPGRADE_PLACEHOLDER)),
+        inbound_event("om_note", "text", json.dumps({"text": "please summarize"})),
+    )
+
+    assert turns == ["Release\n\nDeploy **done**\nplease summarize"]
+
+
+def test_a_long_card_does_not_push_its_note_into_a_turn_of_its_own():
+    from plugins.platforms.feishu.adapter import _DEFAULT_TEXT_BATCH_MAX_CHARS
+
+    long = "z" * (_DEFAULT_TEXT_BATCH_MAX_CHARS + 200)
+    card = json_card([markdown(text(long))])
+    client = FakeFeishu({"om_card": [item("om_card", "interactive", card, upper=None, sender="cli_peer", sender_type="app")]})
+
+    turns = delivered_turns(
+        make_adapter(client),
+        inbound_event("om_card", "interactive", json.dumps(UPGRADE_PLACEHOLDER)),
+        inbound_event("om_note", "text", json.dumps({"text": "please summarize"})),
+    )
+
+    assert len(turns) == 1 and turns[0].endswith("\nplease summarize")
+
+
 @pytest.mark.parametrize("failure", ["refused", "raises", "unreadable"])
 def test_an_inbound_card_whose_fetch_fails_keeps_its_event_body(failure):
     legacy = {"header": {"title": {"tag": "plain_text", "content": "Requester: Bob"}}, "elements": []}
