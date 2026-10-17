@@ -61,7 +61,8 @@ class FeishuGroupAccessMixin:
         naming the chat or its members. The default policy (``default_group_policy`` /
         ``FEISHU_GROUP_POLICY``), an entry that leaves ``policy`` unset (intake reads it as ``open``),
         and ``blacklist`` all admit people nobody listed, so none of them count (SECURITY.md §2.6).
-        ``admin_only`` admits ``admins``, who are not part of this grant. The rule
+        The ``admins`` list counts in an ``allowlist`` or ``admin_only`` chat: intake admits them there,
+        and it names users the operator wrote down, no wider than a per-chat allowlist. The rule
         is read on every check, so removing it revokes access for follow-ups that are already queued.
         """
         rule = self._group_rules.get(str(chat_id or ""))
@@ -69,4 +70,7 @@ class FeishuGroupAccessMixin:
             return False
         if rule.policy == "open":
             return True
-        return rule.policy == "allowlist" and bool({str(i) for i in sender_ids if i} & rule.allowlist)
+        ids = {str(i) for i in sender_ids if i}
+        if rule.policy in ("allowlist", "admin_only") and ids & self._admins:
+            return True
+        return rule.policy == "allowlist" and bool(ids & rule.allowlist)

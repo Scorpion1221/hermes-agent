@@ -118,6 +118,17 @@ def test_rules_that_do_not_name_the_sender_grant_nothing(rule, sender):
     assert _busy_queued(runner, adapter, _event(adapter, sender)) is False
 
 
+@pytest.mark.parametrize("rule", [{"policy": "admin_only"}, {"policy": "allowlist", "allowlist": [MEMBER]}],
+                         ids=["admin-only", "allowlist-without-the-admin"])
+def test_an_admin_is_answered_in_a_chat_whose_rule_admits_admins(rule):
+    """Intake admits ``admins`` before a chat's rule: the gateway must not then drop them."""
+    runner, adapter = _gateway({CHAT: rule}, admins=["ou_admin"])
+    assert _admitted_by_intake(adapter, "ou_admin")
+
+    assert _idle_answered(runner, _event(adapter, "ou_admin")) is True
+    assert _busy_queued(runner, adapter, _event(adapter, "ou_admin")) is True
+
+
 def test_a_rule_for_one_chat_grants_nothing_in_another():
     runner, adapter = _gateway({CHAT: {"policy": "open"}}, default_group_policy="open")
     assert _admitted_by_intake(adapter, OUTSIDER, OTHER_CHAT)  # the default policy admits at intake...
