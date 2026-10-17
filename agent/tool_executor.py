@@ -31,7 +31,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.compression_marker import _COMPRESSION_MARKER_PREFIX
-from agent.interrupt_control import _REASON_USER_INTERRUPT, interrupt_skip_wording
+from agent.interrupt_control import _REASON_USER_INTERRUPT, interrupt_skip_wording, notify_steer_consumed
 from agent.message_sanitization import coalesce_tool_call_id
 from agent.onboarding import observe_tool_result as observe_onboarding_result
 from agent import plugin_live_notes
@@ -1213,7 +1213,10 @@ def _finalize_tool_batch(agent, messages: list, effective_task_id: str, num_tool
     enforce_turn_budget(batch, env=get_active_env(effective_task_id), config=budget)
     plugin_live_notes.keep_after_turn_budget(agent, batch)
     record_tool_batch(agent, batch, contents_before)
+    rows_before = len(messages)
     agent._apply_pending_steer_to_tool_results(messages, num_tools)
+    if len(messages) > rows_before:  # the steer row was appended (else it was requeued)
+        notify_steer_consumed(agent)
 
 
 def _tool_progress_enabled(agent) -> bool:

@@ -51,6 +51,18 @@ def interrupted_during_api_call_reason(agent) -> str:
     return f"interrupted_during_api_call({issuer})" if issuer else "interrupted_during_api_call"
 
 
+def notify_steer_consumed(agent) -> None:
+    """A steer or redirect has just entered the model's context: tell the host (a gateway splits
+    its live reply there). Notify only, the messages are already final; never raises."""
+    callback = getattr(agent, "steer_consumed_callback", None)
+    if callback is None:
+        return
+    try:
+        callback()
+    except Exception:
+        logger.debug("steer_consumed_callback failed", exc_info=True)
+
+
 def _fence_cancel_before_commit(fence, *, when_in_flight: bool, failure_log: str) -> None:
     """Call ``type(fence).cancel_before_commit(fence)`` when ``commit_in_flight`` matches.
 

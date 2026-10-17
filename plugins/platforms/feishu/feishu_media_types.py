@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import mimetypes
 import os
 import re
@@ -11,6 +12,9 @@ from typing import Any
 from gateway.platforms.base import SUPPORTED_DOCUMENT_TYPES
 from gateway.platforms.event import MessageType
 
+logger = logging.getLogger("plugins.platforms.feishu.adapter")  # log parity with the adapter
+
+_MAX_TEXT_INJECT_BYTES = 100 * 1024
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 _AUDIO_EXTENSIONS = {".ogg", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".opus", ".webm"}
 _VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".3gp"}
@@ -104,3 +108,19 @@ class FeishuMediaTypesMixin:
         if normalized.startswith("video/"):
             return MessageType.VIDEO
         return default
+
+    async def _maybe_extract_text_document(self, cached_path: str, media_type: str) -> str:
+        if not cached_path or not media_type.startswith("text/"):
+            return ""
+        try:
+            if os.path.getsize(cached_path) > _MAX_TEXT_INJECT_BYTES:
+                return ""
+            ext = Path(cached_path).suffix.lower()
+            if ext not in {".txt", ".md"} and media_type not in {"text/plain", "text/markdown"}:
+                return ""
+            content = Path(cached_path).read_text(encoding="utf-8-sig")
+            display_name = self._display_name_from_cached_path(cached_path)
+            return f"[Content of {display_name}]:\n{content}"
+        except (OSError, UnicodeDecodeError):
+            logger.warning("[Feishu] Failed to inject text document content from %s", cached_path, exc_info=True)
+            return ""

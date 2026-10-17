@@ -26,6 +26,7 @@ from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.base_exec_approval import ea_default_reason_text
+from gateway.run_turn_steer_boundary import _clarify_expired_notice, make_steer_consumed_callback
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
@@ -57,12 +58,6 @@ def _renders_exec_approval_buttons(adapter_cls: type) -> bool:
     if callable(probe) and issubclass(adapter_cls, BasePlatformAdapter):
         return bool(probe())
     return getattr(adapter_cls, "send_exec_approval", None) is not None
-
-
-# Rendered on a native clarify card whose wait ended without a click (mirrors the notice the
-# Slack click handler shows on a dead entry).
-def _clarify_expired_notice() -> str:
-    return t("gateway.clarify.expired")
 
 
 class _ExecApprovalDeclined(RuntimeError):
@@ -1294,6 +1289,7 @@ class TurnRunner:
             mem_notif = "on" if mem_notif else "off"
         agent.memory_notifications = str(mem_notif).lower() if mem_notif else "on"
         agent.clarify_callback = self._clarify_callback_sync
+        agent.steer_consumed_callback = make_steer_consumed_callback(self)  # a follow-up's answer starts below it
         # Thinking between tool calls is independent of tool_progress mode (Mattermost opts in
         # per platform so global scratch-text doesn't leak into threads).
         agent.thinking_progress = ctx._thinking_enabled
