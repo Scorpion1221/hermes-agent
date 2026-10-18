@@ -83,6 +83,7 @@ def test_gateway_lifecycle_producers_name_a_system_issuer():
             _peek_session_state=lambda key: SimpleNamespace(turn=SimpleNamespace(agent=evicted_agent)),
             _invalidate_session_run_generation=lambda key, reason="": 1,
             _drop_turn_slot=lambda key, run_generation=None: None,
+            _live_turn_agents=lambda key=None: {},
         )
         runner._interrupt_running_turn = (
             lambda *a, **kw: GatewayAgentCacheMixin._interrupt_running_turn(runner, *a, **kw)
