@@ -138,6 +138,46 @@ def test_job_under_gnu_timeout_gets_sigterm(tmp_path):
     assert "TERM" in terms, "the job under timeout was killed without a SIGTERM first"
 
 
+def test_job_under_a_shell_under_gnu_timeout_gets_sigterm_once(tmp_path):
+    """``timeout N bash script.sh`` (the deploy recipe's shape): timeout's TERM to its group reaches
+    the shell and the job together. The shell dying of it must not get the job a second TERM."""
+    pytest.importorskip("psutil")
+    timeout_bin = shutil.which("timeout")
+    if timeout_bin is None:
+        pytest.skip("no timeout(1) on PATH")
+    shell = ["bash", "-c", '"$@"; exit $?', "bash"]  # the trailing exit keeps bash from exec'ing the job
+
+    result, _, terms, _ = _interrupt_running_job(tmp_path, [timeout_bin, "30", *shell], "record")
+
+    assert result["returncode"] == 130, result
+    assert terms == ["TERM"]
+
+
+_RUNS = [sys.executable, "-c", "import subprocess, sys; subprocess.Popen(sys.argv[1:]).wait()"]  # dies on TERM
+
+
+def test_job_beside_a_parent_we_terminate_alone_gets_sigterm(tmp_path):
+    """Leader -> parent -> job, all in one group outside the command's. The teardown TERMs the
+    orphaned leader, then the parent it leaves behind, each alone, so the job needs its own TERM."""
+    pytest.importorskip("psutil")
+
+    result, _, terms, _ = _interrupt_running_job(tmp_path, [*_launcher(tmp_path, "orphan"), *_RUNS, *_RUNS], "record")
+
+    assert result["returncode"] == 130, result
+    assert terms == ["TERM"]
+
+
+def test_job_under_a_leader_its_supervisor_stopped_alone_gets_sigterm(tmp_path):
+    """A supervisor TERMs its ``start_new_session`` child alone, not the child's group: when that
+    child dies of it, the job it ran in its group needs a TERM from the teardown."""
+    pytest.importorskip("psutil")
+
+    result, _, terms, _ = _interrupt_running_job(tmp_path, [*_launcher(tmp_path, "relay"), *_RUNS], "record")
+
+    assert result["returncode"] == 130, result
+    assert terms == ["TERM"]
+
+
 def test_parent_that_forwards_sigterm_is_not_doubled(tmp_path):
     """A live parent got the group's TERM and stops its own setsid child: a second TERM from the
     teardown would re-enter the child's handler while it is still recording."""

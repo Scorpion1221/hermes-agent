@@ -841,6 +841,7 @@ def _wait_for_group_exit(proc, pgid: int, timeout: float, escaped: dict | None =
     Returns whether the group is gone. POSIX-only; callers are behind the _IS_WINDOWS gate."""
     deadline = time.monotonic() + timeout
     group_gone = False
+    termed: set = set()  # pids _escapee_grace_tick sent its own TERM to
     while True:
         if not group_gone:
             try:
@@ -853,7 +854,7 @@ def _wait_for_group_exit(proc, pgid: int, timeout: float, escaped: dict | None =
                 group_gone = True  # sticky: an emptied PGID may be reused
             except PermissionError:
                 pass  # exists, even if we cannot signal it
-        escapees_left = bool(escaped) and _escapee_grace_tick(escaped)
+        escapees_left = bool(escaped) and _escapee_grace_tick(escaped, termed)
         if group_gone and not escapees_left:
             return True
         if time.monotonic() >= deadline:
@@ -862,31 +863,41 @@ def _wait_for_group_exit(proc, pgid: int, timeout: float, escaped: dict | None =
 
 
 def _escapees(descendants: list, pgid: int) -> dict:
-    """Snapshotted descendants outside the process group -> their parent's pid now."""
+    """Snapshotted descendants outside the process group -> (their parent's pid now, whether
+    that parent is a member, not the leader, of their own process group)."""
     if not descendants:  # no snapshot (psutil missing or failed): nothing to give a grace to
         return {}
     import psutil
     escaped = {}
     for child in descendants:
         with contextlib.suppress(psutil.Error, OSError):  # gone, or not visible
-            if os.getpgid(child.pid) != pgid:
-                escaped[child] = child.ppid()
+            if (own := os.getpgid(child.pid)) != pgid:
+                parent, shared = child.ppid(), False
+                with contextlib.suppress(OSError):  # parent already gone: no shared group to count on
+                    shared = parent != own and os.getpgid(parent) == own
+                escaped[child] = (parent, shared)
     return escaped
 
 
-def _escapee_grace_tick(escaped: dict) -> bool:
+def _escapee_grace_tick(escaped: dict, termed: set) -> bool:
     """Forget escapees that exited; SIGTERM each one whose parent has exited (it was
     reparented), and report whether any still run. The group's TERM is relayed down, never
-    doubled: a live parent got it and stops what it started itself (GNU ``timeout`` forwards
-    it to its own group, supervisors signal their ``start_new_session`` children), and a
-    second TERM re-enters a handler that is still recording the interrupt."""
+    doubled: a live parent got it and stops what it started itself (GNU ``timeout`` forwards it
+    to its own group, supervisors signal their ``start_new_session`` children), and a parent
+    that was a plain member of the escapee's group and was not TERMed by us was stopped through
+    that group, which reached the escapee too (``timeout N bash job.sh``: the shell dies of
+    timeout's group TERM). A dead group leader was signalled alone (a supervisor TERMs its
+    child, not the child's group). A second TERM re-enters a handler still recording the interrupt."""
     import psutil
     for child, parent in list(escaped.items()):
         try:
             if not child.is_running() or child.status() == psutil.STATUS_ZOMBIE:
                 del escaped[child]
-            elif parent is not None and child.ppid() != parent:
-                child.terminate()  # identity-checked: never signals a recycled PID
+            elif parent is not None and child.ppid() != parent[0]:
+                ppid, shared = parent
+                if not shared or ppid in termed:  # else the group TERM that stopped its parent reached it
+                    child.terminate()  # identity-checked: never signals a recycled PID
+                    termed.add(child.pid)
                 escaped[child] = None  # TERMed once; SIGKILLed by the sweep if it outlives the grace
         except (psutil.Error, OSError):  # exited (NoSuchProcess), or not ours to signal (AccessDenied)
             del escaped[child]
