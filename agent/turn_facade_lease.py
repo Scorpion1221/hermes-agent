@@ -25,6 +25,13 @@ _REASON_LEASE_LOST = "session turn lease lost"
 
 LEASE_TTL_SECONDS = 300.0
 LEASE_WAIT_SECONDS = 1800.0
+# Lease-wait statuses; the holder may be another process or a leftover turn in this one, so they name
+# neither. gateway/run.py derives its chat filter from them: chats get the first notice only.
+LEASE_WAIT_STATUS = (
+    "⏳ Another turn is still running in this session; waiting for it to finish before starting yours..."
+)
+LEASE_WAIT_TICK_STATUS_TEMPLATE = "⏳ Still waiting for the other turn in this session to finish ({seconds}s)..."
+LEASE_FREE_STATUS = "Session is free; loading the latest transcript..."
 # SessionDB's default write patience: a renewal waits this long for the write lock, never past the authority.
 _REFRESH_WRITE_PATIENCE_S = 20.0
 # Headroom before expiry for one BEGIN IMMEDIATE blocked in the writer's 1s busy handler, plus jitter.
@@ -335,10 +342,7 @@ def admit_durable_turn_lease(
         nonlocal reload_needed, announced
         reload_needed = announced = True
         agent._emit_status(
-            "⏳ Another Hermes process is using this session; "
-            "waiting for it to finish before starting your turn..."
-            if elapsed < 1.0 else
-            f"⏳ Still waiting for the other Hermes process on this session ({int(elapsed)}s)..."
+            LEASE_WAIT_STATUS if elapsed < 1.0 else LEASE_WAIT_TICK_STATUS_TEMPLATE.format(seconds=int(elapsed))
         )
 
     authority_floor = time.time()  # every acquisition attempt stamps its expiry after this instant
@@ -372,7 +376,7 @@ def admit_durable_turn_lease(
         # raising ends the turn.
         if reload_needed and durable is not False:
             if announced:
-                agent._emit_status("Session is free; loading the latest transcript...")
+                agent._emit_status(LEASE_FREE_STATUS)
             # The holder may have compressed/rotated the session while we waited: reload only
             # AFTER admission; an immediate acquisition skips this (needless prompt-cache miss).
             latest_session_id = db.resolve_resume_session_id(session_id)
@@ -447,7 +451,7 @@ def _lease_not_acquired_result(agent, session_id: str, conversation_history) -> 
         )
         result = {
             "final_response": (
-                "Stopped waiting for another Hermes process on this session. "
+                "Stopped waiting for the other turn in this session. "
                 "Your message was not processed."
             ),
             **base,
@@ -467,8 +471,8 @@ def _lease_not_acquired_result(agent, session_id: str, conversation_history) -> 
         return result
     # Fail closed like gateway TurnLeaseTimeoutError: surface a resend notice, not a bare TimeoutError.
     timeout_msg = (
-        "⏳ Another Hermes process kept this session busy too long. Your message was not "
-        "processed - wait for the other process to finish, then send it again."
+        "⏳ Another turn kept this session busy too long. Your message was not "
+        "processed - wait for that turn to finish, then send it again."
     )
     logger.error("session turn lease wait timed out for %s", session_id)
     try:

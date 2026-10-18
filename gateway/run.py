@@ -32,11 +32,7 @@ from typing import Callable, Dict, Optional, Any, List, Tuple, cast
 
 from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
-from agent.conversation_compression import (
-    COMPACTION_DONE_STATUS, COMPACTION_HEARTBEAT_STATUS, COMPACTION_STATUS, COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
-    COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE, COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
-    COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE, IDLE_COMPACTION_STATUS_TEMPLATE,
-    PRE_API_COMPRESSION_STATUS_TEMPLATE, PREFLIGHT_COMPRESSION_STATUS_TEMPLATE)
+from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_HEARTBEAT_STATUS, COMPACTION_STATUS
 from agent.conversation_compression_archive import MERGED_DURABLE_ROWS, RETIRED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.interrupt_compat import request_hard_interrupt
@@ -46,6 +42,7 @@ from agent.session_activity import ActivityProvenance
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import pre_agent_fallback_notice
 from gateway.turn_executor import _UnboundedThreadExecutor
+from gateway.run_status_filters import _COMPRESSION_PROGRESS_STATUS_RE, _LEASE_WAIT_REPEAT_STATUS_RE
 
 # Per-session AIAgent cache bounds (agents are heavy); see _enforce_agent_cache_cap/_session_housekeeping_watcher.
 _AGENT_CACHE_MAX_SIZE = 128
@@ -313,32 +310,6 @@ def _record_hygiene_cooldown(
         recorder(session_id, time.time() + cooldown_seconds, error)
     except Exception as exc:
         logger.debug("session hygiene cooldown persist failed: %s", exc)
-
-
-def _status_template_to_regex(template: str) -> str:
-    """Compile a compression status template constant into a regex source.
-
-    Literal text is escaped verbatim (wording drift can't diverge from the matcher); ``{field}`` -> numeric."""
-    parts = re.split(r"\{[^{}]*\}", template)
-    return r"[\d,]+".join(re.escape(part) for part in parts)
-
-
-# ROUTINE compression progress statuses, derived from the SAME template constants the emit sites format.
-# Used ONLY by the opt-in ``compression.progress_notices`` gate below (#52995) to decide which of the noisy
-# statuses matched by _TELEGRAM_NOISY_STATUS_RE are compression progress (deliverable when the user opted
-# in) versus unrelated aux/retry chatter (always suppressed on chat surfaces). Failure notices and manual
-# /compress feedback never match _TELEGRAM_NOISY_STATUS_RE in the first place, so they are unaffected by
-# this gate.
-_COMPRESSION_PROGRESS_STATUS_RE = re.compile(
-    "|".join(
-        _status_template_to_regex(_template)
-        for _template in (
-            COMPACTION_STATUS, COMPACTION_HEARTBEAT_STATUS, COMPACTION_DONE_STATUS, PRE_API_COMPRESSION_STATUS_TEMPLATE,
-            PREFLIGHT_COMPRESSION_STATUS_TEMPLATE, IDLE_COMPACTION_STATUS_TEMPLATE,
-            COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE, COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
-            COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
-            COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE)),
-    re.IGNORECASE)
 
 
 def _gateway_compression_progress_notices_enabled() -> bool:
@@ -731,6 +702,8 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
+    if _LEASE_WAIT_REPEAT_STATUS_RE.search(text):
+        return None
     # Opt-in `compression.progress_notices` lets ROUTINE (template-derived) progress through; other noise stays.
     if _TELEGRAM_NOISY_STATUS_RE.search(text) and not (
         _gateway_compression_progress_notices_enabled() and _COMPRESSION_PROGRESS_STATUS_RE.search(text)

@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent import relay_runtime
+from agent.turn_facade_lease import LEASE_FREE_STATUS, LEASE_WAIT_STATUS
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -123,8 +124,8 @@ def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch, signal):
         "include_row_ids": True,
     }
     texts = [text or "" for _kind, text in status_events]
-    for notice in ("Another Hermes process", "Session is free"):
-        assert any(notice in text for text in texts) is (signal == "on_wait"), notice
+    for notice in (LEASE_WAIT_STATUS, LEASE_FREE_STATUS):
+        assert (notice in texts) is (signal == "on_wait"), notice
 
 
 def test_run_conversation_acquires_lease_when_session_probe_raises(monkeypatch):
