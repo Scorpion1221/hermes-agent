@@ -3954,10 +3954,10 @@ class GatewayRunner(
         _write_runtime_status_quiet(active_agents=self._active_work_count())
 
     def _running_agent_ids(self) -> set:
-        """``id()`` of every agent mid-turn — identity-keyed so the lookup is O(1) and independent of
-        ``AIAgent.__eq__`` (MagicMock overrides it in tests)."""
+        """``id()`` of every agent mid-turn, slot or live turn thread — identity-keyed so the lookup is O(1)
+        and independent of ``AIAgent.__eq__`` (MagicMock overrides it in tests)."""
         return {id(a) for _, a in self._running_agent_items()
-                if a is not None and a is not _AGENT_PENDING_SENTINEL}
+                if a is not None and a is not _AGENT_PENDING_SENTINEL}.union(self._live_turn_agents())
 
     def _snapshot_running_agents(self) -> dict[str, Any]:
         return {k: a for k, a in self._running_agent_items() if a is not _AGENT_PENDING_SENTINEL}

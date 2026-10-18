@@ -32,6 +32,10 @@ _OVERRIDE_APPLY_KEYS = (
     "provider", "requested_provider", "api_key", "base_url", "api_mode", "credential_pool", "capabilities", "max_tokens",
 )
 
+# Guards the runner's live-turn registry: turn threads register/unregister from the executor while the
+# loop reads it for /stop and agent-cache decisions.
+_LIVE_TURNS_LOCK = threading.Lock()
+
 
 def _first_agent(entry: Any) -> Any:
     """Unwrap a cache entry (``(agent, sig, ...)`` tuple or bare agent) to its agent."""
@@ -483,42 +487,71 @@ class GatewayAgentCacheMixin:
             if interrupt_event is not None:
                 interrupt_event._hermes_run_generation = int(generation)
 
+    def _register_live_turn_agent(self, session_key: Optional[str], agent: Any) -> None:
+        """Record ``agent`` as running a turn thread for ``session_key`` until that thread exits
+        (``_run_agent_start_turn_worker`` unregisters it). The slot only holds the newest promoted
+        agent, so a turn built before a generation bump (never promoted) or released without being
+        stopped is reachable through this registry alone, while it still holds the durable lease."""
+        if not session_key:
+            return
+        with _LIVE_TURNS_LOCK:
+            self.__dict__.setdefault("_live_turns", {}).setdefault(session_key, {})[id(agent)] = agent
+
+    def _unregister_live_turn_agent(self, session_key: Optional[str], agent: Any) -> None:
+        with _LIVE_TURNS_LOCK:
+            live = self.__dict__.get("_live_turns") or {}
+            agents = live.get(session_key)
+            if agents is not None and agents.pop(id(agent), None) is not None and not agents:
+                del live[session_key]
+
+    def _live_turn_agents(self, session_key: Optional[str] = None) -> dict[int, Any]:
+        """``{id(agent): agent}`` of the live turn threads of ``session_key`` (every session when None)."""
+        with _LIVE_TURNS_LOCK:
+            live = self.__dict__.get("_live_turns") or {}
+            buckets = live.values() if session_key is None else [live.get(session_key) or {}]
+            return {key: agent for bucket in buckets for key, agent in bucket.items()}
+
     def _interrupt_running_turn(
         self, session_key: str, *, interrupt_reason: str, invalidation_reason: str, tool_reason: str | None = None,
     ) -> int:
-        """Sync core shared by /stop, /new and eviction: request a hard interrupt on the in-flight
-        agent, invalidate its run generation, and reap the tool processes that turn spawned.
-        ``tool_reason`` names a system issuer (eviction); ``None`` keeps the user attribution of /stop and /new.
-        Returns the post-bump generation."""
+        """Sync core shared by /stop, /new and eviction: invalidate the run generation, hard-interrupt
+        every turn of the session still running in this process — the slot's agent AND each live turn
+        thread (one never promoted, or released without being stopped, keeps the durable session lease
+        while nothing else reaches it) — and reap the tool processes each spawned, against its own
+        baseline. ``tool_reason`` names a system issuer (eviction); ``None`` keeps the user attribution
+        of /stop and /new. Returns the post-bump generation."""
         from contextvars import copy_context
         from gateway.run import _AGENT_PENDING_SENTINEL, _reap_gateway_turn_processes, request_hard_interrupt
+        # Bump BEFORE reading the live turns: a turn thread registers its agent and only then checks its
+        # generation (run_sync), so it is either interrupted here or sees the bump and never starts.
+        # The post-bump value also gates each reap: task_id is session-scoped, so a replacement turn
+        # spawning before the reap runs bumps it again and the closure skips — the replacement's own
+        # baseline covers its cleanup, so nothing stays unreaped.
+        _generation_at_interrupt = self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
         state = self._peek_session_state(session_key)
+        agents = self._live_turn_agents(session_key)
         running_agent = state.turn.agent if state else None
-        _process_task_id, _process_baseline = "", None
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+            agents[id(running_agent)] = running_agent
+        for agent in agents.values():
             # A raising interrupt implementation must not leave the slot unroutable: the generation
-            # bump and release below are the cleanup that matters.
+            # bump and release are the cleanup that matters.
             with _log_suppressed(logging.WARNING, "Failed to interrupt running agent for %s; continuing",
                                  session_key, exc_info=True):
-                request_hard_interrupt(running_agent, interrupt_reason, tool_reason=tool_reason)
-            _process_task_id = getattr(running_agent, "_gateway_turn_process_task_id", "")
-            _process_baseline = getattr(running_agent, "_gateway_turn_process_baseline", None)
-        # Bump the generation BEFORE scheduling the reap thread and capture the post-bump value:
-        # task_id is session-scoped, so a replacement turn spawning before the reap runs bumps it
-        # again and the closure sees a stale generation and skips — the replacement's own baseline
-        # covers its cleanup, so nothing stays unreaped.
-        _generation_at_interrupt = self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
-        if _process_task_id and _process_baseline is not None:
-            threading.Thread(
-                target=copy_context().run,
-                args=(_reap_gateway_turn_processes, _process_task_id, _process_baseline),
-                kwargs={
-                    "source": "gateway_turn_interrupt",
-                    "is_still_current": lambda: self._is_session_run_current(session_key, _generation_at_interrupt),
-                },
-                name=f"gateway-turn-reaper-{_process_task_id[:12]}",
-                daemon=True,
-            ).start()
+                request_hard_interrupt(agent, interrupt_reason, tool_reason=tool_reason)
+            _process_task_id = getattr(agent, "_gateway_turn_process_task_id", "")
+            _process_baseline = getattr(agent, "_gateway_turn_process_baseline", None)
+            if _process_task_id and _process_baseline is not None:
+                threading.Thread(
+                    target=copy_context().run,
+                    args=(_reap_gateway_turn_processes, _process_task_id, _process_baseline),
+                    kwargs={
+                        "source": "gateway_turn_interrupt",
+                        "is_still_current": lambda: self._is_session_run_current(session_key, _generation_at_interrupt),
+                    },
+                    name=f"gateway-turn-reaper-{_process_task_id[:12]}",
+                    daemon=True,
+                ).start()
         return _generation_at_interrupt
 
     @staticmethod
@@ -926,8 +959,9 @@ class GatewayAgentCacheMixin:
 
     def _release_evicted_agent_soft(self, agent: Any) -> None:
         """Soft cleanup for cache-evicted agents: unlike _cleanup_agent_resources, the session may
-        resume, so terminal sandbox, browser daemon and bg processes outlive the AIAgent instance."""
-        if agent is None:
+        resume, so terminal sandbox, browser daemon and bg processes outlive the AIAgent instance.
+        Never for a live turn's agent: another thread is still using its clients and transcript."""
+        if agent is None or id(agent) in self._live_turn_agents():
             return
         with suppress(Exception):
             if hasattr(agent, "release_clients"):

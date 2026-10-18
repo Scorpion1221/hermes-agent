@@ -1007,23 +1007,8 @@ class TurnRunner:
         return bool((platforms_cfg.get(platform_key) or {}).get("skip_context_files"))
 
     def _cached_sid_is_dead(self, cache_lock, cache) -> tuple:
-        """(peeked cached session_id, is_dead) — checked OUTSIDE the cache lock. "cached sid != current
-        sid" normally means an intentional switch (reuse), but the routing-key self-heal yields the same
-        shape with an agent bound to a DEAD session; reusing it re-binds the dead sid and loops."""
-        ctx = self._ctx
-        peek_sid = None
-        if cache_lock and cache is not None:
-            with cache_lock:
-                entry = cache.get(ctx.session_key)
-            if entry and len(entry) > 3:
-                peek_sid = entry[3]
-        dead = False
-        if peek_sid is not None and ctx.session_id is not None and peek_sid != ctx.session_id:
-            # The cache is keyed by session_key, so the snapshot's row lives in that key's profile
-            # store; its id is no longer in the routing index once the self-heal moved the key on.
-            with suppress(Exception):
-                dead = self._runner.session_store._is_session_ended_in_db(peek_sid, session_key=ctx.session_key)
-        return peek_sid, dead
+        from gateway.run_turn_runner_agent_cache import cached_sid_is_dead
+        return cached_sid_is_dead(self._runner, self._ctx, cache_lock, cache)
 
     def _current_message_count(self):
         """Cross-process write guard input: the session's current DB message_count (or None)."""
@@ -1073,6 +1058,8 @@ class TurnRunner:
                     "#54878 x #54947) — discarding instead of "
                     "reusing across the routing recovery", ctx.session_key, cached_sid,
                 )
+            elif id(cached[0]) in self._runner._live_turn_agents(ctx.session_key):
+                return out  # still running a turn on another thread (stopped or not): never share it
             elif not sid_mismatch and cached_mc is not None and msg_count is not None and msg_count != cached_mc:
                 logger.info(
                     "Agent cache invalidated for session %s: "
@@ -1304,6 +1291,7 @@ class TurnRunner:
             agent.interim_assistant_callback = None
             agent.thinking_progress = False
         ctx.agent_holder[0] = agent  # interrupt support
+        runner._register_live_turn_agent(ctx.session_key, agent)  # /stop reaches it until the thread exits
         # The titler fires from the turn prologue, so attach the rename lane before the run.
         self._attach_session_title_callback(agent, ctx)
         # Publish turn ownership for /stop, /new, disconnect and shutdown interrupts; older session
@@ -1940,6 +1928,9 @@ class TurnRunner:
             # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
             agent._pending_fallback_notice = pending_fallback_notice
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
+        if ctx._run_still_current is not None and not ctx._run_still_current():
+            # /stop bumped the generation during setup: the agent is never promoted, so never start it.
+            return {"final_response": "", "messages": [], "api_calls": 0, "tools": [], "interrupted": True}
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
         result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)

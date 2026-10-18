@@ -439,6 +439,12 @@ class GatewaySlashCommandsMixin(
         if agent:  # force-clean the session lock so a truly hung agent doesn't keep it forever
             await _stop(session_key, "stop_command_handler")
             return EphemeralReply(t("gateway.stop.stopped"))
+        if self._live_turn_agents(session_key):
+            # The slot was released without stopping its turn (never promoted, an abandon): the thread
+            # still runs and holds the session lease, so this is not "no active task".
+            await _stop(session_key, "stop_command_live_turn")
+            logger.info("STOP (live turn outside the slot) for session %s", session_key)
+            return EphemeralReply(t("gateway.stop.stopped"))
 
         # No run under the caller's own key: a live turn in THIS chat may still carry a differently
         # shaped key. One scan feeds both tiers; the chat tier is a superset of the thread-sibling

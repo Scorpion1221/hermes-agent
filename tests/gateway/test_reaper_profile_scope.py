@@ -34,6 +34,9 @@ class _Runner:
     def _is_session_run_current(self, _session_key, generation):
         return generation == 7
 
+    def _live_turn_agents(self, _session_key=None):
+        return {}
+
 
 def test_interrupt_reaper_keeps_served_profile_home(tmp_path, monkeypatch):
     """A /stop-style reaper must write/check process state in the session's profile, not launch home."""

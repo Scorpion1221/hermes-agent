@@ -3460,10 +3460,10 @@ class GatewayTurnMixin:
                 # *next* turn is claimed (see _session_state(...).turn.agent = ... at claim time), so a
                 # stale reference to this exact agent instance stays reachable from
                 # _interrupt_and_clear_session() until then. See #76115.
-                _finished_agent = agent_holder[0] if agent_holder else None
-                if _finished_agent is not None:
+                if (_finished_agent := agent_holder[0] if agent_holder else None) is not None:
                     _finished_agent._gateway_turn_process_task_id = ""
                     _finished_agent._gateway_turn_process_baseline = frozenset()
+                    self._unregister_live_turn_agent(session_key, _finished_agent)
 
         if _agent_timeout is not None:
             threading.Thread(

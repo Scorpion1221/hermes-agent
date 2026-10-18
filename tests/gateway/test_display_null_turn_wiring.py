@@ -47,6 +47,7 @@ def _wire(user_config):
         _runner=types.SimpleNamespace(
             _service_tier=None,
             _consume_pending_turn_sidecar_notes=lambda key: [],
+            _register_live_turn_agent=lambda key, agent: None,
         ),
         _make_bg_review_callbacks=lambda: (lambda message: None, lambda: None),
         _merge_turn_request_overrides=TurnRunner._merge_turn_request_overrides,
