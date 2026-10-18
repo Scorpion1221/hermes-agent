@@ -834,30 +834,79 @@ def _prepend_shell_init(cmd_string: str, files: list[str]) -> str:
 
 
 # --- Process-group teardown (POSIX) ---
-def _wait_for_group_exit(proc, pgid: int, timeout: float) -> bool:
+def _wait_for_group_exit(proc, pgid: int, timeout: float, escaped: dict | None = None) -> bool:
     """Wait until the process group is gone, reaping the wrapper as we go (a dead
-    but unreaped group leader still makes ``killpg(pgid, 0)`` succeed).
-    POSIX-only; callers are behind the _IS_WINDOWS gate."""
+    but unreaped group leader still makes ``killpg(pgid, 0)`` succeed). ``escaped``
+    (see _escapees) shares the wait: it ends once they are gone too.
+    Returns whether the group is gone. POSIX-only; callers are behind the _IS_WINDOWS gate."""
     deadline = time.monotonic() + timeout
+    group_gone = False
+    termed: set = set()  # pids _escapee_grace_tick sent its own TERM to
     while True:
-        try:
-            proc.poll()
-        except Exception:
-            pass
-        try:
-            os.killpg(pgid, 0)  # windows-footgun: ok — POSIX process-group alive probe
-        except ProcessLookupError:
+        if not group_gone:
+            try:
+                proc.poll()
+            except Exception:
+                pass
+            try:
+                os.killpg(pgid, 0)  # windows-footgun: ok — POSIX process-group alive probe
+            except ProcessLookupError:
+                group_gone = True  # sticky: an emptied PGID may be reused
+            except PermissionError:
+                pass  # exists, even if we cannot signal it
+        escapees_left = bool(escaped) and _escapee_grace_tick(escaped, termed)
+        if group_gone and not escapees_left:
             return True
-        except PermissionError:
-            pass  # exists, even if we cannot signal it
         if time.monotonic() >= deadline:
-            return False
+            return group_gone
         time.sleep(0.05)
 
 
+def _escapees(descendants: list, pgid: int) -> dict:
+    """Snapshotted descendants outside the process group -> (their parent's pid now, whether
+    that parent is a member, not the leader, of their own process group)."""
+    if not descendants:  # no snapshot (psutil missing or failed): nothing to give a grace to
+        return {}
+    import psutil
+    escaped = {}
+    for child in descendants:
+        with contextlib.suppress(psutil.Error, OSError):  # gone, or not visible
+            if (own := os.getpgid(child.pid)) != pgid:
+                parent, shared = child.ppid(), False
+                with contextlib.suppress(OSError):  # parent already gone: no shared group to count on
+                    shared = parent != own and os.getpgid(parent) == own
+                escaped[child] = (parent, shared)
+    return escaped
+
+
+def _escapee_grace_tick(escaped: dict, termed: set) -> bool:
+    """Forget escapees that exited; SIGTERM each one whose parent has exited (it was
+    reparented), and report whether any still run. The group's TERM is relayed down, never
+    doubled: a live parent got it and stops what it started itself (GNU ``timeout`` forwards it
+    to its own group, supervisors signal their ``start_new_session`` children), and a parent
+    that was a plain member of the escapee's group and was not TERMed by us was stopped through
+    that group, which reached the escapee too (``timeout N bash job.sh``: the shell dies of
+    timeout's group TERM). A dead group leader was signalled alone (a supervisor TERMs its
+    child, not the child's group). A second TERM re-enters a handler still recording the interrupt."""
+    import psutil
+    for child, parent in list(escaped.items()):
+        try:
+            if not child.is_running() or child.status() == psutil.STATUS_ZOMBIE:
+                del escaped[child]
+            elif parent is not None and child.ppid() != parent[0]:
+                ppid, shared = parent
+                if not shared or ppid in termed:  # else the group TERM that stopped its parent reached it
+                    child.terminate()  # identity-checked: never signals a recycled PID
+                    termed.add(child.pid)
+                escaped[child] = None  # TERMed once; SIGKILLed by the sweep if it outlives the grace
+        except (psutil.Error, OSError):  # exited (NoSuchProcess), or not ours to signal (AccessDenied)
+            del escaped[child]
+    return bool(escaped)
+
+
 def _sweep_escaped_descendants(descendants: list, pgid: int) -> None:
-    """SIGKILL snapshotted survivors that escaped the process group via ``setsid``
-    — after TERM→KILL so in-group members keep their grace; psutil's identity-aware
+    """SIGKILL snapshotted survivors that escaped the process group via ``setsid`` —
+    the KILL step, after they shared the group's TERM grace; psutil's identity-aware
     Process skips recycled PIDs. POSIX-only (see _IS_WINDOWS gate in caller)."""
     for child in descendants:
         try:
@@ -904,10 +953,11 @@ def _leader_is_ours(pgid, expected_start) -> bool:
 
 
 def _kill_process_group_posix(proc) -> None:
-    """TERM the group, wait, KILL, then sweep setsid escapees. Descendants are
-    snapshotted BEFORE the first signal — once the wrapper dies they reparent to
-    init — and we wait on the group, not the wrapper, which can exit before
-    grandchildren under load. POSIX-only (_IS_WINDOWS handled by the caller).
+    """TERM the group, wait, KILL, then sweep setsid escapees, which share the TERM and
+    its grace (_escapee_grace_tick). Descendants are snapshotted BEFORE the first
+    signal — once the wrapper dies they reparent to init — and we wait on the group, not
+    the wrapper, which can exit before grandchildren under load. POSIX-only (_IS_WINDOWS
+    handled by the caller).
     PID-reuse guard (#43044): the group is only signalled while its leader's start
     time still matches the spawn-time baseline — a recycled PGID is never killed."""
     expected_start = getattr(proc, "_hermes_pgid_start", None)
@@ -941,8 +991,11 @@ def _kill_process_group_posix(proc) -> None:
         _kill_known_pids(proc, descendants)
     else:
         try:
+            # Processes that left the group (``timeout N cmd`` runs outside it) get the TERM
+            # and the grace too, so they can record the interrupt; survivors are KILLed below.
+            escaped = _escapees(descendants, pgid)
             os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok — POSIX only (see _IS_WINDOWS gate in caller)
-            if not _wait_for_group_exit(proc, pgid, 1.0):
+            if not _wait_for_group_exit(proc, pgid, 1.0, escaped):
                 if not _leader_is_ours(pgid, expected_start):
                     # Leader exited during the grace window; do not escalate to
                     # SIGKILL on a possibly-recycled PGID.
