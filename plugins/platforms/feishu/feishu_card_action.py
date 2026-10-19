@@ -3,7 +3,9 @@
 A click answers the card, once. Only an admin, the user the card answers or, in a DM, the user there may
 click; anyone else gets an error toast and the card is left as it was. A control whose callback value carries
 ``"hermes_card_click": "anyone"`` opens its click to everyone in the chat (a card meant for a group, such as a
-release approval; the agent still decides what the click means). A card answers the user whose turn was
+release approval; the agent still decides what the click means). ``"hermes_card_command": "stop"`` makes the
+click the clicker's ``/stop``: it goes through the same command path as a typed one (the busy-session bypass, the
+clicker's authorization), so it stops the running turn and its commands at once instead of reaching the agent. A card answers the user whose turn was
 running in its chat (and topic) when it was sent, however it was sent (the adapter or the agent's own
 ``lark-cli``): the processing hooks record each turn (:func:`note_turn`). A card no recorded turn explains
 (sent before a restart) answers the sender of the message it replies to, through the bot's own replies but
@@ -48,6 +50,7 @@ _OWNER_HOPS = 4  # how far up the bot's own replies a card no turn explains look
 _RETRY_AFTER_FAILED_LOOKUP_SECONDS = 30.0
 _CLOCK_SLACK_SECONDS = 5.0  # Feishu's create_time against this host's clock
 _OPEN_CLICK = ("hermes_card_click", "anyone")  # in a control's callback value: anyone in the chat may click
+_CARD_COMMANDS = {"stop": "/stop"}  # ``hermes_card_command`` in a control's callback value -> the command it runs
 _LOOKUP_BUDGET_SECONDS = 2.0  # leaves headroom inside Feishu's ~3 s card-callback deadline
 # What the user did: a button's value, a submitted form's values, a select / picker choice, a typed input.
 _ACTION_FIELDS = ("name", "value", "form_value", "option", "options", "input_value", "checked")
@@ -386,13 +389,16 @@ async def handle_card_action_event(adapter: Any, data: Any) -> None:
         return
     action = getattr(getattr(data, "event", None), "action", None)
     tag = str(getattr(action, "tag", "") or "button")
+    value = getattr(action, "value", None)
+    command = _CARD_COMMANDS.get(value.get("hermes_card_command")) if isinstance(value, dict) else None
     card = await _card_message(adapter, click.card_id)
     quote = await adapter._fetch_quoted_reply(click.card_id, media=False)  # cached by the fetch above
     chat_info = await adapter.get_chat_info(click.chat_id)  # cached; reused by _dispatch_synthetic_event
     logger.info("[Feishu] Routing card action %r from %s on card %s in %s", tag, click.open_id, click.card_id,
                 click.chat_id)
     await adapter._dispatch_synthetic_event(
-        text=_click_text(tag, action), message_type=MessageType.TEXT, chat_id=click.chat_id,
+        text=command or _click_text(tag, action), message_type=MessageType.COMMAND if command else MessageType.TEXT,
+        chat_id=click.chat_id,
         sender_id=SimpleNamespace(open_id=click.open_id, user_id=click.user_id or None, union_id=click.union_id or None),
         event_chat_type=_event_chat_type(chat_info), raw_message=data,
         # No card id (a click outside a chat card) maps back to no reply target: the answer is a new message.

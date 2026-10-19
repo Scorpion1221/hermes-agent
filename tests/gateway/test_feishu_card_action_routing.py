@@ -176,6 +176,34 @@ def test_what_was_picked_or_submitted_reaches_the_agent():
     ]
 
 
+def test_a_stop_button_is_the_clickers_stop_command():
+    """A control whose value names ``hermes_card_command: stop`` (the release progress card's 停止上线) is the
+    clicker's own /stop: a COMMAND event the gateway's busy-session bypass dispatches at once."""
+    from gateway.platforms.event import MessageType
+
+    adapter = _adapter()
+    routed = _wire(adapter, _bot_message())
+
+    _route(adapter, _click("tok_1", value={"hermes_card_command": "stop", "hermes_card_click": "anyone"}))
+
+    [event] = routed
+    assert event.text == "/stop"
+    assert event.message_type == MessageType.COMMAND
+    assert event.get_command() == "stop"
+    assert event.source.user_id == "ou_human"  # stopped by the clicker
+
+
+def test_an_unknown_card_command_is_an_ordinary_click():
+    adapter = _adapter()
+    routed = _wire(adapter, _bot_message())
+
+    _route(adapter, _click("tok_1", value={"hermes_card_command": "rm -rf"}))
+
+    [event] = routed
+    assert event.text.startswith("card:button ")
+    assert not event.is_command()
+
+
 @pytest.mark.parametrize("get", [
     Mock(return_value=SimpleNamespace(success=lambda: False, code=230002, msg="no permission")),
     Mock(side_effect=RuntimeError("network down")),
