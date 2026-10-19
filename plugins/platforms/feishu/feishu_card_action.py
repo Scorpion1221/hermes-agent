@@ -123,7 +123,7 @@ async def _answer(adapter: Any, data: Any, click: _Click, *, decided: bool) -> N
             return
         _mark_handled(adapter, click.card_id)
     await adapter._handle_card_action_event(data)
-    await _mark_card_answered(adapter, click)
+    await _mark_card_answered(adapter, click, note_key=_answered_note_key(data))
 
 
 def _parse(data: Any) -> Optional[_Click]:
@@ -288,7 +288,15 @@ def note_turn(adapter: Any, event: Any, *, running: bool) -> None:
 
 # --- The answered card ---
 
-async def _mark_card_answered(adapter: Any, click: _Click) -> None:
+def _answered_note_key(data: Any) -> str:
+    """The note under an answered card: a stop button's says who stopped it, any other who handled it."""
+    value = getattr(getattr(getattr(data, "event", None), "action", None), "value", None)
+    stop = isinstance(value, dict) and _CARD_COMMANDS.get(value.get("hermes_card_command")) == "/stop"
+    return "platform.feishu.card_action.stopped_by" if stop else "platform.feishu.card_action.handled_by"
+
+
+async def _mark_card_answered(adapter: Any, click: _Click, *,
+                              note_key: str = "platform.feishu.card_action.handled_by") -> None:
     """Redraw the card with its controls disabled and who handled it (best effort: the click still routes)."""
     from .feishu_outbound import _patch_request
 
@@ -299,7 +307,7 @@ async def _mark_card_answered(adapter: Any, click: _Click) -> None:
         if card is None:
             return
         name = await adapter._resolve_sender_name_from_api(click.user_id or click.open_id) or click.open_id
-        content = json.dumps(answered_card(card, t("platform.feishu.card_action.handled_by", user=name)),
+        content = json.dumps(answered_card(card, t(note_key, user=name)),
                              ensure_ascii=False)
         response = await adapter._run_blocking(adapter._client.im.v1.message.patch,
                                                _patch_request(click.card_id, content))

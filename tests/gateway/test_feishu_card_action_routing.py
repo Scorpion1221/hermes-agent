@@ -349,6 +349,19 @@ def test_the_user_the_card_answers_gets_a_toast_and_the_card_is_marked_answered(
     assert "Asker" in elements[-1]["content"]
 
 
+def test_a_pressed_stop_button_marks_the_card_stopped_by_the_presser(callback_types):
+    """The redraw under a stop button says who stopped it, so the release card (and the wrapper reading it back)
+    reads 「已由 X 停止」, not a generic 「已由 X 处理」."""
+    from agent.i18n import t
+
+    adapter = _clickable()
+
+    _press(adapter, open_id="ou_asker", value={"hermes_card_command": "stop", "hermes_card_click": "anyone"})
+
+    note = _patched_card(adapter)["body"]["elements"][-1]["content"]
+    assert t("platform.feishu.card_action.stopped_by", user="Asker") in note
+
+
 def test_someone_else_in_the_group_is_refused_and_the_card_stays_as_it_was(callback_types):
     adapter = _clickable()
 

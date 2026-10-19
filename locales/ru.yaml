@@ -1359,6 +1359,7 @@ platform:
       already_handled: "Уже обработано"
       retry: "Не удалось проверить права. Попробуйте ещё раз"
       handled_by: "✅ Обработано: {user}"
+      stopped_by: "⏹ Остановлено: {user}"
     approval:
       action_session: "На сеанс"
       action_always: "Всегда"

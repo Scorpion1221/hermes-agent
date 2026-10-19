@@ -1359,6 +1359,7 @@ platform:
       already_handled: "Já processado"
       retry: "Não foi possível verificar a permissão. Tente novamente"
       handled_by: "✅ Processado por {user}"
+      stopped_by: "⏹ Parado por {user}"
     approval:
       action_session: "Sessão"
       action_always: "Sempre"

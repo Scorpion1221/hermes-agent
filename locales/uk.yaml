@@ -1359,6 +1359,7 @@ platform:
       already_handled: "Вже оброблено"
       retry: "Не вдалося перевірити дозвіл. Спробуйте ще раз"
       handled_by: "✅ Оброблено: {user}"
+      stopped_by: "⏹ Зупинено: {user}"
     approval:
       action_session: "На сеанс"
       action_always: "Завжди"

@@ -1580,6 +1580,7 @@ platform:
       already_handled: "Déjà traitée"
       retry: "Impossible de vérifier l'autorisation. Réessayez"
       handled_by: "✅ Traitée par {user}"
+      stopped_by: "⏹ Arrêté par {user}"
     approval:
       action_session: "Session"
       action_always: "Toujours"
