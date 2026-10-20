@@ -123,7 +123,7 @@ async def _answer(adapter: Any, data: Any, click: _Click, *, decided: bool) -> N
             return
         _mark_handled(adapter, click.card_id)
     await adapter._handle_card_action_event(data)
-    await _mark_card_answered(adapter, click, note_key=_answered_note_key(data))
+    await _mark_card_answered(adapter, click, note_key=_answered_note_key(data), data=data)
 
 
 def _parse(data: Any) -> Optional[_Click]:
@@ -295,7 +295,13 @@ def _answered_note_key(data: Any) -> str:
     return "platform.feishu.card_action.stopped_by" if stop else "platform.feishu.card_action.handled_by"
 
 
-async def _mark_card_answered(adapter: Any, click: _Click, *,
+def _submitted(data: Any) -> dict[str, Any]:
+    """The form values this click submitted (``form_value``), keyed by control name; {} for a plain button."""
+    value = getattr(getattr(getattr(data, "event", None), "action", None), "form_value", None)
+    return value if isinstance(value, dict) else {}
+
+
+async def _mark_card_answered(adapter: Any, click: _Click, *, data: Any = None,
                               note_key: str = "platform.feishu.card_action.handled_by") -> None:
     """Redraw the card with its controls disabled and who handled it (best effort: the click still routes)."""
     from .feishu_outbound import _patch_request
@@ -307,7 +313,7 @@ async def _mark_card_answered(adapter: Any, click: _Click, *,
         if card is None:
             return
         name = await adapter._resolve_sender_name_from_api(click.user_id or click.open_id) or click.open_id
-        content = json.dumps(answered_card(card, t(note_key, user=name)),
+        content = json.dumps(answered_card(card, t(note_key, user=name), submitted=_submitted(data)),
                              ensure_ascii=False)
         response = await adapter._run_blocking(adapter._client.im.v1.message.patch,
                                                _patch_request(click.card_id, content))
@@ -331,17 +337,46 @@ async def _card_definition(adapter: Any, card_id: str) -> Optional[dict[str, Any
     return card if isinstance(card, dict) else None
 
 
-def answered_card(card: dict[str, Any], note: str) -> dict[str, Any]:
-    """``card`` with every control that calls back disabled and ``note`` below it, so it takes no second answer."""
+def answered_card(card: dict[str, Any], note: str, *, submitted: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """``card`` with every control that calls back disabled and ``note`` below it, so it takes no second answer.
+    ``submitted`` (the click's form values) replaces each form control's initial value, so the frozen card shows what
+    was actually submitted, not what the card was sent with."""
     card = copy.deepcopy(card)
     if str(card.get("schema")) == "2.0":
         body = card.setdefault("body", {})
+        if submitted:
+            _show_submitted(body, submitted)
         _disable(body)
         body.setdefault("elements", []).append({"tag": "markdown", "content": f"<font color='grey'>{note}</font>"})
     else:  # Card JSON 1.0 has no disabled state: its button rows go
         elements = [e for e in card.get("elements") or [] if not (isinstance(e, dict) and e.get("tag") == "action")]
         card["elements"] = [*elements, {"tag": "markdown", "content": note}]
     return card
+
+
+# Form controls whose initial value is a list of option values / one option value.
+_MULTI_VALUE = frozenset({"multi_select_static", "multi_select_person"})
+_SINGLE_VALUE = frozenset({"select_static", "select_person", "select_img"})
+
+
+def _show_submitted(node: Any, submitted: dict[str, Any]) -> None:
+    if isinstance(node, list):
+        for child in node:
+            _show_submitted(child, submitted)
+    elif isinstance(node, dict):
+        name, tag = node.get("name"), node.get("tag")
+        if name in submitted:
+            value = submitted[name]
+            if tag in _MULTI_VALUE:
+                node["selected_values"] = list(value) if isinstance(value, (list, tuple)) else [value]
+            elif tag in _SINGLE_VALUE:
+                node["initial_option"] = value
+            elif tag == "input":
+                node["default_value"] = value
+            elif tag == "checker":
+                node["checked"] = bool(value)
+        for child in node.values():
+            _show_submitted(child, submitted)
 
 
 def _disable(node: Any) -> None:

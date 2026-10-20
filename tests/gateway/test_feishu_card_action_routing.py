@@ -362,6 +362,40 @@ def test_a_pressed_stop_button_marks_the_card_stopped_by_the_presser(callback_ty
     assert t("platform.feishu.card_action.stopped_by", user="Asker") in note
 
 
+def test_the_answered_card_shows_what_was_submitted_not_the_initial_selection(callback_types):
+    """2026-10-20: a preview card's 本次上线 started with all three services selected; the user kept only Plugin Server
+    and clicked 上线所选, but the frozen card showed all three again, as if all were released."""
+    form = {"tag": "form", "name": "f", "elements": [
+        {"tag": "multi_select_static", "name": "releases", "selected_values": ["ps", "cl", "pg"],
+         "options": [{"text": {"tag": "plain_text", "content": n}, "value": v}
+                     for n, v in (("Plugin Server", "ps"), ("Web Client", "cl"), ("Web Pages", "pg"))]},
+        {"tag": "select_static", "name": "when", "initial_option": "now", "options": []},
+        {"tag": "button", "name": "go", "form_action_type": "submit", "text": {"tag": "plain_text", "content": "上线所选"}},
+    ]}
+    adapter = _clickable()
+    dsl = {"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": "pick"}, form]}}
+    get = adapter._client.im.v1.message.get.side_effect
+
+    def _get(request):
+        if getattr(request, "card_msg_content_type", None) == "user_card_content":
+            return SimpleNamespace(success=lambda: True, data=SimpleNamespace(
+                items=[SimpleNamespace(body=SimpleNamespace(content=json.dumps(dsl)))]))
+        return get(request)
+
+    adapter._client.im.v1.message.get = Mock(side_effect=_get)
+
+    data = _click("tok_1", value={}, form_value={"releases": ["ps"], "when": "later"})
+    data.event.operator = SimpleNamespace(open_id="ou_asker", user_id=None, union_id=None)
+    with _LoopThread() as loop:
+        adapter._loop = loop
+        adapter._on_card_action_trigger(data)
+
+    frozen = _patched_card(adapter)["body"]["elements"][1]["elements"]
+    assert frozen[0]["selected_values"] == ["ps"]
+    assert frozen[1]["initial_option"] == "later"
+    assert all(e.get("disabled") is True for e in frozen)
+
+
 def test_someone_else_in_the_group_is_refused_and_the_card_stays_as_it_was(callback_types):
     adapter = _clickable()
 
