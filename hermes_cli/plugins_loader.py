@@ -710,6 +710,12 @@ class PluginLoaderMixin:
             ns_pkg.__package__ = _NS_PARENT
             sys.modules[_NS_PARENT] = ns_pkg
         module_name = module_name or self._directory_module_name(manifest)
+        running = sys.modules.get(module_name)
+        if manifest.kind == "platform" and getattr(running, "__file__", None) == str(init_file):
+            # A force re-discovery (``hermes plugins install/enable`` -> reload-plugins) must not re-import a
+            # platform this process already runs: its live adapter resolves lazily bound SDK names through the
+            # package's modules (feishu's ``from . import adapter``), and a fresh copy has them unbound again.
+            return running
         # Evict stale entries for this slug (same slug cached from another Hermes home, or an earlier force
         # reload). Replacing only sys.modules[module_name] is not enough: the plugin's relative imports are
         # cached as "module_name.sub" and resolve from sys.modules first, so a stale submodule would keep
