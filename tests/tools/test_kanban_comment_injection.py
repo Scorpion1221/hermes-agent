@@ -26,10 +26,13 @@ import tools.kanban_tools as kt
 
 
 class FakeAgent:
-    def __init__(self):
+    def __init__(self, accepting=True):
         self.steers: list[str] = []
+        self.accepting = accepting
 
     def steer(self, text: str) -> bool:
+        if not self.accepting:      # a turn that already made its last read of the steer slot
+            return False
         self.steers.append(text)
         return True
 
@@ -191,3 +194,29 @@ def test_skips_own_authored_comments_without_env_profile(worker_home, monkeypatc
     _unthrottle()
     assert kt.inject_new_comments_from_env(agent) is False
     assert agent.steers == []
+
+
+def test_a_refused_steer_keeps_the_note_for_the_next_poll(worker_home, monkeypatch):
+    """The steer window closed (the turn already made its last read): the note is not consumed, and the
+    next poll, at the next turn's tool boundary, delivers it."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="live task")
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "worker-bot")
+    agent = FakeAgent(accepting=False)
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(agent) is False                 # seeds the watermark
+    conn = kbc.connect()
+    try:
+        kb.add_comment(conn, tid, author="desktop", body="switch to the staging bucket")
+    finally:
+        conn.close()
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(agent) is False                 # refused: not consumed
+    agent.accepting = True
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(agent) is True
+    assert len(agent.steers) == 1 and "staging bucket" in agent.steers[0]

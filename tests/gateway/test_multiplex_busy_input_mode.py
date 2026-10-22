@@ -495,6 +495,7 @@ async def test_primary_adapter_busy_origin_uses_routed_privacy(
         skip_memory=True, save_trajectories=False, platform="cli",
     )
     agent._executing_tools = mode == "interrupt"
+    agent._open_steer_window()   # a live turn: run_conversation() opens it (never called in this unit test)
     runner._session_state(key).turn.agent = agent
     adapter._active_sessions[key] = asyncio.Event()
     ambient = get_hermes_home_override()

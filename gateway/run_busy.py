@@ -310,9 +310,13 @@ class GatewayBusySessionMixin:
 
     def _steer_running_agent(self, running_agent: Any, text: str) -> bool:
         """``running_agent.steer(text)`` plus fan-out to its active subagents (see
-        :meth:`_steer_active_subagents`); True when the parent or any child queued it."""
-        accepted = bool(running_agent.steer(text))
-        return bool(self._steer_active_subagents(running_agent, text)) or accepted
+        :meth:`_steer_active_subagents`). The parent decides: when its turn already made its last read
+        it refuses, and nothing is fanned out (a post-turn background-review fork would accept the text
+        and drop it with its result), so the caller queues the event as the next turn."""
+        if not running_agent.steer(text):
+            return False
+        self._steer_active_subagents(running_agent, text)
+        return True
 
     async def _session_has_compression_in_flight(self, session_key: str) -> bool:
         """True when a compression lock is held for this session's id (callers demote interrupt →
@@ -1139,7 +1143,7 @@ class GatewayBusySessionMixin:
             logger.warning("Steer failed for session %s: %s", quick_key, exc)
             return t("gateway.steer.failed", error=exc)
         if not accepted:
-            return t("gateway.steer.rejected_empty")
+            return _queue_fallback(t("gateway.steer.queued_no_agent"))   # the turn already made its last read
         self._fold_into_running_turn(running_agent, quick_key, event)
         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
         target = (t("gateway.steer.target_subagents") if self._agent_has_active_subagents(running_agent)

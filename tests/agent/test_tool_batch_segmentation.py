@@ -395,6 +395,7 @@ def agent():
             skip_memory=True,
         )
         a.client = MagicMock()
+        a._open_steer_window()   # _execute_tool_calls runs inside a live turn; run_conversation() opens it
         return a
 
 

@@ -637,24 +637,29 @@ def inject_new_comments_from_env(agent: Any) -> bool:
         _comment_watermark[tid] = max((c.id for c in rows), default=0)
     if seen is None or not rows:
         return False
-    # Advance past everything read (including our own notes) so nothing is re-injected.
-    _comment_watermark[tid] = max(c.id for c in rows)
+    newest = max(c.id for c in rows)
     # Same resolution the write side used, so a worker skips its OWN comments even
     # when the dispatcher did not pin HERMES_PROFILE (echoed notes would otherwise
     # re-enter the live turn as fake operator steering).
     own = _persisted_identity()
     fresh = [c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()]
     if not fresh:
+        _comment_watermark[tid] = newest       # only our own / empty notes: nothing to deliver
         return False
     lines = [f"- {c.author or 'operator'}: {c.body.strip()}" for c in fresh]
     note = ("New note" + ("s" if len(fresh) > 1 else "")
             + " on your kanban task from the operator (delivered mid-run). "
             + "Take it into account for the work you're doing right now:\n" + "\n".join(lines))
     try:
-        return bool(agent.steer(note))
+        accepted = bool(agent.steer(note))
     except Exception:
         logger.debug("comment-inject: steer failed", exc_info=True)
         return False
+    # Advance past what was read only once it was delivered: a turn that already made its last read
+    # of the steer slot refuses it, and the next poll (the next turn's tool boundary) retries it.
+    if accepted:
+        _comment_watermark[tid] = newest
+    return accepted
 
 
 # --- Handlers ---

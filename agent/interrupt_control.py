@@ -278,11 +278,15 @@ class InterruptControlMixin:
 
     def steer(self, text: str) -> bool:
         """Queue user text for delivery as its own user row after the current tool batch finishes (no
-        interrupt); multiple calls concatenate with newlines. Returns False for empty text."""
+        interrupt); multiple calls concatenate with newlines. Returns False for empty text, and once the
+        turn's last read of the slot closed the window (``_close_steer_window``): the caller then queues
+        the message as the next turn instead of parking it where nothing reads it."""
         if not text or not text.strip():
             return False
         cleaned = text.strip()
         with _ic_lock(self, "_pending_steer_lock"):
+            if not getattr(self, "_steer_window_open", True):
+                return False
             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
         # The turn no longer ran on its own (first-task-done detection reads this off the result).
@@ -367,6 +371,23 @@ class InterruptControlMixin:
     def _drain_pending_steer(self) -> Optional[str]:
         """Return the pending steer text (if any) and clear the slot; None when nothing is pending."""
         with _ic_lock(self, "_pending_steer_lock"):
+            text = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
+            self._pending_steer = None
+        return text
+
+    def _open_steer_window(self) -> None:
+        """A turn started: ``steer()`` may queue text for it."""
+        with _ic_lock(self, "_pending_steer_lock"):
+            self._steer_window_open = True
+
+    def _close_steer_window(self) -> Optional[str]:
+        """The turn's last read of the steer slot: close the window and drain under one lock, so a
+        concurrent ``steer()`` is either in the returned text or refused, never parked on an agent no
+        turn will read (2026-10-21: a Feishu card click landed after the finalizer's drain, while the
+        gateway still listed the turn as running, was "steered" and never ran). Same shape as
+        ``tools.delegate_tool_registry._close_subagent_steering``."""
+        with _ic_lock(self, "_pending_steer_lock"):
+            self._steer_window_open = False
             text = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             self._pending_steer = None
         return text

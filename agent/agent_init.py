@@ -542,10 +542,10 @@ _CONTROL_STATE: dict[str, Any] = {
     "_client_lock": threading.RLock,
     "_model_request_active": threading.Event,
     "_supports_active_turn_redirect": True,
-    # /steer: the drain hook appends the note to the last tool result after the current
-    # batch — no interrupt, no new user turn (role alternation preserved).
+    # /steer: delivered after the current tool batch — no interrupt, no new user turn (role alternation preserved).
     "_pending_steer": None,
     "_pending_steer_lock": threading.Lock,
+    "_steer_window_open": False,  # run_conversation() start → finalizer's last read (_close_steer_window)
     # Active-turn redirect: keep the valid turn prefix, cancel only the in-flight request,
     # rebuild the tail with the correction. Drained at a role-safe boundary.
     "_pending_redirect": None,

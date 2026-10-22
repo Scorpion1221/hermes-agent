@@ -467,8 +467,9 @@ class CLILoopsMixin:
             else:
                 if accepted:
                     _cprint(f"  {t('cli.steer.queued', preview=_preview(payload))}")
-                else:
-                    _cprint(f"  {t('cli.steer.rejected_empty')}")
+                else:   # the turn already made its last read of the steer slot: run it as the next turn
+                    self._pending_input.put(payload)
+                    _cprint(f"  {t('cli.steer.no_agent_queued', preview=_preview(payload))}")
         else:
             self._pending_input.put(payload)
             _cprint(f"  {t('cli.steer.no_agent_queued', preview=_preview(payload))}")

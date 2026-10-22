@@ -1736,6 +1736,8 @@ def run_conversation(
 
     # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
     agent._turn_user_intervened = False
+    agent._open_steer_window()
+    late_steer = None
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
     with native_turn_images(user_message):
@@ -1759,6 +1761,10 @@ def run_conversation(
             )
         finally:
             end_voice_turn_route(agent)
+            # Paths that skip the finalizer (codex app-server, early returns, an exception) end here.
+            late_steer = agent._close_steer_window()
+    if late_steer and isinstance(result, dict):
+        result["pending_steer"] = "\n".join(t for t in (result.get("pending_steer"), late_steer) if t)
     result = export_current_turn_boundary(agent, result, user_message)
     if isinstance(result, dict):
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))
