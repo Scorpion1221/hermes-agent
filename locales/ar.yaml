@@ -1359,6 +1359,7 @@ platform:
       already_handled: "تمت معالجتها بالفعل"
       retry: "تعذّر التحقق من الإذن. حاول مرة أخرى"
       handled_by: "✅ عالجها {user}"
+      handled_by_control: "✅ {control} · عالجها {user}"
       stopped_by: "⏹ أوقفه {user}"
     approval:
       action_session: "الجلسة"

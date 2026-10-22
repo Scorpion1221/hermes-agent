@@ -1359,6 +1359,7 @@ platform:
       already_handled: "这张卡片已经处理过了"
       retry: "暂时无法确认权限，请稍后再试"
       handled_by: "✅ 已由 {user} 处理"
+      handled_by_control: "✅ {control} · 已由 {user} 处理"
       stopped_by: "⏹ 已由 {user} 停止"
     approval:
       action_session: "本会话"

@@ -1359,6 +1359,7 @@ platform:
       already_handled: "Zaten işlendi"
       retry: "Yetki doğrulanamadı. Tekrar deneyin"
       handled_by: "✅ {user} tarafından işlendi"
+      handled_by_control: "✅ {control} · {user} tarafından işlendi"
       stopped_by: "⏹ {user} tarafından durduruldu"
     approval:
       action_session: "Oturum"

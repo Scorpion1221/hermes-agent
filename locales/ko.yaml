@@ -1359,6 +1359,7 @@ platform:
       already_handled: "이미 처리된 카드입니다"
       retry: "권한을 확인하지 못했습니다. 다시 시도하세요"
       handled_by: "✅ {user} 님이 처리함"
+      handled_by_control: "✅ {control} · {user} 님이 처리함"
       stopped_by: "⏹ {user} 님이 중지함"
     approval:
       action_session: "세션"

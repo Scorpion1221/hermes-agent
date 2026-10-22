@@ -11,8 +11,8 @@ running in its chat (and topic) when it was sent, however it was sent (the adapt
 (sent before a restart) answers the sender of the message it replies to, through the bot's own replies but
 never a topic's root; a card that answers nobody is for admins. An allowed click gets a toast at once and
 reaches the agent as ``card:<tag> <json>`` (what the user did), from the clicker, quoting the card, in the
-card's chat and topic; then the card is redrawn with its controls disabled and who handled it. A later click
-on the same card only gets a toast.
+card's chat and topic; then the card is redrawn with its controls disabled, who handled it and, when the click
+says which, the button they pressed (:func:`_pressed_button`). A later click on the same card only gets a toast.
 
 The callback names the card (``open_message_id``) but not its topic, so the card is fetched for its
 ``thread_id``; when that fails the click still reaches the agent, outside any topic. Its ``message_id``
@@ -313,8 +313,10 @@ async def _mark_card_answered(adapter: Any, click: _Click, *, data: Any = None,
         if card is None:
             return
         name = await adapter._resolve_sender_name_from_api(click.user_id or click.open_id) or click.open_id
-        content = json.dumps(answered_card(card, t(note_key, user=name), submitted=_submitted(data)),
-                             ensure_ascii=False)
+        pressed = _pressed_button(card, data) if note_key == "platform.feishu.card_action.handled_by" else ""
+        note = (t("platform.feishu.card_action.handled_by_control", user=name, control=pressed) if pressed
+                else t(note_key, user=name))
+        content = json.dumps(answered_card(card, note, submitted=_submitted(data)), ensure_ascii=False)
         response = await adapter._run_blocking(adapter._client.im.v1.message.patch,
                                                _patch_request(click.card_id, content))
         if not adapter._response_succeeded(response):
@@ -322,6 +324,41 @@ async def _mark_card_answered(adapter: Any, click: _Click, *, data: Any = None,
                            getattr(response, "code", None), getattr(response, "msg", None))
     except Exception:
         logger.warning("[Feishu] Could not mark card %s answered", click.card_id, exc_info=True)
+
+
+def _pressed_button(card: dict[str, Any], data: Any) -> str:
+    """The text of the button this click pressed, as ``card`` (the stored copy) shows it; "" when the click can't say.
+    A form's submit button is named in the callback (``action.name``). A plain button's callback carries only its
+    value, and Feishu's stored copy of a card keeps no values (verified 2026-10-22), so a plain button is known only
+    when it is the card's one enabled button that may call back: a link button does not, unless ``complex_interaction``
+    makes its link call back too. The control goes first in the note, so ``已由 X 处理`` / ``Handled by X<`` still
+    end at the clicker's name for tools that read it back."""
+    action = getattr(getattr(data, "event", None), "action", None)
+    name = str(getattr(action, "name", "") or "")
+    buttons = list(_buttons(card))
+    if name:
+        pressed = [b for b in buttons if b.get("name") == name]
+    elif str(getattr(action, "tag", "") or "button") == "button":
+        pressed = [b for b in buttons if not b.get("disabled")
+                   and (b.get("complex_interaction") is True or not (b.get("url") or b.get("multi_url")))]
+    else:
+        pressed = []
+    text = pressed[0].get("text") if len(pressed) == 1 else None
+    if not isinstance(text, dict):
+        return ""
+    i18n = text.get("i18n_content") if isinstance(text.get("i18n_content"), dict) else {}
+    return str(text.get("content") or next(iter(i18n.values()), "") or "").strip()
+
+
+def _buttons(node: Any) -> Any:
+    if isinstance(node, list):
+        for child in node:
+            yield from _buttons(child)
+    elif isinstance(node, dict):
+        if node.get("tag") == "button":
+            yield node
+        for child in node.values():
+            yield from _buttons(child)
 
 
 async def _card_definition(adapter: Any, card_id: str) -> Optional[dict[str, Any]]:

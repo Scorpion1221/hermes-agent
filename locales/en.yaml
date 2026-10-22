@@ -1419,6 +1419,7 @@ platform:
       already_handled: "Already handled"
       retry: "Couldn't check who may use this card. Try again"
       handled_by: "✅ Handled by {user}"
+      handled_by_control: "✅ {control} · Handled by {user}"
       stopped_by: "⏹ Stopped by {user}"
     approval:
       # Feishu keeps shorter button words than the shared card (emoji prefixes are added in code).

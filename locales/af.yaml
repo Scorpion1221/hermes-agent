@@ -1359,6 +1359,7 @@ platform:
       already_handled: "Reeds hanteer"
       retry: "Kon nie toestemming nagaan nie. Probeer weer"
       handled_by: "✅ Hanteer deur {user}"
+      handled_by_control: "✅ {control} · Hanteer deur {user}"
       stopped_by: "⏹ Gestop deur {user}"
     approval:
       action_session: "Sessie"

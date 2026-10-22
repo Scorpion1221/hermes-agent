@@ -1359,6 +1359,7 @@ platform:
       already_handled: "Láimhseáilte cheana"
       retry: "Níorbh fhéidir an cead a sheiceáil. Bain triail eile as"
       handled_by: "✅ Láimhseáilte ag {user}"
+      handled_by_control: "✅ {control} · Láimhseáilte ag {user}"
       stopped_by: "⏹ Stoptha ag {user}"
     approval:
       action_session: "Seisiún"

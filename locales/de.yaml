@@ -1359,6 +1359,7 @@ platform:
       already_handled: "Bereits erledigt"
       retry: "Berechtigung konnte nicht geprüft werden. Bitte erneut versuchen"
       handled_by: "✅ Erledigt von {user}"
+      handled_by_control: "✅ {control} · Erledigt von {user}"
       stopped_by: "⏹ Gestoppt von {user}"
     approval:
       action_session: "Sitzung"

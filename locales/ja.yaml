@@ -1359,6 +1359,7 @@ platform:
       already_handled: "このカードは処理済みです"
       retry: "権限を確認できませんでした。もう一度お試しください"
       handled_by: "✅ {user} が対応済み"
+      handled_by_control: "✅ {control} · {user} が対応済み"
       stopped_by: "⏹ {user} が停止"
     approval:
       action_session: "セッション中"

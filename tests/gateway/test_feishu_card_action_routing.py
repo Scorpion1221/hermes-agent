@@ -396,6 +396,114 @@ def test_the_answered_card_shows_what_was_submitted_not_the_initial_selection(ca
     assert all(e.get("disabled") is True for e in frozen)
 
 
+_PREVIEW = {"schema": "2.0", "body": {"elements": [
+    {"tag": "markdown", "content": "🟢 Web Client"},
+    {"tag": "form", "name": "swp_approve_form", "elements": [
+        {"tag": "multi_select_static", "name": "releases", "selected_values": ["r1", "r2"], "options": []},
+        {"tag": "button", "name": "swp_approve", "form_action_type": "submit", "text": {"tag": "plain_text", "content": "上线所选"}},
+        {"tag": "button", "name": "swp_decline", "form_action_type": "submit", "text": {"tag": "plain_text", "content": "暂不上线"}},
+    ]},
+]}}
+
+
+def _answered_note(card, **action):
+    """The note under ``card`` after ``ou_asker`` clicked it with these callback ``action`` fields."""
+    adapter = _clickable()
+    get = adapter._client.im.v1.message.get.side_effect
+
+    def _get(request):
+        if getattr(request, "card_msg_content_type", None) == "user_card_content":
+            return SimpleNamespace(success=lambda: True, data=SimpleNamespace(
+                items=[SimpleNamespace(body=SimpleNamespace(content=json.dumps(card)))]))
+        return get(request)
+
+    adapter._client.im.v1.message.get = Mock(side_effect=_get)
+    value = action.pop("value", {"swp": "approve", "hermes_card_click": "anyone"})
+    data = _click("tok_1", value=value, **action)
+    data.event.operator = SimpleNamespace(open_id="ou_asker", user_id=None, union_id=None)
+    with _LoopThread() as loop:
+        adapter._loop = loop
+        adapter._on_card_action_trigger(data)
+    return _patched_card(adapter)["body"]["elements"][-1]["content"]
+
+
+@pytest.mark.parametrize(("name", "label"), [("swp_approve", "上线所选"), ("swp_decline", "暂不上线")])
+def test_the_answered_card_names_the_button_that_was_pressed(callback_types, name, label):
+    """2026-10-21: a release card only said 「已由 X 处理」, so nobody (nor the release gate reading it back) could tell
+    an approve from a decline. A form's submit button is named in the callback: the note says which one."""
+    from agent.i18n import t
+
+    note = _answered_note(_PREVIEW, name=name, form_value={"releases": ["r1"]})
+
+    assert t("platform.feishu.card_action.handled_by_control", user="Asker", control=label) in note
+
+
+def test_a_plain_button_is_named_when_it_is_the_only_one_that_calls_back(callback_types):
+    """A plain button's callback carries only its value and the stored card keeps no values; with one callback
+    button (a link button never calls back) there is nothing to tell apart."""
+    from agent.i18n import t
+
+    note = _answered_note(_DSL)  # 9:00 (callback) + Docs (link)
+
+    assert t("platform.feishu.card_action.handled_by_control", user="Asker", control="9:00") in note
+
+
+def test_a_link_button_that_also_calls_back_is_not_ruled_out(callback_types):
+    """``complex_interaction`` makes a link button call back too: with another callback button beside it the click
+    can't say which was pressed, so the note names neither (never the other one)."""
+    from agent.i18n import t
+
+    card = {"schema": "2.0", "body": {"elements": [
+        {"tag": "button", "text": {"tag": "plain_text", "content": "打开并批准"}, "url": "https://ci/run/1",
+         "complex_interaction": True},
+        {"tag": "button", "text": {"tag": "plain_text", "content": "拒绝"}},
+    ]}}
+
+    note = _answered_note(card, value={"op": "approve"})
+
+    assert note == f"<font color='grey'>{t('platform.feishu.card_action.handled_by', user='Asker')}</font>"
+
+
+@pytest.mark.parametrize("lang", ["zh", "en"])
+def test_a_reader_of_the_note_still_gets_the_clicker_alone(lang):
+    """Tools read the clicker back off the note (the swp release gate: ``已由 (.+?) 处理|Handled by (.+?)<``); the
+    pressed control must not end up inside that name."""
+    import re
+
+    from agent.i18n import t
+    from plugins.platforms.feishu.feishu_card_action import answered_card
+
+    note = t("platform.feishu.card_action.handled_by_control", lang=lang, user="Guo Baoqi", control="上线所选")
+    body = json.dumps(answered_card({"schema": "2.0", "body": {"elements": []}}, note), ensure_ascii=False)
+
+    hit = re.search(r"已由 (.+?) 处理|Handled by (.+?)<", body)
+    assert hit and next(g for g in hit.groups() if g) == "Guo Baoqi"
+
+
+def test_a_click_that_cannot_say_which_button_keeps_the_plain_note(callback_types):
+    from agent.i18n import t
+
+    two_plain = {"schema": "2.0", "body": {"elements": [
+        {"tag": "button", "name": "a", "text": {"tag": "plain_text", "content": "上线"}},
+        {"tag": "button", "name": "b", "text": {"tag": "plain_text", "content": "暂不上线"}},
+    ]}}
+
+    note = _answered_note(two_plain)
+
+    assert note == f"<font color='grey'>{t('platform.feishu.card_action.handled_by', user='Asker')}</font>"
+
+
+def test_a_stop_button_keeps_its_stopped_note(callback_types):
+    from agent.i18n import t
+
+    stop = {"schema": "2.0", "body": {"elements": [
+        {"tag": "button", "name": "swp_stop", "text": {"tag": "plain_text", "content": "停止上线"}}]}}
+
+    note = _answered_note(stop, value={"hermes_card_command": "stop", "hermes_card_click": "anyone"})
+
+    assert note == f"<font color='grey'>{t('platform.feishu.card_action.stopped_by', user='Asker')}</font>"
+
+
 def test_someone_else_in_the_group_is_refused_and_the_card_stays_as_it_was(callback_types):
     adapter = _clickable()
 

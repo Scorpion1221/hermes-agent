@@ -1376,6 +1376,7 @@ platform:
       already_handled: "Már feldolgozva"
       retry: "Nem sikerült ellenőrizni a jogosultságot. Próbáld újra"
       handled_by: "✅ Feldolgozta: {user}"
+      handled_by_control: "✅ {control} · Feldolgozta: {user}"
       stopped_by: "⏹ Leállította: {user}"
     approval:
       action_session: "Munkamenet"
