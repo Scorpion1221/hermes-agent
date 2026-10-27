@@ -193,3 +193,34 @@ def test_one_store_through_symlinked_homes_keeps_one_pm_runtime(tmp_path, monkey
     for tools in (home / "tools", task / "tools", real, home / "tools"):
         assert launch(tools) == current
     assert len(staged) == 1
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.require_symlinks
+def test_a_task_home_stages_the_pm_runtime_against_the_real_interpreter(tmp_path, monkeypatch):
+    """A generation staged from a per-task home lives on in the owner's installs/: its venv must
+    not point at the task's tools/ link, which dies with the task."""
+    from pm import runtime
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text("[project]\nname = 'fixture'\n")
+    (project / "uv.lock").write_text("version = 1\n")
+    real = tmp_path / "home" / "tools"
+    (real / "python" / "bin").mkdir(parents=True)
+    (real / "python" / "bin" / "python3").touch()
+    task = tmp_path / "task"
+    task.mkdir()
+    (task / "tools").symlink_to(real, target_is_directory=True)
+    staged = []
+
+    def stage(uv, python, environment, **_):
+        staged.append(python)
+        environment.mkdir(parents=True)
+        return runtime._python(environment)
+
+    monkeypatch.setattr("pm.runtime_stage.stage_runtime", stage)
+    monkeypatch.setattr(runtime, "_hold_for_children", lambda environment: None)
+    runtime.prepare_runtime(task / "tools" / "uv", task / "tools" / "python" / "bin" / "python3",
+                            tmp_path / "pm-runtime", project=project)
+    assert staged == [real.resolve() / "python" / "bin" / "python3"]

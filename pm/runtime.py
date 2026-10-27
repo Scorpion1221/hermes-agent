@@ -163,7 +163,12 @@ def prepare_runtime(uv: Path, python: Path, root: Path, *, offline: bool = False
         environment = root / generation
         try:
             print("Preparing the isolated Hermes runtime…", file=sys.stderr, flush=True)
-            executable = stage_runtime(uv, python, environment, project=project, offline=offline, cache=cache)
+            # The generation outlives the launching home: a per-task home whose tools/ links back
+            # must not leave the venv pointing at a path that dies with the task. Directories only,
+            # as in _inputs; Windows keeps the spelling (resolve() turns a mapped drive into UNC).
+            staged_python = python if os.name == "nt" else python.parent.resolve() / python.name
+            executable = stage_runtime(uv, staged_python, environment, project=project, offline=offline,
+                                       cache=cache)
             (environment / ".lease-managed").touch()
             _write(environment / "pm-runtime.json", {"inputs": identity})
             _write(selected, {"inputs": identity, "generation": generation.as_posix()})

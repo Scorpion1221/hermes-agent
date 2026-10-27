@@ -1,9 +1,10 @@
 """prepare_launch() recognizes the store interpreter it would re-exec into (#122513).
 
-PM spells the store Python through HERMES_HOME, which may contain '..', while
-the OS reports ``sys.executable`` normalized. The identity check must be
-lexical: comparing the raw spellings relaunched every child forever, and
-following symlinks would treat a venv interpreter as the store interpreter.
+PM spells the store Python through HERMES_HOME, which may contain '..' or a
+linked tools/, while the OS reports ``sys.executable`` normalized. The identity
+check follows directories, never the file: comparing the raw spellings
+relaunched every child forever, and following the file's own link would treat
+a venv interpreter as the store interpreter.
 """
 
 from __future__ import annotations

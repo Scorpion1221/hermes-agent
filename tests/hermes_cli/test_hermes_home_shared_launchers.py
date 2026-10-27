@@ -7,6 +7,7 @@ still relaunch into its own root's Python.
 """
 import json
 import os
+import sys
 from pathlib import Path
 
 import pm
@@ -147,3 +148,72 @@ def test_dead_exe_never_shadows_kept_cmd(tmp_path, monkeypatch):
     # that would have run instead of it is gone.
     assert local / "hermes.cmd" in written
     assert not (local / "hermes.exe").exists()
+
+
+def _task_home(tmp_path: Path, owner: Path) -> Path:
+    """A per-task HERMES_HOME (Multica) whose tools/ and installs/ link back to the owner's."""
+    task = tmp_path / "workspaces" / "task-1" / "hermes-home"
+    task.mkdir(parents=True)
+    (owner / "installs").mkdir(exist_ok=True)
+    for name in ("tools", "installs"):
+        (task / name).symlink_to(owner / name, target_is_directory=True)
+    return task
+
+
+def _installed_checkout(tmp_path: Path, monkeypatch) -> tuple[Path, Path, Path]:
+    """The default root's checkout at <home>/hermes-agent, its launchers published by the owner."""
+    from pm.environments import install_key
+
+    owner, python = _make_home(tmp_path, ".hermes")
+    repo = owner / "hermes-agent"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "0"\n', encoding="utf-8")
+    (repo / "install-stamp.json").write_text(json.dumps({"updateMechanism": "self"}), encoding="utf-8")
+    facts = owner / "installs" / install_key(repo) / "facts.json"
+    facts.parent.mkdir(parents=True)
+    facts.write_text(json.dumps({"packages": {"venv": {"stamp": "complete"}}}), encoding="utf-8")
+    _isolate(tmp_path, monkeypatch, owner)
+    _publish(repo)
+    return owner, repo, python
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.require_symlinks
+def test_symlinked_task_home_never_binds_launchers_to_its_own_spelling(tmp_path, monkeypatch):
+    """A task home that links tools/ back to the owner's store reaches the same interpreter, but its
+    spelling dies with the task: a launcher published through it exits 127 once the workspace is
+    cleaned, and the next supervised gateway restart cannot start."""
+    import shutil
+
+    owner, repo, python = _installed_checkout(tmp_path, monkeypatch)
+    before = {name: (repo / ".hermes" / "bin" / name).read_bytes() for name in _launchers.ENTRY_POINTS}
+
+    task = _task_home(tmp_path, owner)
+    _isolate(tmp_path, monkeypatch, task)
+    monkeypatch.setattr(pm, "venv_is_current", lambda **kwargs: True)
+    venv_sync.prepare_launch(repo, [])
+    _publish(repo)  # an explicit sync from the task publishes too
+
+    for name, content in before.items():
+        assert (repo / ".hermes" / "bin" / name).read_bytes() == content
+    shutil.rmtree(task.parent)
+    for name in before:
+        assert _launchers._launcher_python(repo / ".hermes" / "bin" / name) == python
+        assert python.is_file()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.require_symlinks
+def test_launch_through_the_shared_launcher_under_a_task_home_is_current(tmp_path, monkeypatch):
+    """The shared launcher execs the store Python by its real path; the task home spells the same
+    interpreter through its link. Same interpreter: no relaunch, no republication."""
+    owner, repo, python = _installed_checkout(tmp_path, monkeypatch)
+    task = _task_home(tmp_path, owner)
+    _isolate(tmp_path, monkeypatch, task)
+    monkeypatch.setattr(pm, "venv_is_current", lambda **kwargs: True)
+    monkeypatch.setattr(sys, "executable", str(python))
+    published = []
+    monkeypatch.setattr(venv_sync, "publish_launchers", published.append)
+
+    assert venv_sync.prepare_launch(repo, []) is None
+    assert published == []

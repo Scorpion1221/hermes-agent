@@ -130,6 +130,18 @@ def resolve_store_python(repo_root: Path, *, publication: bool = False) -> Path 
     return _store_python(store_root(repo_root))
 
 
+def canonical_interpreter(python: Path) -> Path:
+    """*python* through its real directories, its file name as spelled.
+
+    A per-task HERMES_HOME whose tools/ links back to the owner's store reaches
+    the same interpreter by a path that dies with the task. Only directories
+    resolve: the pinned bin/python3 is itself a symlink, and a venv python
+    linked to the store binary is still a different interpreter. Windows keeps
+    the spelling: resolve() there turns a mapped drive into its UNC share."""
+    python = Path(python)
+    return python if _is_windows() else python.parent.resolve() / python.name
+
+
 def _store_python(runtime: Path) -> Path | None:
     rel = "python.exe" if _is_windows() else "bin/python3"
 
@@ -555,7 +567,8 @@ def stage_launcher(name: str, repo_root: Path, out_dir: Path) -> Path | None:
     # runtime override must not displace the tree's own interpreter.
     store_python = resolve_store_python(repo_root, publication=True)
     if store_python is not None:
-        path = mint_launcher(name, repo_root, out_dir, store_python, None)
+        # Nor may the launching home's spelling of that store.
+        path = mint_launcher(name, repo_root, out_dir, canonical_interpreter(store_python), None)
         if path is not None and path.suffix == ".cmd":
             # cmd.exe prefers .exe. An older launcher must not shadow the
             # newly published command when distlib is unavailable.

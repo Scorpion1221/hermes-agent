@@ -432,12 +432,14 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     python = resolve_store_python(root)
     if python is None:
         raise RuntimeError("source update has no managed Python; run `hermes pm install`")
-    # Lexical identity, never resolve(): PM spells the store path through
-    # HERMES_HOME (which may carry '..') while sys.executable arrives
-    # normalized, so a raw compare re-execs every child forever (#122513). A
-    # venv interpreter symlinked to the same binary is still a different
-    # interpreter (its own sys.prefix) and must re-exec once.
-    same = os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable))
+    # Identity through real directories, never the file: PM spells the store
+    # path through HERMES_HOME (which may carry '..' or, in a per-task home, a
+    # tools/ link back to the owner's store) while the shared launcher execs it
+    # by its real path, so a raw compare re-execs every child forever (#122513)
+    # and republishes the launchers on every task launch. A venv interpreter
+    # symlinked to the same binary is still a different interpreter (its own
+    # sys.prefix) and must re-exec once.
+    same = _same_interpreter(python, sys.executable)
     if not current or not same:
         publish_launchers(root)
         return python
@@ -460,7 +462,6 @@ def _prepare_borrowed_launch(root: Path, owner: Path, *, current: bool) -> Path 
     borrowing launch cannot rebind the shared launchers, rebuild products another root is
     serving, or race the owner's tail under a lock that lives in a different home.
     """
-    import os
     import sys
     import pm
     from hermes_cli._launchers import resolve_store_python
@@ -480,8 +481,18 @@ def _prepare_borrowed_launch(root: Path, owner: Path, *, current: bool) -> Path 
     python = resolve_store_python(root)
     if python is None:
         raise RuntimeError("source update has no managed Python; run `hermes pm install`")
-    same = os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable))
+    same = _same_interpreter(python, sys.executable)
     return python if not current or not same else None
+
+
+def _same_interpreter(python: Path, executable: str) -> bool:
+    import os
+    from hermes_cli._launchers import canonical_interpreter
+
+    def key(path) -> str:
+        return os.path.normcase(canonical_interpreter(Path(os.path.abspath(path))))
+
+    return key(python) == key(executable)
 
 
 def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
