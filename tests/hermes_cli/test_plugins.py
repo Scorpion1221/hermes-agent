@@ -2001,7 +2001,7 @@ class TestGetPreVerifyContinueMessage:
 
 
 class TestThreadToolWhitelist:
-    """Tests for the thread-local tool whitelist used by background review forks."""
+    """Tests for the context-scoped tool whitelist used by background review / side-question forks."""
 
     def test_allowed_tool_passes_through_to_hooks(self, monkeypatch):
         from hermes_cli.plugins import (

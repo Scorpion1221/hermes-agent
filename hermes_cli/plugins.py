@@ -1945,7 +1945,8 @@ def fire_pre_command_hook(
         logger.debug("pre_command hook dispatch failed (non-fatal): %s", exc)
 
 
-_thread_tool_whitelist = threading.local()
+# ContextVar, not threading.local: tools run on workers that copy the caller's context.
+_tool_whitelist: contextvars.ContextVar[Optional[tuple]] = contextvars.ContextVar("tool_whitelist", default=None)
 
 
 @dataclass(frozen=True)
@@ -1960,12 +1961,11 @@ def set_thread_tool_whitelist(
     allowed: Optional[set[str]],
     deny_msg_fmt: str = "Tool '{tool_name}' denied: not in this thread's tool whitelist",
 ) -> None:
-    _thread_tool_whitelist.allowed = allowed
-    _thread_tool_whitelist.fmt = deny_msg_fmt
+    _tool_whitelist.set(None if allowed is None else (frozenset(allowed), deny_msg_fmt))
 
 
 def clear_thread_tool_whitelist() -> None:
-    _thread_tool_whitelist.allowed = None
+    _tool_whitelist.set(None)
 
 
 def _get_pre_tool_call_directive_details(
@@ -1979,10 +1979,9 @@ def _get_pre_tool_call_directive_details(
     ``block`` > ``approve`` > none, not registration order: any plugin's valid veto wins over an
     earlier plugin's request for human confirmation (#87420); among approves the first valid one
     wins. Irrelevant returns are ignored."""
-    allowed = getattr(_thread_tool_whitelist, "allowed", None)
-    if allowed is not None and tool_name not in allowed:
-        fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
-        return _PreToolCallDirective(action="block", message=fmt.format(tool_name=tool_name))
+    if (whitelist := _tool_whitelist.get()) is not None and tool_name not in whitelist[0]:
+        logger.info("Tool whitelist blocked %s (session %s)", tool_name, session_id or "-")
+        return _PreToolCallDirective(action="block", message=whitelist[1].format(tool_name=tool_name))
     from hermes_cli.lifecycle import invoke_hook as invoke_lifecycle_hook
     hook_results = invoke_lifecycle_hook(
         "pre_tool_call", tool_name=tool_name, args=args if isinstance(args, dict) else {},
