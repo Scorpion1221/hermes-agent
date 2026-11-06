@@ -74,7 +74,6 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
         from tools.environments.base import touch_activity_if_due
     except Exception:  # pragma: no cover - optional
         touch_activity_if_due = None
-    from tools.interrupt import is_interrupted
     deadline = None if timeout is None or float(timeout) <= 0.0 else time.monotonic() + float(timeout)
     activity_state = {"last_touch": time.monotonic(), "start": time.monotonic()}
     while True:
