@@ -532,7 +532,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             agent.interim_assistant_callback = None
             agent.thinking_progress = False
         ctx.agent_holder[0] = agent  # interrupt support
-        runner._register_live_turn_agent(ctx.session_key, agent)  # /stop reaches it until the thread exits
+        register_live = getattr(runner, "_register_live_turn_agent", None)  # absent on bare runner stubs
+        if callable(register_live):
+            register_live(ctx.session_key, agent)  # /stop reaches it until the thread exits
         # This turn owns the agent from here: a steer latched before adoption (adopt_agent below) or a
         # queued-prompt transfer landing before run_conversation starts is this turn's, not refused.
         open_steer_window = getattr(agent, "_open_steer_window", None)

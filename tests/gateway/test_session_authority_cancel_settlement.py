@@ -209,8 +209,7 @@ def _wire_turn_agent(authority, generation, agent):
         process_baseline=None, run_generation=0, voice_turn=False)
     holder = SimpleNamespace(
         _ctx=ctx, _approval_owner=(authority, 's', generation),
-        _runner=SimpleNamespace(_service_tier=None, _consume_pending_turn_sidecar_notes=lambda key: [],
-                                _register_live_turn_agent=lambda key, agent: None),
+        _runner=SimpleNamespace(_service_tier=None, _consume_pending_turn_sidecar_notes=lambda key: []),
         _make_bg_review_callbacks=lambda: (lambda message: None, lambda: None),
         _merge_turn_request_overrides=TurnRunner._merge_turn_request_overrides,
         _clarify_callback_sync=lambda *a, **k: None, _notice_callback_sync=lambda *a, **k: None,

@@ -127,7 +127,7 @@ def test_interrupt_before_any_wait_does_not_blame_another_process():
     agent = _agent(_Db(acquired=False), _interrupt_requested=True)
     agent.clear_interrupt = lambda: None
     reply = _admit(agent).early_result["final_response"]
-    assert "another Hermes process" not in reply and "not processed" in reply
+    assert "Stopped waiting" not in reply and "not processed" in reply
 
     class _HeldDb(_Db):
         def acquire_session_turn_lease(self, session_id, holder, **kwargs):
@@ -136,7 +136,7 @@ def test_interrupt_before_any_wait_does_not_blame_another_process():
 
     agent = _agent(_HeldDb(), _interrupt_requested=True)
     agent.clear_interrupt = lambda: None
-    assert "another Hermes process" in _admit(agent).early_result["final_response"]
+    assert "Stopped waiting for the other turn" in _admit(agent).early_result["final_response"]
 
 
 def _active_lease(db):
