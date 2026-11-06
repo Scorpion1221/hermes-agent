@@ -17,7 +17,9 @@ from gateway.config import PlatformConfig
 def _adapter():
     from plugins.platforms.feishu.adapter import FeishuAdapter
 
-    return FeishuAdapter(PlatformConfig())
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._admins = {"ou_clicker"}  # card clicks need an authorized operator (Feishu admin here)
+    return adapter
 
 
 class _Response:

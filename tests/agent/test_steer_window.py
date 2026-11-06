@@ -161,3 +161,16 @@ def test_close_is_atomic_with_the_last_read():
     assert sorted(lines) == sorted(accepted)
     assert refused and not set(refused) & set(lines)
     assert agent._drain_pending_steer() is None
+
+
+def test_closing_the_window_keeps_a_ticketed_transfer_for_its_settlement():
+    """The last read hands back only ticketless steers; a queued-prompt transfer stays buffered so the
+    gateway's settlement withdraws it back to its queue place, and the closed window refuses the rest."""
+    agent = _agent()
+    agent._open_steer_window()
+    assert agent.steer("typed /steer") is True
+    assert agent.steer("queued prompt", ticket="adm-1") is True
+    assert agent._close_steer_window() == "typed /steer"
+    assert agent.steer("late click") is False
+    assert agent.withdraw_steer("adm-1") is True            # never delivered: back to its queue
+    assert agent._drain_pending_steer() is None

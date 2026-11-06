@@ -215,6 +215,14 @@ def _startup_harness(monkeypatch, tmp_path):
 
     class _CleanExitRunner:
         def __init__(self, config):
+            # Start-up builds the profile's session authority from the runner's real stores.
+            from gateway.session import SessionStore
+            from hermes_constants import get_hermes_home
+            from hermes_state import SessionDB
+            self.session_store = SessionStore(get_hermes_home() / "sessions", config)
+            self._session_db = SessionDB(get_hermes_home() / "state.db")
+            self.session_store._db = self._session_db
+            self._draining = False
             self.config = config
             self.should_exit_cleanly = True
             self.exit_reason = None
@@ -226,7 +234,8 @@ def _startup_harness(monkeypatch, tmp_path):
             return True
 
         async def stop(self):
-            return None
+            self.session_store.close_all_db_handles()
+            self._session_db.close()
 
     monkeypatch.setattr("gateway.run._host_attach_or_none", AsyncMock(return_value=None))
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)

@@ -258,6 +258,7 @@ class TestResolveApproval:
             "session_key": "sess-7", "message_id": "om_card", "chat_id": "oc_12345", "thread_id": "omt_topic",
         }
         adapter.send = AsyncMock()
+        adapter.set_authorization_check(lambda *_a, **_kw: True)  # the clicker may answer the card
 
         with patch("tools.approval.resolve_gateway_approval", return_value=0):
             await adapter._resolve_approval(7, "once", "Norbert", open_id="ou_user1", chat_id="oc_12345")

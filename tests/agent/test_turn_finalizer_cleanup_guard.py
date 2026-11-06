@@ -165,7 +165,8 @@ def test_a_ticketed_steer_stays_out_of_the_leftover_follow_up():
     """A gateway transfer still buffered when the turn ends is not this turn's leftover steer: the
     finalizer hands back only ticketless steers, so settlement returns the transfer to its queue."""
     agent = _StubAgent(raise_in=())
-    agent._drain_leftover_steer = lambda: "typed /steer"
+    # The finalizer's last read (_close_steer_window) takes only the ticketless steers.
+    agent._close_steer_window = lambda: "typed /steer"
     agent._drain_pending_steer = lambda: "typed /steer\nqueued prompt"
     assert _run(agent)["pending_steer"] == "typed /steer"
 

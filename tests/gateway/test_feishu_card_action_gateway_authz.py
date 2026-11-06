@@ -60,6 +60,8 @@ def _make_adapter(*, allowed=(), admins=()) -> FeishuAdapter:
     adapter._loop.is_closed = MagicMock(return_value=False)
     adapter._allowed_group_users = set(allowed)
     adapter._admins = set(admins)
+    # Every clicker's display name is already cached, so the click resolves without a name lookup.
+    adapter._get_cached_sender_name = lambda sender_id: f"name-{sender_id}" if sender_id else None
     adapter._approval_state[1] = {"session_key": "sess-1", "message_id": "msg-1", "chat_id": "oc_group"}
     adapter._update_prompt_state[2] = {"session_key": "sess-2", "message_id": "msg-2", "chat_id": "oc_group"}
     return adapter
