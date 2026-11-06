@@ -152,6 +152,8 @@ class TextDebounceMixin:
         """Cancel and drop pending text debounce state for control commands; returns the dropped
         burst so an async caller can clear its "waiting" marker."""
         state = self._text_debounce_store().pop(session_key, None)
+        from gateway.session_ingress_burst import discard_busy_burst
+        discard_busy_burst(self, session_key)  # the shared runtime's held burst goes with it
         if state is None:
             return None
         state.cancel_timer()
