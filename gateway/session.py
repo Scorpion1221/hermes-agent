@@ -154,6 +154,10 @@ class SessionSource:
         if self.auto_thread_created:
             d["auto_thread_created"] = True
         _optional(self._OPTIONAL_TAIL)
+        if self.auth_aliases:
+            # Authorization-only ids (Feishu open_id/union_id beside the tenant user_id): a stored
+            # admission is re-authorized when it drains, so they must survive the round trip.
+            d["auth_aliases"] = list(self.auth_aliases)
         return d
 
     @classmethod
@@ -167,7 +171,8 @@ class SessionSource:
             platform=Platform(data["platform"]), chat_id=str(data["chat_id"]),
             chat_type=data.get("chat_type", "dm"),
             scope_id=data.get("scope_id", data.get("guild_id")),
-            auto_thread_created=bool(data.get("auto_thread_created", False)), **plain,
+            auto_thread_created=bool(data.get("auto_thread_created", False)),
+            auth_aliases=tuple(str(a) for a in data.get("auth_aliases") or () if a), **plain,
         )
 
 

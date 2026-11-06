@@ -73,3 +73,22 @@ def test_a_source_without_aliases_is_judged_on_its_user_id_only(monkeypatch):
     source = SessionSource(platform=Platform.FEISHU, chat_id="oc_dm", chat_type="dm", user_id="u_tenant_alice")
 
     assert _runner()._is_user_authorized(source) is False
+
+
+def test_the_aliases_survive_the_stored_admission_round_trip(monkeypatch):
+    """The durable FIFO stores the source as JSON and re-authorizes it when the row drains. Losing the
+    aliases there refused a sender intake had just admitted, and paused the chat (2026-11-06)."""
+    monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_alice")
+    source = _source_for("ou_alice", "u_tenant_alice", "on_alice")
+
+    restored = SessionSource.from_dict(source.to_dict())
+
+    assert restored.auth_aliases == source.auth_aliases
+    assert _runner()._is_user_authorized(restored) is True
+
+
+def test_a_source_without_aliases_stores_none():
+    source = SessionSource(platform=Platform.FEISHU, chat_id="oc_dm", chat_type="dm", user_id="u_x")
+
+    assert "auth_aliases" not in source.to_dict()  # byte-stable wire for every other source
+    assert SessionSource.from_dict(source.to_dict()).auth_aliases == ()
