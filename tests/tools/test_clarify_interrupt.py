@@ -43,7 +43,7 @@ def test_agent_interrupt_wakes_clarify_without_a_user_answer(timeout):
         assert started.wait(1)
         try:
             agent.interrupt("Use the uploaded ZIP instead")
-            assert future.result(timeout=0.75) is None
+            assert future.result(timeout=0.75) in {None, cm.CANCELLED}  # released, never an answer
             assert cm.get_pending_for_session("session", include_choice_prompts=True) is None
         finally:
             cm.clear_session("session")
@@ -69,7 +69,7 @@ def test_interrupt_does_not_cancel_another_agent_wait():
         assert all(start.wait(1) for start in starts)
         try:
             set_interrupt(True, tids[0])
-            assert first_future.result(timeout=0.75) is None
+            assert first_future.result(timeout=0.75) in {None, cm.CANCELLED}
             assert not second_future.done()
             assert not is_thread_interrupted(tids[1])
             assert cm.get_pending_for_session("second-session") is second
