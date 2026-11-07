@@ -35,7 +35,9 @@ from typing import Any, Awaitable, Optional
 logger = logging.getLogger(__name__)
 
 CHAIN_BUDGET_SECONDS = 2.5  # quoted message + ancestor walk + quoted media
-NAMES_BUDGET_SECONDS = 0.5  # one batch lookup naming the chain's senders
+# Naming the chain's senders gets at least this, else whatever the chain left of its budget: the
+# tenant answers contact/v3/users/batch in 0.6-0.9s, and an unnamed author invites a guess.
+NAMES_BUDGET_SECONDS = 0.5
 MAX_ANCESTOR_CHARS = 500
 MAX_ANCESTORS_CHARS = 4000
 MAX_QUOTED_MEDIA = 5
@@ -83,7 +85,8 @@ async def fetch_quoted_reply(
     )
     if folder_text:
         quoted = dataclasses.replace(quoted, text=f"{quoted.text}\n\n{folder_text}" if quoted.text else folder_text)
-    text = await _render(adapter, quoted, ancestors, complete)
+    names_budget = max(NAMES_BUDGET_SECONDS, deadline - asyncio.get_running_loop().time())
+    text = await _render(adapter, quoted, ancestors, complete, names_budget)
     return QuotedReply(
         text=text.replace(_POINTER_END, '"]\n \n') or None, is_own=_is_own(adapter, quoted.sender),
         media_urls=media_urls, media_types=media_types,
@@ -242,10 +245,13 @@ async def _download(
     return urls + folders.media_urls, types + folders.media_types, folders.text
 
 
-async def _render(adapter: Any, quoted: QuoteNode, ancestors: list[QuoteNode], complete: bool) -> str:
+async def _render(
+    adapter: Any, quoted: QuoteNode, ancestors: list[QuoteNode], complete: bool,
+    names_budget: float = NAMES_BUDGET_SECONDS,
+) -> str:
     if not ancestors and complete:
         return quoted.text  # nothing above it: reads exactly as the quoted message
-    await _prefetch_names(adapter, [quoted, *ancestors])
+    await _prefetch_names(adapter, [quoted, *ancestors], names_budget)
     anonymous: dict[str, str] = {}
     kept: list[str] = []
     room = MAX_ANCESTORS_CHARS
@@ -263,7 +269,7 @@ async def _render(adapter: Any, quoted: QuoteNode, ancestors: list[QuoteNode], c
     return "\n".join(lines)
 
 
-async def _prefetch_names(adapter: Any, nodes: list[QuoteNode]) -> None:
+async def _prefetch_names(adapter: Any, nodes: list[QuoteNode], budget: float = NAMES_BUDGET_SECONDS) -> None:
     from .feishu_names import prefetch_user_names
 
     open_ids = [
@@ -271,7 +277,7 @@ async def _prefetch_names(adapter: Any, nodes: list[QuoteNode]) -> None:
         if getattr(sender, "id_type", "") == "open_id" and getattr(sender, "id", None)
     ]
     if open_ids:  # a lookup cut short leaves neutral labels; names it finds later are cached
-        await _within(adapter, prefetch_user_names(adapter, open_ids), NAMES_BUDGET_SECONDS)
+        await _within(adapter, prefetch_user_names(adapter, open_ids), budget)
 
 
 def _one_line(text: str) -> str:

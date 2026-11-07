@@ -233,7 +233,7 @@ def test_chain_senders_get_names_or_neutral_labels_never_raw_ids():
     _adapter, event = reply_to("om_3", client=client)
 
     assert event.reply_to_text.split("\n")[1:4] == [
-        "- Participant 1 (text): from outside",
+        "- Unidentified member 1 (text): from outside",
         "- Bot (card): peer bot answer",
         "Directly quoted message (text, from Bob):",
     ]
@@ -398,11 +398,11 @@ def test_a_stalled_sender_name_lookup_costs_at_most_its_budget_and_leaves_neutra
     first, elapsed, second = asyncio.run(two_replies())
 
     assert lookup_started.is_set()
-    assert elapsed < 3  # stopped at the names' 0.5s budget, not after the 10s stall
+    assert elapsed < 4  # stopped within the chain's 2.5s budget, not after the 10s stall
     assert first.text.split("\n") == [
         "Earlier messages in this reply chain, oldest first:",
-        "- Participant 1 (text): the question",
-        "Directly quoted message (text, from Participant 2):",
+        "- Unidentified member 1 (text): the question",
+        "Directly quoted message (text, from Unidentified member 2):",
         "the answer",
     ]
     assert second.text.split("\n")[1:3] == ["- Alice (text): the question", "Directly quoted message (text, from Bob):"]
@@ -761,3 +761,45 @@ def test_a_slow_quote_in_one_topic_does_not_hold_the_senders_message_in_another(
     )
 
     assert order == ["om_b", "om_a"]
+
+
+def test_a_name_lookup_as_slow_as_the_real_tenant_still_names_the_chain():
+    """The cloud tenant answers contact/v3/users/batch in 0.6-0.9s. The chain's own budget leaves
+    room for that, so the reply chain names its senders instead of reading "Participant 1" and
+    leaving the model to guess who wrote the quoted messages (2026-11-07 group misattribution)."""
+    import time
+
+    import plugins.platforms.feishu.feishu_quote as quote
+
+    messages = {
+        "om_1": [msg("om_1", {"text": "give this sticker a GIF"}, sender="ou_alice")],
+        "om_2": [bot("om_2", card("here it is"), parent="om_1")],
+    }
+    client = ChainFeishu(messages)
+    batch_lookup = client.request
+
+    def tenant_paced_batch_lookup(raw_request):  # on the adapter's SDK executor thread
+        time.sleep(0.9)  # health: allow HX013 -- the tenant's measured lookup latency is the scenario
+        return batch_lookup(raw_request)
+
+    client.request = tenant_paced_batch_lookup
+    adapter = make_adapter(client)
+
+    reply = asyncio.run(quote.fetch_quoted_reply(adapter, "om_2"))
+
+    assert reply.text.split("\n")[:3] == [
+        "Earlier messages in this reply chain, oldest first:",
+        "- Alice (text): give this sticker a GIF",
+        "Directly quoted message (card, from You):",
+    ]
+
+
+def test_an_unnamed_sender_reads_as_an_unidentified_member_not_a_numbered_person():
+    """A label like "Participant 1" reads as a real, known person and invites a guess at who it is."""
+    messages = {"om_1": [msg("om_1", {"text": "from outside"}, sender="ou_external")],
+                "om_2": [msg("om_2", {"text": "from bob"}, parent="om_1", sender="ou_bob")]}
+
+    _adapter, event = reply_to("om_2", client=ChainFeishu(messages))
+
+    first = event.reply_to_text.split("\n")[1]
+    assert first.startswith("- Unidentified member 1 (text):"), first

@@ -256,4 +256,6 @@ def sender_label(adapter: Any, sender: Any, anonymous: dict[str, str]) -> str:
     if getattr(sender, "sender_type", "") == "app":
         return (adapter._bot_name if sender_id and sender_id == adapter._app_id else "") or "Bot"
     name = adapter._get_cached_sender_name(sender_id) if sender_id else None
-    return name or anonymous.setdefault(sender_id, f"Participant {len(anonymous) + 1}")
+    # Numbered so two unnamed authors stay apart, but never a name-like label the model could take
+    # for a known person and resolve to someone in the chat.
+    return name or anonymous.setdefault(sender_id, f"Unidentified member {len(anonymous) + 1}")

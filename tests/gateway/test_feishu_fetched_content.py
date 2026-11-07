@@ -413,10 +413,10 @@ def test_unresolvable_forward_senders_get_neutral_labels_never_raw_ids():
     assert client.user_gets == []
     assert text_out.splitlines()[1:] == [
         "- Alice: from a colleague",
-        "- Participant 1: from outside",
+        "- Unidentified member 1: from outside",
         "- Hermes: from this bot",
         "- Bot: from another bot",
-        "- Participant 1: outside again",
+        "- Unidentified member 1: outside again",
     ]
     assert "ou_" not in text_out and "cli_" not in text_out
 
@@ -433,7 +433,7 @@ def test_a_sender_no_lookup_can_name_is_not_looked_up_again_on_the_next_forward(
     first = inbound_forward(adapter)[0]
     second = inbound_forward(adapter)[0]
 
-    assert first == second == "[Merged forward message]\n- Alice: from a colleague\n- Participant 1: from someone who left"
+    assert first == second == "[Merged forward message]\n- Alice: from a colleague\n- Unidentified member 1: from someone who left"
     assert len(client.batch_gets) == 2 and client.user_gets == []  # refused, then the rest; none on the second
 
 
@@ -569,9 +569,9 @@ def test_context_references_in_a_forward_stay_literal(tmp_path):
     assert (result.references, result.expanded, fetched) == ([], False, [])
     assert "SECRET PLAN" not in result.message
     assert text_out.splitlines()[1:] == [
-        "- Participant 1: fyi ＠file:plan.md",
-        "- Participant 1: see ＠url:http://10.0.0.1/admin and ＠diff",
-        "- Participant 1: @Alice: ok, mail me at alice@example.com",
+        "- Unidentified member 1: fyi ＠file:plan.md",
+        "- Unidentified member 1: see ＠url:http://10.0.0.1/admin and ＠diff",
+        "- Unidentified member 1: @Alice: ok, mail me at alice@example.com",
     ]
 
 
