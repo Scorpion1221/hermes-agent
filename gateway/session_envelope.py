@@ -162,6 +162,12 @@ def _validate_native(runner, event, provenance=None, fresh_roles=False):
         # re-check denied what the inbound filter had just accepted (#139199).
         delegated = runner._adapter_flag(
             source.platform, "authorization_is_upstream", runner._adapter_profile_for_source(source))
+    if not delegated and provenance is not None:
+        # Provenance proves the input came through a live adapter's own callback (a stored route
+        # has none), so the adapter-time grants intake used count here too: a Feishu member let in
+        # only by the chat's explicit ``group_rules`` entry was admitted at intake and refused here,
+        # pausing the chat with permission_denied (2026-11-07). Roles still need ``fresh_roles``.
+        delegated = source.role_authorized is not True
     if not runner._is_user_authorized_for_source(source, allow_adapter_delegation=delegated):
         _refuse(event, 'permission_denied', 'user_not_authorized')
     for name in ('channel_prompt', 'channel_context', 'reply_anchor_override'):
