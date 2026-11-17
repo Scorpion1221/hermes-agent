@@ -86,6 +86,43 @@ async def test_clarify_tap_answers_once_and_only_for_an_authorized_operator(adap
     assert entry.response == "blue"
 
 
+async def _turn(a, open_id, *, thread_id=None, running=True):
+    """``open_id``'s message started a turn in CHAT (and topic): what the processing hooks record."""
+    from gateway.platforms.event import ProcessingOutcome
+
+    a._add_reaction = AsyncMock(return_value=None)  # the turn's badge
+    source = SimpleNamespace(chat_id=CHAT, thread_id=thread_id, user_id=open_id, user_id_alt=None, auth_aliases=())
+    event = SimpleNamespace(message_id=f"om_{open_id}", source=source)
+    await a.on_processing_start(event)
+    if not running:
+        await a.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+
+@pytest.mark.asyncio
+async def test_the_group_member_whose_turn_asked_may_answer_without_being_an_operator(adapter):
+    """Production: a group member (open group, not admin / allowlisted) asked; their tap was refused."""
+    adapter._loop = asyncio.get_running_loop()
+    await _turn(adapter, "ou_asker")
+    values = await _ask(adapter)
+
+    assert _click(adapter, values[1], open_id="ou_bystander") is None  # another member still may not
+    assert cg.get_pending("c1") is not None
+    settled = _click(adapter, values[1], open_id="ou_asker")
+    assert "blue" in settled["elements"][0]["content"] and cg._entries["c1"].response == "blue"
+
+
+@pytest.mark.asyncio
+async def test_a_card_no_running_turn_sent_answers_operators_only(adapter):
+    adapter._loop = asyncio.get_running_loop()
+    await _turn(adapter, "ou_asker", running=False)  # that turn is over
+    await _turn(adapter, "ou_elsewhere", thread_id="omt_other")  # a turn in another topic
+    values = await _ask(adapter)
+
+    assert _click(adapter, values[1], open_id="ou_asker") is None
+    assert _click(adapter, values[1], open_id="ou_elsewhere") is None
+    assert _click(adapter, values[1])["elements"][0]["content"].endswith("blue")
+
+
 @pytest.mark.asyncio
 async def test_other_tap_waits_for_text_and_retire_settles_the_card(adapter):
     adapter._loop = asyncio.get_running_loop()

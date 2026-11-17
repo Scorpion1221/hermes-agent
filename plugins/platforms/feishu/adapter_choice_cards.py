@@ -74,10 +74,17 @@ class FeishuChoiceCardsMixin:
         try:
             return await self._send_interactive_card(
                 chat_id, card, metadata, "send_clarify failed", state_map=self._clarify_state,
-                state_id=clarify_id, session_key=session_key, extra_state={"question": str(question)})
+                state_id=clarify_id, session_key=session_key,
+                extra_state={"question": str(question), "asker": self._card_asker(chat_id, metadata)})
         except Exception as exc:
             logger.warning("[Feishu] send_clarify failed: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    def _card_asker(self, chat_id: str, metadata: Optional[dict[str, Any]]) -> frozenset[str]:
+        """The ids of the user whose turn is sending this card: they may answer it as well as the operators
+        ``_validate_card_action`` admits (a group member who may prompt the bot is rarely an admin)."""
+        from .feishu_card_action import running_turn_owner
+        return running_turn_owner(self, chat_id, str((metadata or {}).get("thread_id") or "")) or frozenset()
 
     @staticmethod
     def _clarify_card(body: str, template: str, *, actions: Optional[list] = None) -> dict[str, Any]:
@@ -99,10 +106,10 @@ class FeishuChoiceCardsMixin:
         state = self._clarify_state.get(clarify_id)
         if not state:
             logger.debug("[Feishu] Clarify %s already resolved or unknown", clarify_id or "<missing>")
-            return self._card_response()
+            return self._card_response(toast=("info", t("platform.feishu.card_action.already_handled")))
         checked = self._validate_card_action(event=event, state=state, label="clarify", ident=clarify_id)
         if checked is None:
-            return self._card_response()
+            return self._card_response(toast=("error", t("platform.feishu.card_action.denied")))
         user_name = checked[2]
         from tools import clarify_gateway
 

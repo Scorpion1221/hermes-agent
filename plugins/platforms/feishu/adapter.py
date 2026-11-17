@@ -1920,17 +1920,16 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuBadgesMixin, FeishuMediaTypesM
     def _validate_card_action(
         self, *, event: Any, state: dict[str, str], label: str, ident: Any,
     ) -> Optional[tuple[str, str, str, str, str]]:
-        """Shared operator/chat checks for approval + update-prompt clicks.
-
-        Returns ``(open_id, callback_chat_id, user_name, user_id, union_id)`` or None (already logged).
-        """
+        """Shared operator/chat checks for button-card clicks; a clarify / picker card's ``asker`` (in its state)
+        may answer it too. ``(open_id, callback_chat_id, user_name, user_id, union_id)``, or None (logged)."""
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
         user_id = str(getattr(operator, "user_id", "") or "")
         union_id = str(getattr(operator, "union_id", "") or "")
         callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
         expected_chat_id = str(state.get("chat_id", "") or "")
-        if not self._is_interactive_operator_authorized(
+        asker = state.get("asker") or frozenset()  # the user whose turn sent the card (adapter_choice_cards)
+        if not asker & {open_id, user_id, union_id} and not self._is_interactive_operator_authorized(
             open_id, user_id=user_id, union_id=union_id, chat_id=expected_chat_id or callback_chat_id,
         ):
             logger.warning("[Feishu] Unauthorized %s click by %s", label, open_id or "<unknown>")

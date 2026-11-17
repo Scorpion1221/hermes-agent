@@ -247,6 +247,14 @@ def _turn_owner(adapter: Any, chat_id: str, card: Any) -> Optional[frozenset[str
     return owners.pop() if len(owners) == 1 else None
 
 
+def running_turn_owner(adapter: Any, chat_id: str, thread_id: str) -> Optional[frozenset[str]]:
+    """The user whose turn is running in that chat and topic now: who a clarify card sent now asks. None when
+    no turn, or turns of several users, are running there."""
+    owners = {turn.user_ids for turn in _turns(adapter).values()
+              if turn.ended is None and turn.chat_id == chat_id and turn.thread_id == thread_id}
+    return owners.pop() if len(owners) == 1 else None
+
+
 async def _asker(adapter: Any, card: Any) -> Optional[frozenset[str]]:
     """The sender of the message ``card`` replies to, skipping the bot's own messages (a card answering a
     click or a reaction replies to the bot's earlier card). In a topic every message replies to the topic's
