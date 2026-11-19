@@ -52,6 +52,24 @@ def _read_message_body(positional: Optional[str], file_path: Optional[str]) -> O
     return (sys.stdin.read() or None) if not sys.stdin.isatty() else None
 
 
+def _text_envelope(message: str) -> Optional[str]:
+    """The text of a body that is only a JSON ``{"text": ...}`` (or ``{"content": ...}``) envelope, else
+    None. Every platform delivers the body verbatim, so an envelope arrives as raw JSON — usually because
+    ``--json`` (an output flag) was read as "the body is JSON"."""
+    stripped = message.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return None
+    try:
+        payload = json.loads(stripped)
+    except ValueError:
+        return None
+    if isinstance(payload, dict) and len(payload) == 1:
+        text = payload.get("text", payload.get("content"))
+        if isinstance(text, str):
+            return text
+    return None
+
+
 def _invalid_whatsapp_mentions(mentions: list[str]) -> list[str]:
     """Return mention values that cannot identify a WhatsApp participant."""
     from gateway.whatsapp_identity import normalize_whatsapp_mention_jid
@@ -222,6 +240,12 @@ def cmd_send(args: argparse.Namespace) -> None:
         _fail(
             "hermes send: no message provided. Pass text as a positional "
             "argument, use --file PATH, or pipe data via stdin.",
+            _USAGE_EXIT)
+    if _text_envelope(message) is not None:
+        _fail(
+            "hermes send: the message is a JSON {\"text\": ...} envelope; it would arrive as raw JSON. "
+            "Send the text itself (write it to a file and pass --file PATH). --json only changes "
+            "this command's output, not how the message is read.",
             _USAGE_EXIT)
 
     # Optional subject line: a consistent header for alerting scripts.

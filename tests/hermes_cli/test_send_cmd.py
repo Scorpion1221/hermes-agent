@@ -459,3 +459,29 @@ def test_help_and_empty_list_hint_name_the_resolved_home(tmp_path, monkeypatch, 
     out = capsys.readouterr().out
     assert str(home / "channel_directory.json") in out
     assert "~/.hermes" not in out
+
+
+@pytest.mark.parametrize("body", [
+    '{"text":"<at id=\\"ou_x\\"></at> deployed ✅\\n📌 one pod restarted"}',
+    '  {"content": "hello"}\n',
+])
+def test_a_json_text_envelope_is_refused_not_delivered_as_raw_json(fake_tool, capsys, body):
+    """``--json`` is an output flag; an agent read it as "the body is JSON" and Feishu got the raw envelope."""
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(_parse(["--to", "feishu:oc_chat", "--json", body]))
+
+    assert exc.value.code == 2 and fake_tool.calls == []
+    assert "--file" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("body", [
+    '{"text": "hi", "msg_type": "post"}',  # more than an envelope: the user's own JSON
+    '{"text": 3}',
+    '{not json}',
+    '[{"text": "hi"}]',
+])
+def test_a_body_that_is_more_than_a_text_envelope_is_sent_as_is(fake_tool, capsys, body):
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(_parse(["--to", "feishu:oc_chat", body]))
+
+    assert exc.value.code == 0 and fake_tool.calls[0]["message"] == body
